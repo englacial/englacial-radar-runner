@@ -119,23 +119,27 @@ MANAGER_DEFAULTS = {
         "log_max_mb": 1024.0,               # per collection; beyond it only the radar's file and exit lines are kept
     },
 
-    # "Make the amplifier safe" after a radar exit (ampsafe.py). A non-zero
-    # status or a timeout of the command is a fault. A command that is missing
-    # or not executable means the radar is never started.
+    # Making the amplifier safe (ampsafe.py): the tool that drives the SDR's
+    # amplifier pin to the shutdown level. A command that is missing or not
+    # executable means the radar is never started.
     "amp_safe": {
-        "command": ["/home/englacial/englacial-radar-runner/tools/sdr_gpio_safe/amp_safe", "--timeout", "20"],
-        "timeout_s": 30.0,                  # the manager kills the command after this
-        # NOT DECIDED. "always": after every radar exit. "when_needed": not after
-        # a clean exit that telemetry confirms; every run of the tool itself
-        # enables the amplifier for about 0.3-0.5 s.
-        "policy": "always",
-        # For "when_needed": the reading in the telemetry status file that confirms shutdown.
+        # --timeout is mandatory for the tool; timeout_s, the manager's own limit, must be longer.
+        "command": ["/home/englacial/englacial-radar-runner/tools/sdr_gpio_safe/amp_safe", "--timeout", "14"],
+        "timeout_s": 20.0,                  # the manager kills the command after this
+        # "when_needed": the tool runs only when the pin is not known to be safe
+        # (decided 2026-11-19). "always": also after every radar exit. Every
+        # run of the tool itself enables the amplifier for about 0.3-0.5 s.
+        "policy": "when_needed",
+        "assume_enabled_retries": 2,        # immediate retries when the tool says ASSUME_ENABLED (exit 3)
+        "retry_s": 60.0,                    # with no radar and the state unknown: try the tool this often
+        "idle_enabled_s": 5.0,              # enabled current this long with no radar process: run the tool
+        # The reading in the telemetry status file that decides, when it is fresh.
         "current_field": "amp.current_a",
         "voltage_field": "amp.voltage_v",
         "sample_uptime_field": "amp.sample_uptime_s",
         "enabled_current_a": 0.5,           # at or above: enabled (shutdown 0.16 A, enabled about 2.5 A)
         "min_voltage_v": 20.0,              # below: the 28 V rail is off and the current says nothing
-        "confirm_settle_s": 1.0,            # the reading must be this much newer than the exit
+        "confirm_settle_s": 1.0,            # after a radar exit the reading must be this much newer than the exit
         "confirm_timeout_s": 4.0,           # wait this long for such a reading
     },
 

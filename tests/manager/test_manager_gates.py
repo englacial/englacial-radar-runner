@@ -296,23 +296,21 @@ def test_amp_safe_gate_refuses_to_run_without_the_command(env):
 def test_default_config_is_not_ready_until_the_tool_and_the_radar_config_exist():
     from radar_runner.manager.config import MANAGER_DEFAULTS
     assert MANAGER_DEFAULTS["amp_safe"]["command"][0].endswith("tools/sdr_gpio_safe/amp_safe")
-    assert MANAGER_DEFAULTS["amp_safe"]["policy"] == "always"
+    assert MANAGER_DEFAULTS["amp_safe"]["policy"] == "when_needed"
     assert MANAGER_DEFAULTS["limits"]["max_tx_gain"] == 43.0        # the conservative default
 
 
-# ------------------------------------------------------ amp-safe: decide, confirm, flag
+# ------------------------------------------- amp-safe: the three decisions (pure functions)
 
 CLEAN = {"reached_running": True, "killed": False, "exit_status": 0, "failure": ""}
+KILLED = {**CLEAN, "killed": True, "exit_status": -9}
+NO_READING = (None, "no fresh amplifier reading after the exit")
+SHUTDOWN = (True, "amplifier current 0.16 A at 28.0 V")
+ENABLED = (False, "amplifier current 2.50 A at 27.5 V")
 
 
 def never():
     raise AssertionError("telemetry must not be asked")
-
-
-def test_policy_always_runs_the_command_whatever_happened():
-    assert ampsafe.decide("always", CLEAN, never) == (True, "policy always")
-    run, why = ampsafe.decide("sometimes", CLEAN, never)
-    assert run and "unknown policy" in why                  # anything unknown is treated as always
 
 
 @pytest.mark.parametrize("change, why", [
@@ -323,17 +321,99 @@ def test_policy_always_runs_the_command_whatever_happened():
     ({"exit_status": None}, "the radar exited with status None"),
     ({"failure": "the radar reports the SDR on a USB 2 link"}, "failure: the radar reports the SDR on a USB 2 link"),
 ])
-def test_policy_when_needed_runs_after_any_unclean_exit(change, why):
-    assert ampsafe.decide("when_needed", {**CLEAN, **change}, never) == (True, why)
+def test_what_counts_as_an_unclean_radar_exit(change, why):
+    assert ampsafe.unclean({**CLEAN, **change}) == why
+    assert ampsafe.unclean(CLEAN) == ""
 
 
-def test_policy_when_needed_after_a_clean_exit_follows_the_telemetry():
-    run, why = ampsafe.decide("when_needed", CLEAN, lambda: (True, "amplifier current 0.16 A at 28.0 V"))
-    assert not run and why == "clean exit confirmed by telemetry (amplifier current 0.16 A at 28.0 V)"
-    run, why = ampsafe.decide("when_needed", CLEAN, lambda: (False, "amplifier current 2.50 A at 27.5 V"))
-    assert run and "shows the amplifier enabled" in why
-    run, why = ampsafe.decide("when_needed", CLEAN, lambda: (None, "no fresh amplifier reading after the exit"))
-    assert run and "not confirmed" in why
+def test_known_safe_after_a_clean_exit_without_telemetry():
+    known, why = ampsafe.known_safe_after_exit(CLEAN, NO_READING)
+    assert known and why.startswith("clean radar exit; no telemetry to check")
+
+
+def test_not_known_safe_after_an_unclean_exit_without_telemetry():
+    known, why = ampsafe.known_safe_after_exit(KILLED, NO_READING)
+    assert not known and why.startswith("the radar was killed; no telemetry to decide")
+
+
+@pytest.mark.parametrize("facts", [CLEAN, KILLED, {**CLEAN, "reached_running": False}, {**CLEAN, "exit_status": 3}])
+def test_a_fresh_reading_with_the_28_v_present_decides_whatever_the_history(facts):
+    assert ampsafe.known_safe_after_exit(facts, SHUTDOWN) == (True, "telemetry: amplifier current 0.16 A at 28.0 V")
+    known, why = ampsafe.known_safe_after_exit(facts, ENABLED)
+    assert not known and "telemetry shows the amplifier enabled" in why
+
+
+def test_decide_when_needed_runs_the_tool_only_when_not_known_safe():
+    assert ampsafe.decide("when_needed", CLEAN, lambda: NO_READING)[:2] == (False, True)
+    assert ampsafe.decide("when_needed", CLEAN, lambda: SHUTDOWN)[:2] == (False, True)
+    assert ampsafe.decide("when_needed", CLEAN, lambda: ENABLED)[:2] == (True, False)
+    assert ampsafe.decide("when_needed", KILLED, lambda: NO_READING)[:2] == (True, False)
+    assert ampsafe.decide("when_needed", KILLED, lambda: SHUTDOWN)[:2] == (False, True)
+    assert ampsafe.decide("when_needed", KILLED, lambda: ENABLED)[:2] == (True, False)
+
+
+def test_decide_always_runs_the_tool_and_judges_by_the_history_alone():
+    run, known, why = ampsafe.decide("always", CLEAN, never)
+    assert run and known and why.startswith("policy always; clean radar exit")
+    run, known, why = ampsafe.decide("always", KILLED, never)
+    assert run and not known
+    run, known, why = ampsafe.decide("sometimes", CLEAN, never)
+    assert run and "unknown policy 'sometimes', treated as always" in why
+
+
+@pytest.mark.parametrize("status, known_before, expected", [
+    (0, False, ("safe", True)), (0, True, ("safe", True)),
+    (3, True, ("unknown", False)), (3, False, ("unknown", False)),         # ASSUME_ENABLED: never safe
+    (ampsafe.KILLED_BY_CALLER, True, ("unknown", False)),                   # killed half way
+    (2, True, ("safe", True)), (2, False, ("unknown", False)),              # NOT_FOUND: nothing changed
+    (6, True, ("safe", True)), (6, False, ("unknown", False)),              # BUSY
+    (7, False, ("unknown", False)), (4, False, ("unknown", False)), (5, True, ("safe", True)),
+    (64, False, ("unknown", False)), (None, True, ("safe", True)), (None, False, ("unknown", False)),
+    (99, False, ("unknown", False)),
+])
+def test_the_record_after_a_run_of_the_tool(status, known_before, expected):
+    assert ampsafe.after_tool(status, known_before) == expected
+
+
+def test_exit_codes_of_the_tool_are_named():
+    assert ampsafe.EXIT_MEANING == {0: "OK", 2: "NOT_FOUND", 3: "ASSUME_ENABLED", 4: "TIMEOUT", 5: "FAILED",
+                                    6: "BUSY", 7: "AMBIGUOUS", 64: "USAGE"}
+    assert ampsafe.describe(6) == "status 6 (BUSY)" and ampsafe.describe(None) == "not started"
+    assert "killed" in ampsafe.describe(ampsafe.KILLED_BY_CALLER) and "not a status of the tool" in ampsafe.describe(1)
+
+
+IDLE = dict(enabled_for_s=0.0, enabled_limit_s=5.0)
+
+
+def test_idle_sdr_still_in_its_boot_loader_is_safe_without_the_tool():
+    # Nothing has initialised it since it was powered: also clears a record left by a hard power cut.
+    assert ampsafe.idle_need("unknown", "bootloader", None, **IDLE) == (
+        "mark_safe", "nothing has initialised the SDR since it was powered")
+    assert ampsafe.idle_need("safe", "bootloader", None, **IDLE)[0] == "none"
+
+
+def test_idle_unknown_state_runs_the_tool_unless_telemetry_decides():
+    # Manager start with the record "unknown", or with no record at all, after the SDR has been in use.
+    action, why = ampsafe.idle_need("unknown", "loaded", None, **IDLE)
+    assert action == "run" and "not known" in why
+    assert ampsafe.idle_need("unknown", "loaded", True, **IDLE) == (
+        "mark_safe", "telemetry shows shutdown current with no radar process")
+    assert ampsafe.idle_need("safe", "loaded", None, **IDLE)[0] == "none"
+    assert ampsafe.idle_need("safe", "loaded", True, **IDLE)[0] == "none"
+
+
+def test_idle_enabled_current_runs_the_tool_only_when_it_lasts():
+    # One reading is not enough: every start of the tool or of the radar enables the amplifier briefly.
+    for state in ("safe", "unknown"):
+        assert ampsafe.idle_need(state, "loaded", False, enabled_for_s=4.9, enabled_limit_s=5.0)[0] == "none"
+        action, why = ampsafe.idle_need(state, "loaded", False, enabled_for_s=5.0, enabled_limit_s=5.0)
+        assert action == "run" and "enabled for 5 s with no radar process" in why
+
+
+def test_idle_without_an_sdr_nothing_is_done():
+    for state in ("safe", "unknown"):
+        for reading in (None, True, False):
+            assert ampsafe.idle_need(state, "absent", reading, enabled_for_s=60.0, enabled_limit_s=5.0)[0] == "none"
 
 
 def amp_telemetry(env, **kw):
@@ -391,12 +471,64 @@ def test_confirm_says_nothing_without_the_28_v_rail_or_fresh_telemetry(env):
     assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is None
 
 
-def test_sdr_state_flag(env):
-    flag = ampsafe.SdrStateFlag(env.state_dir)
-    assert not flag.is_set() and flag.clear() == ""
-    assert flag.set("radar launch, collection x") == "" and flag.is_set()
-    assert ampsafe.SdrStateFlag(env.state_dir).is_set()     # a file: seen by any other program
-    with open(os.path.join(env.state_dir, "sdr-state-unknown")) as f:
-        assert f.read() == "radar launch, collection x\n"
-    assert flag.clear() == "" and not flag.is_set()
-    assert "no-dir" in ampsafe.SdrStateFlag(os.path.join(env.tmp, "no-dir")).set()
+def test_latest_reading_without_waiting(env):
+    assert amp_telemetry(env).now() == (None, "no fresh amplifier reading")
+    publish_amp(env, 0.156)
+    assert amp_telemetry(env).now() == (True, "amplifier current 0.16 A at 28.0 V")
+    publish_amp(env, 2.6, 27.4)
+    assert amp_telemetry(env).now() == (False, "amplifier current 2.60 A at 27.4 V")
+    publish_amp(env, 0.0, 0.2)
+    assert amp_telemetry(env).now()[0] is None
+
+
+def test_sdr_state_record(env):
+    state = ampsafe.SdrState(env.state_dir)
+    assert state.get() == "unknown" and not state.known_safe and state.why() == "no record"    # no file
+    assert state.set("unknown", "radar launched, collection x") == "" and state.get() == "unknown"
+    assert state.set("safe", "clean radar exit") == "" and state.known_safe
+    assert ampsafe.SdrState(env.state_dir).get() == "safe"  # a file: any other program can read it
+    with open(os.path.join(env.state_dir, "sdr-state")) as f:
+        lines = f.read().splitlines()
+    assert lines[0] == "safe" and lines[1].endswith(" clean radar exit") and "clean radar exit" in state.why()
+    assert os.listdir(env.state_dir) == ["sdr-state"]       # replaced atomically: no temporary file left
+    # Anything that is not exactly "safe" on the first line is unknown.
+    for content in ("", "SAFE\n", "safe-ish\n", "unknown\n", "\x00\x00", " safe\nsafe\n"):
+        with open(os.path.join(env.state_dir, "sdr-state"), "w") as f:
+            f.write(content)
+        assert state.get() == ("safe" if content.strip().split("\n")[0] == "safe" else "unknown")
+    assert "no-dir" in ampsafe.SdrState(os.path.join(env.tmp, "no-dir")).set("safe")
+
+
+def stop_hook(env, tool_status):
+    """Run bin/radar-manager-stop-hook with a stand-in tool. Returns (exit status, calls of the tool)."""
+    import subprocess
+    from radar_runner.common import config as common_config
+    tool = os.path.join(env.tmp, "amp_safe")
+    calls = os.path.join(env.tmp, "hook_calls")
+    with open(tool, "w") as f:
+        f.write(f'#!/bin/sh\necho "$@" >> {calls}\nexit {tool_status}\n')
+    os.chmod(tool, 0o755)
+    hook = os.path.join(common_config.REPO, "bin", "radar-manager-stop-hook")
+    result = subprocess.run([hook, os.path.join(env.state_dir, "sdr-state"), tool], timeout=20)
+    try:
+        with open(calls) as f:
+            return result.returncode, f.read().splitlines()
+    except OSError:
+        return result.returncode, []
+
+
+def test_stop_hook_of_the_unit_runs_the_tool_only_when_the_state_is_not_safe(env):
+    state = ampsafe.SdrState(env.state_dir)
+    state.set("safe", "clean radar exit")
+    assert stop_hook(env, 0) == (0, [])                     # known safe: nothing is done
+    state.set("unknown", "radar launched, collection x")    # as a killed manager leaves it
+    assert stop_hook(env, 0) == (0, ["--timeout 14"])
+    assert state.get() == "safe" and "stop hook" in state.why()
+
+
+def test_stop_hook_with_no_record_or_a_failing_tool(env):
+    state = ampsafe.SdrState(env.state_dir)
+    assert stop_hook(env, 3) == (3, ["--timeout 14"])       # no record = unknown; the tool's status is passed on
+    assert state.get() == "unknown" and not os.path.exists(state.path)
+    state.set("unknown", "x")
+    assert stop_hook(env, 6)[0] == 6 and state.get() == "unknown"

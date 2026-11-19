@@ -43,15 +43,14 @@ WatchdogSignal=SIGKILL
 #  * whatever is left in the unit's control group after TimeoutStopSec gets SIGKILL.
 KillMode=mixed
 # Longest clean stop: orca.stop_timeout_s (3) + amp_safe.confirm_timeout_s (4)
-# + amp_safe.timeout_s (30) + 15 s. Keep TimeoutStopSec above that sum.
-TimeoutStopSec=60
+# + amp_safe.timeout_s (20) x 3 attempts + 15 s. Keep TimeoutStopSec above that sum.
+TimeoutStopSec=100
 TimeoutStartSec=30
 
 # After every stop of the unit, clean or not, once all its processes are gone:
-# if the SDR's GPIO state is not known to be safe (the flag file exists: the
-# manager died or was killed while a radar ran, or its own attempt failed),
-# make the amplifier safe now.
-ExecStopPost=/bin/sh -c 'f=/var/lib/radar-runner/user/sdr-state-unknown; [ -e "$f" ] || exit 0; /home/englacial/englacial-radar-runner/tools/sdr_gpio_safe/amp_safe --timeout 20 && rm -f "$f"'
+# if the SDR's amplifier pin is not known to be safe (the manager died or was
+# killed while a radar ran, or its own attempt failed), make it safe now.
+ExecStopPost=/home/englacial/englacial-radar-runner/bin/radar-manager-stop-hook
 
 [Install]
 WantedBy=multi-user.target

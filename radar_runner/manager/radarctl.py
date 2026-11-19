@@ -85,8 +85,10 @@ def format_status(s):
                      f"{r.get('interruptions')} interruptions (limit {r.get('max_resumes')})")
     if (s.get("overrides") or {}).get("no_amp_telemetry"):
         lines.append("override:   RUNNING WITHOUT AMPLIFIER TELEMETRY IS ALLOWED")
-    if s.get("sdr_state_unknown"):
-        lines.append("sdr:        GPIO state not known to be safe")
+    if s.get("sdr_state") == "unknown":
+        lines.append(f"sdr:        amplifier pin NOT known to be safe ({s.get('sdr_state_why')})")
+    if s.get("making_amp_safe"):
+        lines.append("sdr:        the make-amplifier-safe tool is running")
     auto = s.get("auto") or {}
     if auto.get("enabled"):
         lines.append(f"auto:       {auto.get('source')} says {auto.get('state')}"

@@ -284,13 +284,13 @@ def test_radar_that_finishes_by_itself_ends_the_run():
 def test_amplifier_not_confirmed_safe_is_a_fault_with_its_own_reason(before):
     s = Sim().running()
     info = {"requested": before == "stopping", "failure": "x" if before == "failed" else "",
-            "amp_safe": False, "amp_safe_detail": "make amplifier safe failed (status 3): not verified"}
+            "amp_safe": False, "amp_safe_detail": "command run: status 3 (ASSUME_ENABLED) in each of 3 attempts"}
     if before == "stopping":
         s.call("stop", L.BUTTON)
     s.call("ended", info)
     assert s.state == L.FAULT
     fault = s.logic.snapshot()["fault"]
-    assert fault["kind"] == "amp_unsafe" and "not verified" in fault["reason"]
+    assert fault["kind"] == "amp_unsafe" and "ASSUME_ENABLED" in fault["reason"]
     assert "could not be confirmed safe" in fault["reason"]
     s.advance(600)
     assert "start" not in s.kinds()[1:]

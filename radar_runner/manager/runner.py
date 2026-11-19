@@ -9,7 +9,10 @@ For every start, `post` is called with, in order:
     "collection"  {"name", "dir"}       the collection directory exists
     "started"     {}                    the radar printed its start line (only if it got that far)
     "ended"       {...}                 always, exactly once: the radar process is gone and the
-                                        "make the amplifier safe" command has run (see `_Run.info`)
+                                        amplifier step is done (ampsafe.py; see `_Run.info`)
+
+`runner.make_safe(why)` runs the make-amplifier-safe tool outside a radar run
+and posts "safe_done".
 
 The start sequence: read and check the requested config, create the collection
 directory, write the derived config and check that too, generate the chirp,
@@ -222,7 +225,9 @@ class Runner:
         self._uptime = uptime
         self._boot_number = boot_number
         self.amp_telemetry = amp_telemetry or ampsafe.AmpTelemetry(config)
-        self.sdr_flag = ampsafe.SdrStateFlag(self.state_dir)
+        self.sdr_state = ampsafe.SdrState(self.state_dir)
+        self.making_safe = False    # a run of the tool outside a radar run is queued or in progress
+        self._pending = 0
         # HOOK (stage 7, turn-on check): called after the build and before the
         # radar is launched, with the _Run. Returns (passed, text). A failure
         # is a fault ("turn_on_check"); the radar is not launched.
@@ -246,8 +251,27 @@ class Runner:
             if self._current is not None:
                 raise RuntimeError("a run is already in progress")
             self._current = _Run(request, flags)
+            self._pending += 1
             self._idle.clear()
             self._queue.put(self._current)
+
+    def make_safe(self, why):
+        """Run the make-amplifier-safe tool now, outside a radar run. Posts "safe_done" {ok, state, detail, why}.
+
+        Returns False (and does nothing) while a radar run or another such
+        request is in progress: the end of a radar run decides for itself.
+        The runner's one thread does both, so the tool never runs while a
+        radar that this manager started is alive, and a start that is asked
+        for meanwhile waits for the tool.
+        """
+        with self._lock:
+            if self._current is not None or self.making_safe:
+                return False
+            self.making_safe = True
+            self._pending += 1
+            self._idle.clear()
+            self._queue.put(("safe", why))
+        return True
 
     def stop(self, reason):
         with self._lock:
@@ -287,6 +311,23 @@ class Runner:
     def _loop(self):
         while True:
             run = self._queue.get()
+            if isinstance(run, tuple):          # ("safe", why): the tool, outside a radar run
+                result = {"ok": False, "state": ampsafe.UNKNOWN, "detail": "internal error", "why": run[1],
+                          "status": None}
+                try:
+                    known = self.sdr_state.known_safe
+                    state, ok, detail, status = self._tool(os.path.join(self.state_dir, AMP_SAFE_LOG), known)
+                    self._record_state(state, f"{detail} ({run[1]})")
+                    result.update(ok=ok, state=state, detail=detail, status=status)
+                except Exception:
+                    log.exception("internal error while making the amplifier safe")
+                with self._lock:
+                    self.making_safe = False
+                    self._pending -= 1
+                    if not self._pending:
+                        self._idle.set()
+                self.post("safe_done", result)
+                continue
             try:
                 self._run(run)
             except Exception as e:      # never lose the thread: it is the radar's parent
@@ -306,7 +347,9 @@ class Runner:
             info = run.info()
             with self._lock:
                 self._current = None
-            self._idle.set()
+                self._pending -= 1
+                if not self._pending:
+                    self._idle.set()
             self.post("ended", info)
 
     def _env(self):
@@ -318,11 +361,18 @@ class Runner:
                 env[name] = value
         return env
 
-    def _command(self, run, argv, cwd, timeout_s, label, log_name, interruptible=True):
-        """Run a helper command to its end. Returns (ok, text). Output goes to <collection>/<log_name>."""
+    def _command(self, stop, argv, cwd, timeout_s, label, log_path):
+        """Run a helper command to its end. Returns (ok, text, exit status).
+
+        Output goes to `log_path` (appended). `stop` is an Event that aborts
+        the command, or None for a command that must not be interrupted. The
+        status is None if the command could not be started, and
+        ampsafe.KILLED_BY_CALLER if it was killed here (timeout or abort).
+        """
         try:
-            out = open(os.path.join(run.directory, log_name), "ab")
-            out.write(f"--- {label}: {' '.join(argv)}\n".encode())
+            out = open(log_path, "ab")
+            out.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {label}: {' '.join(argv)}\n"
+                      .encode())
             out.flush()
         except (OSError, TypeError):
             out = None              # the data drive is gone: the command must still run
@@ -331,7 +381,7 @@ class Runner:
                                     stdout=out if out is not None else subprocess.DEVNULL,
                                     stderr=subprocess.STDOUT, start_new_session=True, env=self._env())
         except OSError as e:
-            return False, f"{label}: cannot run {argv[0]}: {e.strerror or e}"
+            return False, f"{label}: cannot run {argv[0]}: {e.strerror or e}", None
         finally:
             if out is not None:
                 out.close()
@@ -343,14 +393,17 @@ class Runner:
             except subprocess.TimeoutExpired:
                 pass
             timed_out = time.monotonic() >= deadline
-            if timed_out or (interruptible and run.stop.is_set()):
+            if timed_out or (stop is not None and stop.is_set()):
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except OSError:
                     pass
                 proc.wait()
-                return False, f"{label}: " + (f"no result within {timeout_s:g} s" if timed_out else "aborted")
-        return (True, "") if status == 0 else (False, f"{label} failed (status {status}; see {log_name})")
+                return (False, f"{label}: " + (f"no result within {timeout_s:g} s" if timed_out else "aborted"),
+                        ampsafe.KILLED_BY_CALLER)
+        if status == 0:
+            return True, "", 0
+        return False, f"{label} failed (status {status}; see {os.path.basename(str(log_path))})", status
 
     def _fill(self, argv, run, config_path):
         orca = os.path.realpath(self.cfg["orca"]["dir"])
@@ -423,9 +476,10 @@ class Runner:
             return
 
         # 4. Chirp, 5. build. A failure of either is a failed start.
-        ok, text = self._command(run, self._fill(orca_cfg["chirp_command"], run, config_path),
-                                 os.path.join(orca, orca_cfg["chirp_cwd"]), orca_cfg["chirp_timeout_s"],
-                                 "chirp generation", PREPARE_LOG)
+        prepare_log = os.path.join(run.directory, PREPARE_LOG)
+        ok, text, _ = self._command(run.stop, self._fill(orca_cfg["chirp_command"], run, config_path),
+                                    os.path.join(orca, orca_cfg["chirp_cwd"]), orca_cfg["chirp_timeout_s"],
+                                    "chirp generation", prepare_log)
         if ok:
             try:
                 ok = os.path.getsize(os.path.join(run.directory, limits.CHIRP_FILE)) > 0
@@ -437,9 +491,9 @@ class Runner:
         for argv in orca_cfg["build_commands"]:
             if not isinstance(argv, list) or not argv:
                 return run.fail("build", "orca.build_commands must be a list of commands", fatal=True)
-            ok, text = self._command(run, self._fill(argv, run, config_path),
-                                     os.path.join(orca, orca_cfg["build_cwd"]), orca_cfg["build_timeout_s"],
-                                     "build", PREPARE_LOG)
+            ok, text, _ = self._command(run.stop, self._fill(argv, run, config_path),
+                                        os.path.join(orca, orca_cfg["build_cwd"]), orca_cfg["build_timeout_s"],
+                                        "build", prepare_log)
             if not ok:
                 return None if run.stop.is_set() else run.fail("build", text)
 
@@ -497,15 +551,16 @@ class Runner:
                                    data_cfg["log_max_mb"] * 1e6, self._wall)
         stderr_log = OutputLog(run.directory, STDERR_LOG, STDERR_MAX_BYTES, STDERR_MAX_BYTES, self._wall)
         self._sync_queue = queue.Queue()
-        # From here on the SDR's GPIO state is not known to be safe, until _make_amp_safe says so.
-        error = self.sdr_flag.set(f"radar launch, collection {run.name}")
+        # From here on the SDR's state is not known to be safe, until _make_amp_safe says so.
+        before = (self.sdr_state.get(), self.sdr_state.why())
+        error = self.sdr_state.set(ampsafe.UNKNOWN, f"radar launched, collection {run.name}")
         if error:
             return run.fail("state", f"cannot record that the SDR state is unknown: {error}")
         try:
             proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, start_new_session=True, env=self._env())
         except OSError as e:
-            self._clear_flag()      # nothing touched the SDR
+            self._record_state(*before)     # nothing touched the SDR
             return run.fail("launch", f"cannot start the radar ({argv[0]}): {e.strerror or e}")
         run.proc = proc
         run.launched = True
@@ -590,40 +645,68 @@ class Runner:
     def _make_amp_safe(self, run):
         """After every radar exit, however it happened, and only then. Not interruptible.
 
-        Whether the command runs is decided in ampsafe.decide (setting amp_safe.policy).
+        Whether the tool runs is decided in ampsafe.decide (setting amp_safe.policy).
+        `run.amp_safe` becomes True if the pin is known to be safe afterwards.
         """
         cfg = self.cfg["amp_safe"]
         exit_uptime = self._uptime()
         facts = {"reached_running": run.started.is_set(), "killed": run.killed,
                  "exit_status": run.exit_status, "failure": run.failure}
-        run_it, why = ampsafe.decide(cfg["policy"], facts,
-                                     lambda: self.amp_telemetry.confirm_shutdown(exit_uptime))
+        run_it, known, why = ampsafe.decide(cfg["policy"], facts,
+                                            lambda: self.amp_telemetry.confirm_shutdown(exit_uptime))
         run.amp_safe_ran = run_it
         if not run_it:
             run.amp_safe, run.amp_safe_detail = True, f"command not run: {why}"
             log.info("amplifier safe, %s", run.amp_safe_detail)
-            self._clear_flag()
+            self._record_state(ampsafe.SAFE, why)
             return
+        log_path = os.path.join(run.directory, AMP_SAFE_LOG) if run.directory else None
+        state, ok, detail, _ = self._tool(log_path, known)
+        run.amp_safe, run.amp_safe_detail = ok, f"{detail} ({why})"
+        self._record_state(state, run.amp_safe_detail)
+        if not ok:
+            log.error("AMPLIFIER NOT CONFIRMED SAFE after the radar exited: %s", run.amp_safe_detail)
+
+    def _tool(self, log_path, known_before):
+        """Run the make-amplifier-safe tool. Returns (state, ok, text, exit status).
+
+        Only ever called from the runner's thread, with no radar of this
+        manager alive. ASSUME_ENABLED (the tool initialised the SDR and could
+        not verify the pin) is urgent: the tool is run again at once, up to
+        `assume_enabled_retries` times.
+        """
+        cfg = self.cfg["amp_safe"]
         command = [str(a) for a in cfg["command"]]
         if not command:
-            run.amp_safe, run.amp_safe_detail = False, "the make-amplifier-safe command is not configured"
-            return
-        ok, text = self._command(run, command, None, cfg["timeout_s"], "make amplifier safe", AMP_SAFE_LOG,
-                                 interruptible=False)
-        if not ok:
-            for status, meaning in ampsafe.EXIT_MEANING.items():
-                if f"(status {status};" in text:
-                    text += f": {meaning}"
-        run.amp_safe, run.amp_safe_detail = ok, text or f"command run ({why})"
-        if ok:
-            self._clear_flag()
-        else:
-            log.error("AMPLIFIER NOT CONFIRMED SAFE after the radar exited: %s", text)
+            state, ok = ampsafe.after_tool(None, known_before)
+            return state, ok, "the make-amplifier-safe command is not configured", None
+        if log_path is not None:
+            try:
+                if os.path.getsize(log_path) > 1 << 20:     # the log outside a collection must not grow for ever
+                    os.replace(log_path, log_path + ".1")
+            except OSError:
+                pass
+        attempts = 1 + max(0, cfg["assume_enabled_retries"])
+        for attempt in range(1, attempts + 1):
+            _, text, status = self._command(None, command, None, cfg["timeout_s"], "make amplifier safe", log_path)
+            if status != ampsafe.ASSUME_ENABLED:
+                break
+            log.error("URGENT: the make-amplifier-safe tool initialised the SDR and could not verify the pin "
+                      "(attempt %d of %d)", attempt, attempts)
+        state, ok = ampsafe.after_tool(status, known_before)
+        detail = f"command run: {ampsafe.describe(status)}"
+        if status is None or status == ampsafe.KILLED_BY_CALLER:
+            detail += f": {text}"
+        if status == ampsafe.ASSUME_ENABLED:
+            detail += f" in each of {attempts} attempts"
+        elif not ok or (status != ampsafe.OK and known_before):
+            detail += "; the state was " + ("known safe before and is unchanged" if ok else "not known safe before")
+        return state, ok, detail, status
 
-    def _clear_flag(self):
-        error = self.sdr_flag.clear()
+    def _record_state(self, state, why):
+        error = self.sdr_state.set(state, why)
         if error:
-            log.warning("cannot remove the SDR-state flag: %s", error)
+            log.warning("cannot record the SDR state: %s", error)
 
     def _finish(self, run):
         """Write the end of the collection's metadata."""

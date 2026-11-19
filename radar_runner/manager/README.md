@@ -82,7 +82,7 @@ conservative value for an undecided VVA setting; set the unit's value in
 |---|---|
 | `start_failures` | a start failed or the radar exited with an error, and the retries (after 10, 30, 90 s) are used up |
 | `resume_limit` | a gate stopped the run more than `max_resumes` times |
-| `amp_unsafe` | the make-amplifier-safe command failed or timed out after a radar exit |
+| `amp_unsafe` | the amplifier pin could not be confirmed safe (see "Making the amplifier safe") |
 | `config` | the config failed its limits at the start itself |
 | `turn_on_check` | the turn-on check refused (stage 7; the hook passes for now) |
 
@@ -99,15 +99,33 @@ are described at the top of `collection.py`. The radar writes its data chunks
 there itself; nothing is moved afterwards. How this works with ORCA unchanged,
 and the proposed ORCA patches: `docs/orca-proposals/README.md`.
 
-## After a radar exit: the amplifier
+## Making the amplifier safe
 
-`ampsafe.py`. `manager.amp_safe.policy` is `always` (run the tool after every
-radar exit) or `when_needed` (not after a clean exit that fresh telemetry
-confirms: every run of the tool itself enables the amplifier for 0.3-0.5 s).
-The choice is not decided; `always` is the default. The file
-`<state_dir>/sdr-state-unknown` exists from before each radar launch until the
-amplifier is confirmed safe; the unit's stop hook runs the tool if it finds
-the file.
+`ampsafe.py`. The tool `tools/sdr_gpio_safe/amp_safe` drives the SDR's
+amplifier pin to the shutdown level. Every run of it enables the amplifier for
+0.3-0.5 s itself, so **it runs only when the pin is not known to be safe**
+(`manager.amp_safe.policy: when_needed`, the default; `always` also runs it
+after every radar exit).
+
+The record is the file `<state_dir>/sdr-state`: its first line is `safe` or
+`unknown`; no file means unknown. It is set to `unknown` before every radar
+launch.
+
+| Situation | What happens |
+|---|---|
+| The radar exited cleanly (reached running, not killed, status 0) | safe; the tool does not run |
+| The radar was killed, crashed, exited non-zero or never reached running | the tool runs |
+| Either of the two, with a fresh amplifier reading taken after the exit and the 28 V present | the current decides: shutdown current is safe, enabled current runs the tool |
+| No radar running and the record says unknown, or there is no record (also at manager start) | the tool runs; if a fresh reading shows shutdown current, the record is set to safe without it |
+| The SDR is still in its boot loader (nothing initialised it since power-up) | safe |
+| Enabled current for `idle_enabled_s` (5 s) with no radar process | the tool runs, at most every `retry_s` (60 s) |
+| The tool says ASSUME_ENABLED (exit 3: it initialised the SDR and could not verify the pin) | run again at once, up to `assume_enabled_retries` (2) times, then fault `amp_unsafe` |
+| The tool fails otherwise (NOT_FOUND, BUSY, AMBIGUOUS, TIMEOUT, FAILED, USAGE: nothing was changed) | the record stays as it was; if that is unknown, after a radar exit: fault `amp_unsafe`; with no radar: retried every `retry_s` |
+
+The tool is only ever run by the runner's one thread, never while a radar
+that the manager started is alive; a start asked for meanwhile waits for it.
+The unit's stop hook (`bin/radar-manager-stop-hook`) runs the tool after the
+manager has stopped or died, if the record does not say `safe`.
 
 ## radarctl
 
@@ -133,7 +151,8 @@ wanted and resumes when the gates are good again (power came back).
 | `/run/radar-runner/user/manager.sock` | command socket (mode 0660) |
 | `/var/lib/radar-runner/user/manager-events.jsonl` | event log: state changes, requests, starts, stops, faults, gate changes |
 | `/var/lib/radar-runner/user/override-no-amp-telemetry` | the override |
-| `/var/lib/radar-runner/user/sdr-state-unknown` | SDR GPIO state not known to be safe |
+| `/var/lib/radar-runner/user/sdr-state` | is the SDR's amplifier pin known to be safe: first line `safe` or `unknown` |
+| `/var/lib/radar-runner/user/amp_safe.log` | output of the tool when it ran outside a collection |
 
 ## Tests
 

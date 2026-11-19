@@ -419,6 +419,12 @@ class ManagerLogic:
             self.auto_blocked = False
         self._finish(t)
 
+    def amp_unsafe(self, t, detail):
+        """With no radar running, the amplifier could not be made safe (the tool said ASSUME_ENABLED)."""
+        if self.phase == IDLE and (self.fault or {}).get("kind") != "amp_unsafe":
+            self._set_fault(t, "amp_unsafe", f"the amplifier could not be confirmed safe: {detail}")
+        self._finish(t)
+
     def collection_created(self, t, name):
         self.collection = name
 

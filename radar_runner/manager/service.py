@@ -34,7 +34,11 @@ class Manager(Service):
         self._given = {"panel": panel, "runner": runner, "gates": gate_list}
         self.logic = L.ManagerLogic(L.LogicConfig.from_config(self.cfg))
         self.overrides = gates.Overrides(config["paths"]["state_dir"])
-        self.sdr_flag = ampsafe.SdrStateFlag(config["paths"]["state_dir"])
+        self.sdr_state = ampsafe.SdrState(config["paths"]["state_dir"])
+        self.amp_telemetry = ampsafe.AmpTelemetry(config)
+        self.sdr_gate = gates.SdrGate(self.cfg["gates"]["sdr"])
+        self._enabled_since = None              # since when telemetry has said "enabled" with no radar
+        self._next_tool = 0.0
         self.socket_path = os.path.join(config["paths"]["run_dir"], control.SOCKET_NAME)
         self.event_log = control.EventLog(
             self.cfg["events"]["file"] or os.path.join(config["paths"]["state_dir"], "manager-events.jsonl"),
@@ -63,12 +67,10 @@ class Manager(Service):
         self.server = control.ControlServer(self.socket_path, self._handle_request)
         self.server.open()                      # an error here ends the process: systemd restarts it
         self._record({"event": "manager_started", "pid": os.getpid(),
-                      "sdr_state_unknown": self.sdr_flag.is_set(),
+                      "sdr_state": self.sdr_state.get(), "sdr_state_why": self.sdr_state.why(),
                       "override_no_amp_telemetry": self.overrides.is_set()})
         if self.overrides.is_set():
             self.log.warning("OVERRIDE is set: the radar may run without amplifier telemetry")
-        if self.sdr_flag.is_set():
-            self.log.warning("the SDR GPIO state was not confirmed safe when the last radar run ended")
 
     # ------------------------------------------------- inputs from other threads
 
@@ -119,6 +121,7 @@ class Manager(Service):
             self._act()
         if now >= self._next_gates:
             self._check_gates(now)
+            self._keep_sdr_safe(now)
         else:
             self.logic.tick(now)
         changed = self._act() or changed
@@ -147,6 +150,41 @@ class Manager(Service):
         if results.get("telemetry") is not None and results["telemetry"].kind == "override" and self.runner.busy:
             self.runner.add_flag("no_amp_telemetry")
         self.logic.gates(now, results)
+
+    def _sdr_presence(self):
+        found = self.sdr_gate.find()
+        if not found:
+            return ampsafe.ABSENT
+        boot = self.cfg["gates"]["sdr"]["bootloader_product"]
+        return ampsafe.BOOTLOADER if all(product == boot for _, _, product in found) else ampsafe.LOADED
+
+    def _keep_sdr_safe(self, now):
+        """With no radar process: mark the SDR safe, or run the tool, as ampsafe.idle_need says.
+
+        This covers a manager that starts with the state unknown or with no
+        record, a tool run that did not succeed (retried every retry_s), and
+        enabled current with no radar. The tool runs on the runner's thread.
+        """
+        cfg = self.cfg["amp_safe"]
+        if self.logic.phase != L.IDLE or self.logic.closing or self.runner.busy:
+            self._enabled_since = None
+            return
+        reading, _ = self.amp_telemetry.now()
+        if reading is False:
+            if self._enabled_since is None:
+                self._enabled_since = now
+        else:
+            self._enabled_since = None
+        enabled_for = now - self._enabled_since if self._enabled_since is not None else 0.0
+        action, why = ampsafe.idle_need(self.sdr_state.get(), self._sdr_presence(), reading, enabled_for,
+                                        cfg["idle_enabled_s"])
+        if action == "mark_safe":
+            error = self.sdr_state.set(ampsafe.SAFE, why)
+            self._record({"event": "sdr_state", "state": ampsafe.SAFE, "why": why, "error": error})
+        elif action == "run" and now >= self._next_tool:
+            self._next_tool = now + cfg["retry_s"]
+            if self.runner.make_safe(why):
+                self._record({"event": "amp_safe_run", "why": why})
 
     def _request(self, now, request):
         cmd = request.get("cmd")
@@ -182,6 +220,12 @@ class Manager(Service):
         elif name == "ended":
             self._record({"event": "ended", **data})
             self.logic.ended(now, data)
+        elif name == "safe_done":
+            self._record({"event": "amp_safe_done", **data})
+            if not data.get("ok"):
+                self.log.error("the amplifier was not made safe: %s", data.get("detail"))
+                if data.get("status") == ampsafe.ASSUME_ENABLED:
+                    self.logic.amp_unsafe(now, data.get("detail", ""))
 
     def _act(self):
         """Carry out what the logic decided. Returns True if there was anything."""
@@ -229,10 +273,12 @@ class Manager(Service):
         radar = self.runner.snapshot()
         snap.update({
             # True when no radar process exists and the amplifier has been made safe: `radarctl stop --wait`
-            "idle": self.logic.phase == L.IDLE and not radar.get("active"),
+            "idle": self.logic.phase == L.IDLE and not radar.get("active") and not self.runner.busy,
             "radar": radar,
             "overrides": self.overrides.snapshot(),
-            "sdr_state_unknown": self.sdr_flag.is_set(),
+            "sdr_state": self.sdr_state.get(),              # "safe" or "unknown" (ampsafe.py)
+            "sdr_state_why": self.sdr_state.why(),
+            "making_amp_safe": bool(getattr(self.runner, "making_safe", False)),
             "amp_safe_policy": self.cfg["amp_safe"]["policy"],
             "panel": self.panel.snapshot(),
             "socket": self.socket_path,
@@ -252,7 +298,8 @@ class Manager(Service):
         self._act()
         self.panel.show(*L.LEDS[L.STOPPING] if self.runner.busy else (L.OFF, L.OFF))
         orca, amp = self.cfg["orca"], self.cfg["amp_safe"]
-        limit = orca["stop_timeout_s"] + amp["timeout_s"] + amp["confirm_timeout_s"] + 15.0
+        limit = (orca["stop_timeout_s"] + amp["confirm_timeout_s"]
+                 + amp["timeout_s"] * (1 + max(0, amp["assume_enabled_retries"])) + 15.0)
         deadline = time.monotonic() + limit
         done = False
         while not done and time.monotonic() < deadline:

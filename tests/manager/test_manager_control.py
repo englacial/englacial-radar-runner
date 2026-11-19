@@ -119,7 +119,8 @@ def test_status_text():
         "state": "fault", "detail": "", "fault": {"kind": "amp_unsafe", "reason": "not verified"},
         "not_ready": ["sdr: SDR not found on USB"], "run_wanted": False, "last_end": "stopped (manual: stop by button)",
         "retries": {"failed_starts": 2, "max_retries": 3, "interruptions": 0, "max_resumes": 5},
-        "overrides": {"no_amp_telemetry": True}, "sdr_state_unknown": True,
+        "overrides": {"no_amp_telemetry": True}, "sdr_state": "unknown",
+        "sdr_state_why": "radar launched, collection x", "making_amp_safe": True,
         "auto": {"enabled": True, "source": "gps", "state": "moving", "blocked": True},
         "gates": {"telemetry": {"ok": True, "reason": "", "note": "OVERRIDE"},
                   "sdr": {"ok": False, "reason": "SDR not found on USB"}},
@@ -127,7 +128,8 @@ def test_status_text():
         "config_warnings": ["x.yaml: unknown setting a: ignored"]})
     for expected in ("state:      fault", "fault:      amp_unsafe: not verified", "not ready:  sdr: SDR not found on USB",
                      "last run:   stopped (manual: stop by button)", "2 failed starts (limit 3)",
-                     "RUNNING WITHOUT AMPLIFIER TELEMETRY IS ALLOWED", "GPIO state not known to be safe",
+                     "RUNNING WITHOUT AMPLIFIER TELEMETRY IS ALLOWED", "amplifier pin NOT known to be safe (radar launched, collection x)",
+                     "the make-amplifier-safe tool is running",
                      "gps says moving, blocked until stationary", "  telemetry ok  [OVERRIDE]",
                      "  sdr       NOT OK: SDR not found on USB", "READY (yellow) fast_blink, RUNNING (green) off",
                      "config:     x.yaml: unknown setting a: ignored"):

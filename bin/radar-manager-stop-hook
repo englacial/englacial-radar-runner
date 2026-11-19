@@ -1,0 +1,19 @@
+#!/bin/sh
+# Stop hook of radar-manager.service (ExecStopPost): runs after every stop of
+# the unit, clean or not, once all its processes are gone, so no radar is alive.
+#
+# If the SDR's amplifier pin is not known to be safe (radar_runner/manager/ampsafe.py:
+# the first line of the state file is not "safe"), run the make-amplifier-safe
+# tool, and record "safe" if it succeeds. That is the case when the manager died
+# or was killed while a radar ran, or when its own attempt failed. After a clean
+# stop the record says "safe" and nothing is done.
+#
+#   radar-manager-stop-hook [state file] [tool]
+here=$(dirname "$(readlink -f "$0")")
+state=${1:-/var/lib/radar-runner/user/sdr-state}
+tool=${2:-$here/../tools/sdr_gpio_safe/amp_safe}
+
+[ "$(head -n1 "$state" 2>/dev/null)" = safe ] && exit 0
+"$tool" --timeout 14 || exit $?
+printf 'safe\n%s made safe by the stop hook of radar-manager.service\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    > "$state.tmp" && mv "$state.tmp" "$state"

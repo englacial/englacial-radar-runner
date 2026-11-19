@@ -195,7 +195,7 @@ def test_failed_chirp_or_build_is_a_failed_start_without_a_radar(env, events, ru
     assert not info["launched"] and info["amp_safe"] is None and env.amp_safe_calls() == 0
     meta = env.metadata()
     assert meta["end"]["how"] == "failed" and meta["recording_started"] is None
-    assert not ampsafe.SdrStateFlag(env.state_dir).is_set()
+    assert not os.path.exists(os.path.join(env.state_dir, "sdr-state"))     # the SDR was never touched
 
 
 def test_slow_chirp_generation_times_out(env, events, runner):
@@ -238,7 +238,7 @@ def test_missing_radar_program(env, events, runner):
     runner.start(REQUEST)
     info = events.wait("ended")
     assert info["kind"] == "launch" and not info["launched"] and env.amp_safe_calls() == 0
-    assert not ampsafe.SdrStateFlag(env.state_dir).is_set()
+    assert not os.path.exists(os.path.join(env.state_dir, "sdr-state"))
 
 
 def test_turn_on_check_hook_can_refuse(env, events):
@@ -368,30 +368,56 @@ def test_snapshot_while_running(env, events, runner):
 
 # ------------------------------------------------------------- amplifier made safe
 
-@pytest.mark.parametrize("status, meaning", [(3, "not verified"), (2, "SDR not found"), (5, "failed")])
-def test_failed_amp_safe_command_is_reported(env, events, runner, status, meaning):
+@pytest.mark.parametrize("status, name", [(2, "NOT_FOUND"), (5, "FAILED"), (6, "BUSY"), (7, "AMBIGUOUS"), (64, "USAGE")])
+def test_tool_failure_that_changed_nothing_after_a_clean_exit_leaves_the_pin_known_safe(env, events, runner,
+                                                                                        status, name):
+    # Policy "always": the tool runs although a clean radar exit left the pin safe. These
+    # exit codes mean "state unknown and unchanged by the call", so what was known still holds.
     info = run_and_stop(env, events, runner, record_s=0.1, amp_safe=status)
-    assert info["amp_safe"] is False and f"status {status}" in info["amp_safe_detail"]
-    assert meaning in info["amp_safe_detail"]
+    assert info["amp_safe"] is True and info["amp_safe_command_run"] is True and env.amp_safe_calls() == 1
+    assert f"status {status} ({name})" in info["amp_safe_detail"]
+    assert "known safe before and is unchanged" in info["amp_safe_detail"]
+    assert env.sdr_state() == "safe"
+
+
+@pytest.mark.parametrize("status", [2, 5, 6])
+def test_tool_failure_after_an_unclean_exit_is_not_safe(env, events, runner, status):
+    env.behave(radar="crash", amp_safe=status)
+    runner.start(REQUEST)
+    info = events.wait("ended")
+    assert info["amp_safe"] is False and "not known safe before" in info["amp_safe_detail"]
+    assert env.metadata()["end"]["amp_safe"] is False and env.sdr_state() == "unknown"
+
+
+def test_assume_enabled_is_retried_at_once_and_then_reported(env, events, runner, caplog):
+    # Exit 3: the tool itself initialised the SDR and could not verify the pin.
+    info = run_and_stop(env, events, runner, record_s=0.1, amp_safe=3)
+    assert env.amp_safe_calls() == 2                        # assume_enabled_retries = 1 in these tests
+    assert info["amp_safe"] is False and "status 3 (ASSUME_ENABLED) in each of 2 attempts" in info["amp_safe_detail"]
+    assert env.sdr_state() == "unknown" and "URGENT" in caplog.text
     assert env.metadata()["end"]["amp_safe"] is False
-    assert ampsafe.SdrStateFlag(env.state_dir).is_set()        # still not known to be safe
 
 
 def test_hanging_amp_safe_command_times_out(env, events, runner):
     env.config["manager"]["amp_safe"]["timeout_s"] = 0.5
     info = run_and_stop(env, events, runner, record_s=0.1, amp_safe="hang")
     assert info["amp_safe"] is False and "no result within 0.5 s" in info["amp_safe_detail"]
+    assert env.sdr_state() == "unknown"                     # killed half way: it may have initialised the SDR
 
 
-def test_sdr_state_flag_is_set_while_the_radar_runs_and_cleared_after(env, events, runner):
-    flag = ampsafe.SdrStateFlag(env.state_dir)
-    assert not flag.is_set()
+def test_sdr_state_is_unknown_while_the_radar_runs_and_safe_after(env, events, runner):
+    path = os.path.join(env.state_dir, "sdr-state")
+    assert not os.path.exists(path) and env.sdr_state() == "unknown"       # no record = unknown
     runner.start(REQUEST)
     events.wait("started")
-    assert flag.is_set()
+    with open(path) as f:
+        lines = f.read().splitlines()
+    assert lines[0] == "unknown" and "radar launched, collection b00001_s001_" in lines[1]
     runner.stop("x")
     events.wait("ended")
-    assert not flag.is_set()
+    assert env.sdr_state() == "safe"
+    with open(path) as f:
+        assert f.readline() == "safe\n"                     # what the unit's stop hook tests
 
 
 def confirm(state, text="telemetry"):
@@ -404,39 +430,98 @@ def confirm(state, text="telemetry"):
     return Fake()
 
 
-def test_policy_when_needed_skips_the_command_after_a_confirmed_clean_exit(env, events):
-    env.config["manager"]["amp_safe"]["policy"] = "when_needed"
-    telemetry = confirm(True, "amplifier current 0.16 A at 28.0 V")
-    r = Runner(env.config, events, amp_telemetry=telemetry)
-    info = run_and_stop(env, events, r, record_s=0.1)
-    assert info["amp_safe"] is True and info["amp_safe_command_run"] is False
-    assert "clean exit confirmed" in info["amp_safe_detail"] and env.amp_safe_calls() == 0
-    assert not ampsafe.SdrStateFlag(env.state_dir).is_set()
-    assert env.metadata()["end"]["amp_safe_command_run"] is False
+def test_default_policy_is_when_needed():
+    from radar_runner.manager.config import MANAGER_DEFAULTS
+    assert MANAGER_DEFAULTS["amp_safe"]["policy"] == "when_needed"
+    assert MANAGER_DEFAULTS["amp_safe"]["command"][1:] == ["--timeout", "14"]
+    assert MANAGER_DEFAULTS["amp_safe"]["timeout_s"] > 14
 
 
-@pytest.mark.parametrize("state", [False, None])
-def test_policy_when_needed_runs_the_command_if_telemetry_does_not_confirm(env, events, state):
+@pytest.mark.parametrize("state, text", [(True, "amplifier current 0.16 A at 28.0 V"),
+                                         (None, "no fresh amplifier reading after the exit")])
+def test_when_needed_does_not_run_the_tool_after_a_clean_exit(env, events, state, text):
+    # Known safe: the radar, with the amplifier pin configured, exited cleanly; telemetry agrees or is absent.
     env.config["manager"]["amp_safe"]["policy"] = "when_needed"
-    r = Runner(env.config, events, amp_telemetry=confirm(state))
+    r = Runner(env.config, events, amp_telemetry=confirm(state, text))
     info = run_and_stop(env, events, r, record_s=0.1)
-    assert info["amp_safe_command_run"] is True and env.amp_safe_calls() == 1
+    assert info["amp_safe"] is True and info["amp_safe_command_run"] is False and env.amp_safe_calls() == 0
+    assert info["amp_safe_detail"].startswith("command not run: ") and text in info["amp_safe_detail"]
+    assert env.sdr_state() == "safe" and env.metadata()["end"]["amp_safe_command_run"] is False
+
+
+def test_when_needed_runs_the_tool_if_telemetry_shows_enabled_current_after_a_clean_exit(env, events):
+    env.config["manager"]["amp_safe"]["policy"] = "when_needed"
+    r = Runner(env.config, events, amp_telemetry=confirm(False, "amplifier current 2.50 A at 27.5 V"))
+    info = run_and_stop(env, events, r, record_s=0.1)
+    assert info["amp_safe_command_run"] is True and env.amp_safe_calls() == 1 and info["amp_safe"] is True
+    assert "telemetry shows the amplifier enabled" in info["amp_safe_detail"] and env.sdr_state() == "safe"
 
 
 @pytest.mark.parametrize("behaviour", ["crash", "fail_start", "ignore_sigint"])
-def test_policy_when_needed_runs_the_command_after_an_unclean_exit(env, events, behaviour):
+@pytest.mark.parametrize("state, runs", [(None, 1), (False, 1), (True, 0)])
+def test_when_needed_after_an_unclean_exit(env, events, behaviour, state, runs):
+    # Killed, crashed, or never running: the tool runs, unless a fresh reading
+    # with the 28 V present shows shutdown current: then the current decides.
     env.config["manager"]["amp_safe"]["policy"] = "when_needed"
     env.config["manager"]["orca"]["stop_timeout_s"] = 0.4
-    telemetry = confirm(True)
-    r = Runner(env.config, events, amp_telemetry=telemetry)
+    r = Runner(env.config, events, amp_telemetry=confirm(state))
     env.behave(radar=behaviour)
     r.start(REQUEST)
     if behaviour == "ignore_sigint":
         events.wait("started")
         r.stop("x")
     info = events.wait("ended")
-    assert info["amp_safe_command_run"] is True and env.amp_safe_calls() == 1
-    assert type(telemetry).calls == 0           # telemetry is not even asked
+    assert env.amp_safe_calls() == runs and info["amp_safe_command_run"] is bool(runs)
+    assert info["amp_safe"] is True and env.sdr_state() == "safe"
+
+
+# -------------------------------------------------- the tool outside a radar run
+
+def test_make_safe_runs_the_tool_and_records_the_result(env, events, runner):
+    assert runner.make_safe("the state is not known") is True
+    done = events.wait("safe_done")
+    assert done["ok"] and done["state"] == "safe" and done["status"] == 0 and done["why"] == "the state is not known"
+    assert env.amp_safe_calls() == 1 and env.sdr_state() == "safe" and not runner.busy
+    assert os.path.exists(os.path.join(env.state_dir, "amp_safe.log"))     # its output, outside any collection
+
+
+def test_make_safe_is_refused_while_a_radar_runs(env, events, runner):
+    runner.start(REQUEST)
+    events.wait("started")
+    assert runner.make_safe("x") is False                   # never while the radar process is alive
+    runner.stop("x")
+    events.wait("ended")
+    assert env.amp_safe_calls() == 1 and "safe_done" not in events.names()
+
+
+def test_a_start_asked_for_while_the_tool_runs_waits_for_it(env, events, runner):
+    env.config["manager"]["amp_safe"]["timeout_s"] = 1.0
+    env.behave(amp_safe="hang")
+    assert runner.make_safe("x") and runner.making_safe and runner.busy
+    assert runner.make_safe("again") is False               # one at a time
+    env.behave()
+    runner.start(REQUEST)
+    events.wait("started")
+    assert events.names().index("safe_done") < events.names().index("collection")
+    assert runner.shutdown(10.0)
+
+
+def test_make_safe_assume_enabled_and_unchanged_failures(env, events, runner):
+    env.behave(amp_safe=3)
+    runner.make_safe("x")
+    done = events.wait("safe_done")
+    assert not done["ok"] and done["status"] == 3 and done["state"] == "unknown" and env.amp_safe_calls() == 2
+    env.behave(amp_safe=6)                                  # BUSY: nothing changed, still unknown
+    runner.make_safe("x")
+    done = events.wait("safe_done", count=2)
+    assert not done["ok"] and done["status"] == 6 and env.sdr_state() == "unknown" and env.amp_safe_calls() == 3
+    env.behave()
+    runner.make_safe("x")
+    assert events.wait("safe_done", count=3)["ok"] and env.sdr_state() == "safe"
+    env.behave(amp_safe=6)                                  # BUSY again: what was known still holds
+    runner.make_safe("x")
+    done = events.wait("safe_done", count=4)
+    assert done["ok"] and done["state"] == "safe" and env.sdr_state() == "safe"
 
 
 # ---------------------------------------------------------------------- output log
@@ -483,7 +568,7 @@ def test_amplifier_is_made_safe_even_if_the_data_drive_has_gone(env, events, run
     runner.stop("data drive gone")
     info = events.wait("ended")
     assert info["amp_safe"] is True and env.amp_safe_calls() == 1       # no log file, but it ran
-    assert not ampsafe.SdrStateFlag(env.state_dir).is_set()
+    assert env.sdr_state() == "safe"
 
 
 def test_an_internal_error_ends_the_run_and_the_runner_lives_on(env, events):

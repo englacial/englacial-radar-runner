@@ -61,7 +61,10 @@ class Env:
             start_timeout_s=3.0, stop_timeout_s=1.5, chirp_timeout_s=5.0, build_timeout_s=5.0)
         m["data"].update(chunk_max_s=0.4)       # two records per data file
         m["amp_safe"].update(command=[sys.executable, os.path.join(self.orca, "amp_safe.py"), "--timeout", "2"],
-                             timeout_s=3.0, confirm_settle_s=0.0, confirm_timeout_s=0.5)
+                             timeout_s=3.0, confirm_settle_s=0.0, confirm_timeout_s=0.5,
+                             # Most tests count the runs of the tool: "always" makes that one per radar
+                             # exit. The default, "when_needed", has its own tests.
+                             policy="always", retry_s=0.3, idle_enabled_s=0.3, assume_enabled_retries=1)
         m["panel"]["enabled"] = False
         self.sdr(speed=5000, product="USRP B200")
         self._writers = {}
@@ -73,6 +76,11 @@ class Env:
         with open(self.control + ".tmp", "w") as f:
             json.dump(control, f)
         os.replace(self.control + ".tmp", self.control)
+
+    def sdr_state(self):
+        """The record of the SDR's state: "safe" or "unknown" (also when there is no record)."""
+        from radar_runner.manager import ampsafe
+        return ampsafe.SdrState(self.state_dir).get()
 
     def amp_safe_calls(self):
         try:

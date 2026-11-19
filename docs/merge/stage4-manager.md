@@ -32,11 +32,16 @@ is the list of what belongs in them. Delete this file once it is done.
 3. The power service's hook, in `/etc/radar-runner/power.toml`:
    `stop_radar = ["/home/englacial/englacial-radar-runner/bin/radarctl", "stop", "--interrupt", "--wait", "--timeout", "4"]`
    and review `stop_radar_timeout_s` (5 s): the wait covers the radar's exit
-   (up to `orca.stop_timeout_s` = 3 s) **and** the make-amplifier-safe step,
-   which with policy `always` takes as long as the tool does. Either raise the
-   hook's timeout to cover both, or accept that the hook returns before the
-   amplifier step has finished (the power service's own `amp_safe` hook then
-   runs the tool again; the tool serialises concurrent callers).
+   (up to `orca.stop_timeout_s` = 3 s) **and** the amplifier step. With the
+   default policy that step is a wait for an amplifier reading taken after the
+   exit (about 1 s, `amp_safe.confirm_settle_s`; up to `confirm_timeout_s`,
+   4 s, if telemetry is not fresh) and, only when the pin is then not known to
+   be safe, the tool itself (up to 3 x 20 s). Either raise the hook's
+   timeout, or accept that the hook can return before the amplifier step has
+   finished (the tool serialises concurrent callers).
+   The power service's own `amp_safe` hook can test the manager's record
+   before it runs the tool:
+   `[ "$(head -n1 /var/lib/radar-runner/user/sdr-state 2>/dev/null)" = safe ]`.
 4. The data root exists once the drive is mounted: the manager creates
    `/mnt/nvme/radar-runner/collections` itself; `/mnt/nvme/radar-runner` must
    be writable by `englacial` (the telemetry stage already needs that).
@@ -52,7 +57,7 @@ No new package and no new Python dependency: PyYAML, gpiozero and lgpio are in
 * `/usr/local/bin/radarctl` resolves to the checkout's `bin/radarctl`; `radarctl status` exits 0 (3 = manager not running).
 * `/usr/bin/setpriv` exists and knows `--pdeathsig` (`setpriv --pdeathsig KILL true` exits 0).
 * User `englacial` may open `/dev/gpiochip4` (group `dialout` on this image) and has `rtprio 99` (`/etc/security/limits.conf`; the unit sets `LimitRTPRIO=99`).
-* `manager.amp_safe.command[0]` exists and is executable.
+* `manager.amp_safe.command[0]` exists and is executable, and so is `bin/radar-manager-stop-hook` (the unit's `ExecStopPost`).
 * `manager.radar_config` exists and passes the limits:
   `.venv/bin/python -c "from radar_runner.manager import limits, config; c,_=config.load(); print(limits.check(limits.load_file(c['manager']['radar_config']), c['manager']['limits']))"` prints `[]`.
 * The data drive: `manager.gates.data.mount_point` is a mount point and the root is writable by `englacial`.
