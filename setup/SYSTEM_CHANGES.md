@@ -530,7 +530,7 @@ after an OLA reset (ZED-F9P, HPG 1.51, protocol 27.50):
 | SSH enabled (`ssh.socket`) * | stock image | remote access |
 | Network configuration | changed by hand on 2026-11-14 (`~/20261114-network-backups`); not described here and never touched by this repository | Starlink, local access |
 | miniforge in `~/miniforge3` with the `orca` environment * | installed by hand | ORCA chirp generation, UHD build |
-| Patched UHD in `~/uhd-patched` (source `~/uhd`, `ORCA_UHD_BUILD.yaml`) * | built by hand, see `~/radar-testbench/UHD_751_FIX.md` | the radar |
+| Patched UHD in `~/uhd-patched-gpio` (source `~/uhd-gpio` at the commit in `setup/pins.toml`, `ORCA_UHD_BUILD.yaml`) * | built by hand in the `orca` environment: `~/orca/tests/hil/scripts/build_uhd.sh ~/uhd-gpio ~/uhd-patched-gpio`; patches: `~/radar-testbench/UHD_751_FIX.md` (TR switch) and `docs/uhd-proposals/` (front-panel pins) | the radar, the GPIO reset tool |
 | ORCA checkout in `~/orca` * | cloned by hand | the radar |
 | Bootloader EEPROM: version 2026/01/21, `BOOT_ORDER=0xf461`, defaults otherwise * | stored in the Pi, not on the card | boot |
 
@@ -559,7 +559,10 @@ In this order, before `setup/setup.sh`:
 4. `/etc/fstab` line for the NVMe drive (with `nofail`), `rtprio` line in
    `/etc/security/limits.conf`, UHD udev rules.
 5. miniforge and the `orca` environment; the patched UHD build in
-   `~/uhd-patched`; the ORCA checkout at the pinned commit.
+   `~/uhd-patched-gpio` (and no other UHD that a program here could load:
+   `setup/check.py` checks what the reset tool and the radar load); the ORCA
+   checkout at the pinned commit; then build the reset tool
+   (`tools/sdr_gpio_safe/README.md`).
 6. This repository in `/home/englacial/englacial-radar-runner` (the unit file
    expects that path) at the release tag; uv into `~/.local/bin` (verify the
    checksum above); copy `wheelhouse/` from another unit or run

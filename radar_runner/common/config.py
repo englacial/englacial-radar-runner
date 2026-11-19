@@ -230,11 +230,21 @@ DEFAULTS = {
 
         "orca": {
             "dir": "/home/englacial/orca",
-            "env": [],                          # extra environment for the commands below, as "NAME=value"
+            # Extra environment for the commands below, as "NAME=value". ORCA's build reads CONDA_PREFIX.
+            "env": ["CONDA_PREFIX=/home/englacial/miniforge3/envs/orca"],
             "chirp_command": ["/home/englacial/miniforge3/envs/orca/bin/python", "generate_chirp.py", "{config}"],
             "chirp_cwd": "preprocessing",       # relative to dir
             "chirp_timeout_s": 120.0,
-            "build_commands": [["cmake", ".."], ["make", "radar"]],     # only the radar target, not ORCA's tests
+            # Only the radar target, not ORCA's tests. The UHD is named in full, so that a new build
+            # directory and an old one give the same binary: the build that leaves the SDR's
+            # front-panel pins as inputs at initialisation (setup/pins.toml: uhd_prefix), with the
+            # environment that holds Boost and yaml-cpp. The two -U drop the library and headers
+            # that an earlier configure found: without them an old build directory keeps its UHD.
+            "build_commands": [["cmake", "..", "-UUHD_LIBRARIES", "-UUHD_INCLUDE_DIRS",
+                                "-DCMAKE_PREFIX_PATH=/home/englacial/uhd-patched-gpio;/home/englacial/miniforge3/envs/orca",
+                                "-DUHD_DIR=/home/englacial/uhd-patched-gpio/lib/cmake/uhd",
+                                "-DCMAKE_BUILD_RPATH=/home/englacial/uhd-patched-gpio/lib"],
+                               ["make", "radar"]],
             "build_cwd": "sdr/build",
             "build_timeout_s": 900.0,
             "radar_command": ["./radar", "{config_rel}"],   # {config_rel}: the config, relative to dir

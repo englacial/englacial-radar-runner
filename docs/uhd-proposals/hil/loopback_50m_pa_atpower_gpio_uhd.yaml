@@ -1,0 +1,14 @@
+# The bench "at power" PA fixture (chain in HARDWARE_CONFIG.md) run against the UHD build with the front-panel GPIO
+# patch (~/uhd-patched-gpio, source ~/uhd-gpio) instead of ~/uhd-patched. Everything else is
+# inherited from the testbench fixture. Used for the HIL pass before adopting the patch (2026-11-19);
+# since then the standard HIL fixture names this build itself, so this file is only a record.
+fixture_id: loopback_50m_pa_atpower_gpio_uhd
+extends: /home/englacial/radar-testbench/fixtures/loopback_50m_pa_atpower.yaml
+description: The "at power" PA loopback (VVA 5 V, base tx_gain 60), UHD with the front-panel GPIO patch
+judge: expect                 # as in the parent; judge is not inherited
+uhd:
+  source_dir: ~/uhd-gpio
+  install_prefix: ~/uhd-patched-gpio
+  expected_commit: c3e2439c5112c5fbfb56db1d2bb856429adf7cb5
+  env:
+    UHD_IMAGES_DIR: ~/uhd-patched-gpio/share/uhd/images

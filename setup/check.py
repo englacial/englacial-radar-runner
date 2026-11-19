@@ -133,6 +133,34 @@ def git(path, *args):
     return out("git", "-c", f"safe.directory={path}", "-C", path, *args)
 
 
+# The one UHD build that every program here uses: it leaves the SDR's front-panel pins as inputs
+# at initialisation, so opening the SDR does not enable the amplifier (docs/uhd-proposals).
+_uhd = PINS.get("uhd_prefix") or "~/uhd-patched-gpio"
+UHD_PREFIX = os.path.join(HOME, _uhd[2:]) if _uhd.startswith("~/") else _uhd     # the owner's home, also under sudo
+
+
+def loaded_libuhd(binary, extra_env=()):
+    """The libuhd file that `binary` loads when started with `extra_env` ("NAME=value" items) and
+    no LD_LIBRARY_PATH of the caller's; "" if that cannot be told."""
+    env = {k: v for k, v in os.environ.items() if k not in ("LD_LIBRARY_PATH", "LD_PRELOAD")}
+    env.update(str(item).split("=", 1) for item in extra_env if "=" in str(item))
+    try:
+        text = subprocess.run(["ldd", binary], capture_output=True, text=True, timeout=30, env=env,
+                              stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    m = re.search(r"libuhd\.so\S*\s+=>\s+(/\S+)", text)
+    return os.path.realpath(m.group(1)) if m else ""
+
+
+def check_loads_patched_uhd(name, binary, extra_env=()):
+    lib = loaded_libuhd(binary, extra_env)
+    want = os.path.realpath(os.path.join(UHD_PREFIX, "lib"))
+    check(name, os.path.dirname(lib) == want, lib or "no libuhd found by ldd",
+          f"a library in {want}: any other UHD drives the amplifier's enable pin low for about half a second "
+          "each time the SDR is opened")
+
+
 def logind(prop):
     rc, text, err = run("busctl", "get-property", "org.freedesktop.login1", "/org/freedesktop/login1",
                         "org.freedesktop.login1.Manager", prop)
@@ -330,13 +358,13 @@ def _(name):
 
 @item("patched UHD build")
 def _(name):
-    path = os.path.join(HOME, "uhd-patched", "ORCA_UHD_BUILD.yaml")
+    path = os.path.join(UHD_PREFIX, "ORCA_UHD_BUILD.yaml")
     text = read(path)
     if text is None:
         report(FAIL, name, f"{path} missing")
         return
     fields = dict(re.findall(r'^(\w+):\s*"?([^"\n]*)"?\s*$', text, re.M))
-    lib = os.path.join(HOME, "uhd-patched", "lib", "libuhd.so")
+    lib = os.path.join(UHD_PREFIX, "lib", "libuhd.so")
     check(name, os.path.exists(lib) and fields.get("dirty") == "false",
           f"{fields.get('uhd_version')}, built {fields.get('built_utc')}, dirty: {fields.get('dirty')}, "
           f"libuhd.so {'present' if os.path.exists(lib) else 'MISSING'}", "library present, built from a clean tree")
@@ -997,6 +1025,25 @@ def _(name):
     record = read(os.path.join(MANAGER_STATE_DIR, "sdr-state"))
     report(INFO, "SDR amplifier pin record", " ".join(record.split("\n")[:2]) if record else
            "no record yet (treated as unknown)")
+
+
+@item("reset tool loads the patched UHD")
+def _(name):
+    binary = os.path.join(os.path.dirname(AMP_SAFE), "build", "sdr_gpio_safe")
+    if not os.access(binary, os.X_OK):
+        raise Skip("the tool is not built")
+    check_loads_patched_uhd(name, binary)
+
+
+@item("radar binary loads the patched UHD")
+def _(name):
+    orca = manager_settings()["manager"]["orca"]
+    radar = os.path.join(orca["dir"], orca["radar_cwd"], orca["radar_command"][0])
+    if os.path.exists(radar):       # as last built; the manager rebuilds it at every start
+        check_loads_patched_uhd(name, radar, orca["env"])
+    else:
+        report(INFO, name, f"{radar} is not built yet (the manager builds it at the first start; "
+               "run this check again after that)")
 
 
 @item("radar config and its limits")

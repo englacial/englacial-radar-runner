@@ -179,10 +179,12 @@ cmake -S tools/sdr_gpio_safe -B tools/sdr_gpio_safe/build
 cmake --build tools/sdr_gpio_safe/build
 ```
 
-No conda environment needs to be active. It links `~/uhd-patched/lib/libuhd.so` only
-(`-DUHD_PREFIX=` to change) and takes the Boost headers from the environment named in
-`~/uhd-patched/ORCA_UHD_BUILD.yaml`. Building does not touch the SDR. Check:
-`ldd tools/sdr_gpio_safe/build/sdr_gpio_safe | grep libuhd` must show `uhd-patched`.
+No conda environment needs to be active. It links `~/uhd-patched-gpio/lib/libuhd.so` only
+(`-DUHD_PREFIX=` to change; a build directory made earlier keeps the prefix it was made with,
+so pass it there) and takes the Boost headers from the environment named in
+`~/uhd-patched-gpio/ORCA_UHD_BUILD.yaml`. Building does not touch the SDR. Check:
+`ldd tools/sdr_gpio_safe/build/sdr_gpio_safe | grep libuhd` must show `uhd-patched-gpio`;
+`setup/check.py` makes the same check.
 
 Tests (no hardware): `.venv/bin/python -B -m pytest tests/tools`
 

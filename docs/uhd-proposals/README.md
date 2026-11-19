@@ -1,7 +1,15 @@
 # UHD change proposals
 
-Drafts for the user to decide on. Nothing here is applied, built or tested on
-hardware. The UHD source is `~/uhd` (c87abfbe8); the installed build is `~/uhd-patched`.
+`fp-gpio-no-output-at-init.patch` was adopted on 2026-11-19 after scope and HIL tests (results
+in the implementation plan, "When to run the GPIO reset tool"). It is commit c3e2439c5 in
+`~/uhd-gpio`, on top of `~/uhd` at c87abfbe8 (the TR-switch fix), installed in
+`~/uhd-patched-gpio` with `~/orca/tests/hil/scripts/build_uhd.sh ~/uhd-gpio ~/uhd-patched-gpio`.
+`hil/` holds the HIL fixture used for the test (the standard HIL fixture now names this build too).
+The earlier build, without the patch, was moved to `~/uhd-patched.retired-20261119`.
+A consequence for programs: the pin now starts as an input, so a program must set the level
+(`OUT` or the ATR levels) before it makes the pin an output (`DDR`). ORCA and the reset tool do;
+the bench helper `gpio_hold` did not and drove the pin low for 0.06-0.1 ms until it was changed.
+The text below is the proposal as written before the tests.
 
 ## fp-gpio-no-output-at-init.patch
 
