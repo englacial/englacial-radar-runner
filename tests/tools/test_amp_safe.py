@@ -221,3 +221,181 @@ def test_time_limit_of_the_tool_comes_first(amp_safe, tmp_path, fake_tool):
     p = run([amp_safe, "--timeout", "3"], fake="hang=find", timeout=10)
     assert p.returncode == TIMEOUT
     assert "sdr_gpio_safe: TIMEOUT: time limit of 2.0 s reached while looking for the SDR" in one_line(p)
+
+
+# --- the state file ---------------------------------------------------------------------------------
+
+STATE_FILE = 8
+OLD = "safe\nwritten earlier by someone else\n"
+
+
+@pytest.fixture
+def state(tmp_path):
+    """A state file that says "safe", in a directory of its own."""
+    (tmp_path / "state").mkdir()
+    path = tmp_path / "state" / "amp_pin"
+    path.write_text(OLD)
+    return path
+
+
+def first_line(path):
+    return path.read_text().splitlines()[0]
+
+
+def only_the_state_file(path):
+    return [p.name for p in path.parent.iterdir()] == [path.name]       # no temporary file left
+
+
+def test_state_file_is_safe_only_after_ok(amp_safe, tmp_path, state):
+    stand_in(tmp_path, f"cp {state} {tmp_path}/during\necho 'sdr_gpio_safe: OK: text'")
+    p = run([amp_safe] + T + ["--state-file", state])
+    assert p.returncode == OK and one_line(p).endswith("sdr_gpio_safe: OK: text; state file: safe")
+    during = (tmp_path / "during").read_text().splitlines()
+    assert during[0] == "unknown" and "sdr_gpio_safe is starting" in during[1]      # while the tool ran
+    after = state.read_text().splitlines()
+    assert after[0] == "safe" and after[1] == "amp_safe: OK (exit 0): sdr_gpio_safe: OK: text"
+    assert "written 20" in after[2] and "boot " in after[2]
+    assert stat.S_IMODE(state.stat().st_mode) == 0o644 and only_the_state_file(state)
+
+
+def test_state_file_is_created_when_missing(amp_safe, tmp_path, state):
+    state.unlink()
+    stand_in(tmp_path, "echo 'sdr_gpio_safe: OK: text'")
+    assert run([amp_safe] + T + ["--state-file", state]).returncode == OK
+    assert first_line(state) == "safe"
+
+
+@pytest.mark.parametrize("body, code", [
+    ("echo 'sdr_gpio_safe: NOT_FOUND: text'; exit 2", NOT_FOUND),
+    ("echo 'sdr_gpio_safe: ASSUME_ENABLED: text'; exit 3", ASSUME_ENABLED),
+    ("echo 'sdr_gpio_safe: TIMEOUT: text'; exit 4", TIMEOUT),
+    ("echo 'sdr_gpio_safe: BUSY: text'; exit 6", BUSY),
+    ("echo 'sdr_gpio_safe: AMBIGUOUS: text'; exit 7", AMBIGUOUS),
+    ("echo 'sdr_gpio_safe: USAGE: text'; exit 64", USAGE),
+    ("exit 0", ASSUME_ENABLED),                                    # no result line
+    ("echo 'sdr_gpio_safe: OK: text'; exit 1", ASSUME_ENABLED),
+    ("kill -SEGV $$", ASSUME_ENABLED),
+], ids=["not-found", "assume-enabled", "timeout", "busy", "ambiguous", "usage", "silent", "exit-1", "signal"])
+def test_state_file_is_unknown_after_any_other_outcome(amp_safe, tmp_path, state, body, code):
+    stand_in(tmp_path, body)
+    p = run([amp_safe] + T + ["--state-file", state])
+    assert p.returncode == code and one_line(p).endswith("; state file: unknown")
+    after = state.read_text().splitlines()
+    assert after[0] == "unknown" and after[1].startswith(f"amp_safe: {NAMES[code]} (exit {code}): ")
+    assert only_the_state_file(state)
+
+
+def test_state_file_is_unknown_after_a_killed_tool(amp_safe, tmp_path, state):
+    stand_in(tmp_path, "exec sleep 60")
+    p = run([amp_safe, "--timeout", "3", "--state-file", state], timeout=10)
+    assert p.returncode == ASSUME_ENABLED and one_line(p).endswith("; state file: unknown")
+    after = state.read_text().splitlines()
+    assert after[0] == "unknown" and "did not end by itself and was killed" in after[1]
+
+
+def test_state_file_is_untouched_when_the_tool_is_not_started(amp_safe, tmp_path, state):
+    # usage errors
+    stand_in(tmp_path, "echo 'sdr_gpio_safe: OK: text'")
+    for argv in (["--state-file", state], ["--timeout", "2", "--state-file", state],
+                 T + ["--state-file", state, "--pin", "3"]):
+        assert run([amp_safe] + argv).returncode == USAGE
+    # another call keeps running
+    stand_in(tmp_path, "sleep 4; echo 'sdr_gpio_safe: OK: text'")
+    first = subprocess.Popen([str(amp_safe)] + T, stdout=subprocess.DEVNULL)
+    try:
+        while not started(tmp_path):
+            time.sleep(0.02)
+        assert run([amp_safe, "--timeout", "3", "--state-file", state], timeout=10).returncode == TIMEOUT
+    finally:
+        assert first.wait(timeout=20) == OK
+    # no binary, and one that is not executable
+    (tmp_path / "build" / "sdr_gpio_safe").unlink()
+    assert run([amp_safe] + T + ["--state-file", state]).returncode == FAILED
+    (tmp_path / "build" / "sdr_gpio_safe").write_text("#!/bin/sh\nexit 0\n")
+    assert run([amp_safe] + T + ["--state-file", state]).returncode == FAILED
+    assert state.read_text() == OLD and only_the_state_file(state) and len(started(tmp_path)) == 1
+
+
+@pytest.mark.parametrize("path", ["amp_pin", "state/amp_pin", "./amp_pin"])
+def test_state_file_must_be_an_absolute_path(amp_safe, tmp_path, path):
+    stand_in(tmp_path, "echo 'sdr_gpio_safe: OK: text'")
+    p = subprocess.run([str(amp_safe)] + T + ["--state-file", path], capture_output=True, text=True, cwd=tmp_path)
+    assert p.returncode == USAGE and started(tmp_path) == []
+    assert not (tmp_path / path).exists()
+
+
+def check_not_writable(amp_safe, tmp_path, path):
+    stand_in(tmp_path, "echo 'sdr_gpio_safe: OK: text'")
+    p = run([amp_safe] + T + ["--state-file", path])
+    assert p.returncode == STATE_FILE
+    line = one_line(p)
+    assert line.startswith("amp_safe: STATE_FILE (exit 8, ") and "cannot write the state file" in line
+    assert "sdr_gpio_safe not started" in line and started(tmp_path) == []
+
+
+def test_tool_is_not_started_when_the_state_file_cannot_be_written(amp_safe, tmp_path, state):
+    check_not_writable(amp_safe, tmp_path, tmp_path / "missing" / "amp_pin")       # no such directory
+    check_not_writable(amp_safe, tmp_path, state / "amp_pin")                       # the directory is a file
+    (tmp_path / "is_dir").mkdir()
+    (tmp_path / "is_dir" / "amp_pin").mkdir()
+    check_not_writable(amp_safe, tmp_path, tmp_path / "is_dir" / "amp_pin")         # the file is a directory
+    (tmp_path / "link").symlink_to(state.parent)
+    check_not_writable(amp_safe, tmp_path, tmp_path / "link" / "amp_pin")           # the directory is a symlink
+    if os.geteuid() != 0:
+        state.parent.chmod(0o555)
+        try:
+            check_not_writable(amp_safe, tmp_path, state)                           # read-only directory
+        finally:
+            state.parent.chmod(0o755)
+    assert state.read_text() == OLD
+    assert [p.name for p in (tmp_path / "is_dir").iterdir()] == ["amp_pin"]         # no temporary file left
+
+
+def test_symlink_at_the_state_file_is_replaced_not_followed(amp_safe, tmp_path, state):
+    target = tmp_path / "target"
+    target.write_text("do not touch\n")
+    state.unlink()
+    state.symlink_to(target)
+    stand_in(tmp_path, "echo 'sdr_gpio_safe: OK: text'")
+    assert run([amp_safe] + T + ["--state-file", state]).returncode == OK
+    assert target.read_text() == "do not touch\n"
+    assert not state.is_symlink() and first_line(state) == "safe"
+
+
+def test_ok_is_still_returned_when_safe_cannot_be_written(amp_safe, tmp_path, state):
+    if os.geteuid() == 0:
+        pytest.skip("root can write anywhere")
+    stand_in(tmp_path, f"chmod 555 {state.parent}\necho 'sdr_gpio_safe: OK: text'")
+    try:
+        p = run([amp_safe] + T + ["--state-file", state])
+    finally:
+        state.parent.chmod(0o755)
+    assert p.returncode == OK
+    assert f"state file {state} NOT updated, it still says unknown: Permission denied" in one_line(p)
+    assert first_line(state) == "unknown" and only_the_state_file(state)
+
+
+def test_wrapper_killed_between_the_two_writes_leaves_unknown(amp_safe, tmp_path, state):
+    stand_in(tmp_path, "sleep 1; echo 'sdr_gpio_safe: OK: text'")
+    wrapper = subprocess.Popen([str(amp_safe)] + T + ["--state-file", str(state)], stdout=subprocess.DEVNULL)
+    while not started(tmp_path):
+        time.sleep(0.02)
+    wrapper.kill()
+    assert wrapper.wait(timeout=10) == -signal.SIGKILL
+    time.sleep(1.5)                              # the tool ends with OK, but nobody records it
+    assert first_line(state) == "unknown" and only_the_state_file(state)
+
+
+def test_without_a_state_file_nothing_is_written(amp_safe, tmp_path, state):
+    stand_in(tmp_path, "echo 'sdr_gpio_safe: OK: text'")
+    p = run([amp_safe] + T)
+    assert p.returncode == OK and one_line(p).endswith("sdr_gpio_safe: OK: text")
+    assert state.read_text() == OLD
+
+
+def test_state_file_with_the_tool_itself(amp_safe, tmp_path, state, fake_tool):
+    shutil.copy2(fake_tool, tmp_path / "build" / "sdr_gpio_safe")
+    assert run([amp_safe] + T + ["--state-file", state]).returncode == OK
+    assert first_line(state) == "safe"
+    assert run([amp_safe] + T + ["--state-file", state], fake="open_throws=1").returncode == ASSUME_ENABLED
+    assert first_line(state) == "unknown" and "assume the amplifier is ENABLED" in state.read_text()

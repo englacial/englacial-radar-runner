@@ -5,7 +5,7 @@ Runs build/sdr_gpio_safe from this directory (see README.md), which drives the S
 amplifier-enable pin high (amplifier shutdown) and verifies it, and makes sure the
 call ends:
 
-    amp_safe --timeout SECONDS [--args STRING]
+    amp_safe --timeout SECONDS [--args STRING] [--state-file PATH]
 
 * --timeout is required: the call returns within that time, whatever the SDR does.
   The tool gets a time limit of its own 1 s shorter; if it is still there 0.5 s
@@ -15,6 +15,12 @@ call ends:
   that kills this script earlier kills the tool while it initialises the SDR, and
   that leaves the amplifier enabled.
 * --args is passed to the tool (UHD device arguments). Nothing else can be passed.
+* --state-file keeps a record of whether the pin is known to be safe. Its first line
+  is "safe" or "unknown"; the rest says why and when. It is set to "unknown" just
+  before the tool starts and to "safe" only after the tool's verified OK. A call that
+  never starts the tool does not change it. If "unknown" cannot be written, the tool
+  is not started (STATE_FILE). Each write replaces the file: temporary file in the
+  same directory, fsync, rename, fsync of the directory; symlinks are not followed.
 * Only one runs at a time: a second call waits for the first, inside its own
   time. A tool left behind keeps later calls out (they time out) for as long
   as it lives.
@@ -23,7 +29,8 @@ call ends:
      0 OK              pin verified high (amplifier shutdown)
      3 ASSUME_ENABLED  the tool initialised the SDR, or may have, and the pin was not
                        verified high: assume this call left the amplifier enabled
-    2 NOT_FOUND, 4 TIMEOUT, 5 FAILED (tool not started), 6 BUSY, 7 AMBIGUOUS, 64 USAGE:
+    2 NOT_FOUND, 4 TIMEOUT, 5 FAILED (tool not started), 6 BUSY, 7 AMBIGUOUS,
+    8 STATE_FILE (record not writable, tool not started), 64 USAGE:
                        the SDR was not initialised by this call and the pin not changed
                        by it; the amplifier state is unknown
   0 is returned only when the tool exited 0 and printed its OK line. A tool that was
@@ -34,27 +41,94 @@ Standard library only; runs on /usr/bin/python3 as any user, including root.
 import argparse
 import fcntl
 import os
+import secrets
 import subprocess
+import threading
 import time
 
-OK, NOT_FOUND, ASSUME_ENABLED, TIMEOUT, FAILED, BUSY, AMBIGUOUS, USAGE = 0, 2, 3, 4, 5, 6, 7, 64
+OK, NOT_FOUND, ASSUME_ENABLED, TIMEOUT, FAILED, BUSY, AMBIGUOUS, STATE_FILE, USAGE = 0, 2, 3, 4, 5, 6, 7, 8, 64
 NAMES = {OK: "OK", NOT_FOUND: "NOT_FOUND", ASSUME_ENABLED: "ASSUME_ENABLED", TIMEOUT: "TIMEOUT",
-         FAILED: "FAILED", BUSY: "BUSY", AMBIGUOUS: "AMBIGUOUS", USAGE: "USAGE"}
+         FAILED: "FAILED", BUSY: "BUSY", AMBIGUOUS: "AMBIGUOUS", STATE_FILE: "STATE_FILE", USAGE: "USAGE"}
+TOOL_CODES = (OK, NOT_FOUND, ASSUME_ENABLED, TIMEOUT, BUSY, AMBIGUOUS, USAGE)
 SCRIPT = os.path.realpath(__file__)
 TOOL = os.path.join(os.path.dirname(SCRIPT), "build", "sdr_gpio_safe")
 TOOL_MARGIN_S = 1.0   # the tool's own time limit ends this long before ours
 KILL_MARGIN_S = 0.5   # SIGKILL this long before ours
+REAP_MARGIN_S = 0.2   # stop waiting for a killed tool this long before ours
 MIN_TOOL_S = 1.0      # the shortest time limit the tool accepts
 NOT_STARTED = "sdr_gpio_safe not started, pin not changed by this call; amplifier state unknown"
 ASSUME = "assume the amplifier is ENABLED"
 
 t0 = time.monotonic()
+deadline = None       # set once --timeout is known
+state_file = None     # --state-file, from the moment the tool is about to start
 
 
 def finish(code, text):
     line = " ".join(text.split())
     print(f"amp_safe: {NAMES[code]} (exit {code}, {time.monotonic() - t0:.2f} s): {line}", flush=True)
     os._exit(code)   # at once: nothing here may wait for a tool that was left behind
+
+
+def write_record(path, state, reason):
+    """Replace the state file. Raises OSError; never follows a symlink at the directory, the file or the temporary name."""
+    directory, name = os.path.split(path)
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            boot = f.read().strip()
+    except OSError:
+        boot = "?"
+    text = (f"{state}\n{reason}\n"
+            f"written {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} by amp_safe, pid {os.getpid()}, "
+            f"uid {os.getuid()}, boot {boot}, uptime {time.clock_gettime(time.CLOCK_BOOTTIME):.1f} s\n")
+    dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        tmp = f".{name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        try:
+            with os.fdopen(fd, "w") as f:
+                os.fchmod(f.fileno(), 0o644)     # readable by the other services whatever the umask
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)   # replaces a symlink, does not follow it
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def record(state, reason, seconds):
+    """write_record within `seconds` (a stalled disk must not hold up the caller). Returns None or the error."""
+    result = []
+
+    def work():
+        try:
+            write_record(state_file, state, reason)
+            result.append(None)
+        except OSError as e:
+            result.append(e.strerror or str(e))
+
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    thread.join(max(0.0, seconds))
+    return result[0] if result else "not written in time"
+
+
+def conclude(code, text):
+    """End a call that started the tool (or was about to): bring the state file up to date, then finish."""
+    if state_file is not None:
+        state = "safe" if code == OK else "unknown"
+        error = record(state, f"amp_safe: {NAMES[code]} (exit {code}): {' '.join(text.split())}",
+                       deadline - time.monotonic() - 0.05)
+        text += (f"; state file {state_file} NOT updated, it still says unknown: {error}" if error
+                 else f"; state file: {state}")
+    finish(code, text)
 
 
 class Parser(argparse.ArgumentParser):
@@ -79,13 +153,17 @@ def error_tail(err):
 
 
 def main():
+    global deadline, state_file
     # No --help: every way of calling this script either runs the tool or is an error.
     parser = Parser(prog="amp_safe", allow_abbrev=False, add_help=False)
     parser.add_argument("--timeout", type=float, required=True)
     parser.add_argument("--args")
+    parser.add_argument("--state-file")
     args = parser.parse_args()
     if not 3.0 <= args.timeout <= 300.0:    # also false for nan
         parser.error("--timeout must be between 3 and 300 seconds")
+    if args.state_file is not None and not (os.path.isabs(args.state_file) and os.path.basename(args.state_file)):
+        parser.error("--state-file must be the absolute path of a file")
     deadline = t0 + args.timeout
 
     # One at a time. The lock is on this script, which every caller can read and whose
@@ -103,6 +181,16 @@ def main():
             if deadline - time.monotonic() < TOOL_MARGIN_S + MIN_TOOL_S + 0.1:
                 finish(TIMEOUT, f"another sdr_gpio_safe was still running; {NOT_STARTED}")
             time.sleep(0.05)
+    if not (os.path.isfile(TOOL) and os.access(TOOL, os.X_OK)):
+        finish(FAILED, f"cannot run {TOOL}: missing or not executable; {NOT_STARTED}")
+
+    # From here the tool is started, so the pin is no longer known to be safe. Say so first.
+    if args.state_file is not None:
+        state_file = args.state_file
+        error = record("unknown", "amp_safe: sdr_gpio_safe is starting; it drives the pin low before it sets it high",
+                       deadline - time.monotonic() - (TOOL_MARGIN_S + MIN_TOOL_S + 0.1))
+        if error:
+            finish(STATE_FILE, f"cannot write the state file {state_file}: {error}; {NOT_STARTED}")
 
     tool_limit = deadline - time.monotonic() - TOOL_MARGIN_S
     argv = [TOOL, "--timeout", f"{tool_limit:.2f}"] + (["--args", args.args] if args.args is not None else [])
@@ -110,30 +198,30 @@ def main():
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 pass_fds=(lock,))
     except OSError as e:
-        finish(FAILED, f"cannot run {TOOL}: {e.strerror}; {NOT_STARTED}")
+        conclude(FAILED, f"cannot run {TOOL}: {e.strerror}; {NOT_STARTED}")
 
     try:
         out, err = proc.communicate(timeout=max(0.0, deadline - KILL_MARGIN_S - time.monotonic()))
     except subprocess.TimeoutExpired:
         proc.kill()
         try:
-            out, err = proc.communicate(timeout=max(0.0, deadline - 0.1 - time.monotonic()))
+            out, err = proc.communicate(timeout=max(0.0, deadline - REAP_MARGIN_S - time.monotonic()))
             fate = "was killed"
         except subprocess.TimeoutExpired as e:
             out, err = e.stdout, e.stderr
             fate = f"could not be killed and was left behind (pid {proc.pid})"
         line = last_tool_line(out)
-        finish(ASSUME_ENABLED, f"sdr_gpio_safe did not end by itself and {fate}; it may have initialised the SDR, "
-                               f"which drives the pin low: {ASSUME}{'; its last line: ' + line if line else ''}"
-                               f"{error_tail(err)}")
+        conclude(ASSUME_ENABLED, f"sdr_gpio_safe did not end by itself and {fate}; it may have initialised the SDR, "
+                                 f"which drives the pin low: {ASSUME}{'; its last line: ' + line if line else ''}"
+                                 f"{error_tail(err)}")
 
     rc = proc.returncode
     line = last_tool_line(out)
-    if rc in NAMES and rc != FAILED and line.startswith(f"sdr_gpio_safe: {NAMES[rc]}:"):
-        finish(rc, line + ("" if rc == OK else error_tail(err)))
+    if rc in TOOL_CODES and line.startswith(f"sdr_gpio_safe: {NAMES[rc]}:"):
+        conclude(rc, line + ("" if rc == OK else error_tail(err)))
     how = f"was ended by signal {-rc}" if rc < 0 else f"exited {rc}"
-    finish(ASSUME_ENABLED, f"sdr_gpio_safe {how} without a valid result; it may have initialised the SDR, "
-                           f"which drives the pin low: {ASSUME}: {line or 'no result line'}{error_tail(err)}")
+    conclude(ASSUME_ENABLED, f"sdr_gpio_safe {how} without a valid result; it may have initialised the SDR, "
+                             f"which drives the pin low: {ASSUME}: {line or 'no result line'}{error_tail(err)}")
 
 
 main()

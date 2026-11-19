@@ -71,6 +71,7 @@ to its line.
 | 7 | AMBIGUOUS | no | more than one SDR matches; none opened | unknown, unchanged by this run |
 | 4 | TIMEOUT | no | time ran out before the initialisation started (looking for the SDR, or `amp_safe` waiting for another run) | unknown, unchanged by this run |
 | 5 | FAILED | no | `amp_safe` only: the binary is missing or could not be started | unknown, unchanged by this run |
+| 8 | STATE_FILE | no | `amp_safe --state-file` only: the record could not be set to `unknown`, so the tool was not started | unknown, unchanged by this run |
 | 64 | USAGE | no | bad command line | unknown, unchanged by this run |
 
 Only 0 means safe. None of the others does: "unchanged by this run" says nothing
@@ -88,14 +89,64 @@ waits 3 s): call again.
 | `--timeout SECONDS` | `20` | internal time limit, 1-300 |
 | `-h`, `--help` | | help; does not touch the SDR |
 
-`amp_safe --timeout SECONDS [--args STRING]`
+`amp_safe --timeout SECONDS [--args STRING] [--state-file PATH]`
 
 | Option | | |
 |---|---|---|
 | `--timeout SECONDS` | required, 3-300 | the call returns within this time |
 | `--args STRING` | optional | passed to `sdr_gpio_safe` |
+| `--state-file PATH` | optional, absolute path | keep the record described below |
 
 `amp_safe` runs `build/sdr_gpio_safe` next to itself and passes nothing else on.
+
+## State file
+
+One durable record of whether the pin is known to be safe, shared with the radar
+manager (which writes `unknown` before every radar launch).
+
+* Format: the first line is exactly `safe` or `unknown`; the rest is free text
+  (why, when, by whom). A missing or unreadable file, or any other first line,
+  means unknown.
+* With `--state-file`, `amp_safe` writes `unknown` after it has the lock and
+  immediately before it starts the tool, and `safe` only after the tool's verified
+  OK. After every other outcome the file says `unknown` with the outcome in the
+  text, also for BUSY and NOT_FOUND, where the pin was not changed.
+* A call that never starts the tool (usage error, another run still going, binary
+  missing) does not change the file.
+* If `unknown` cannot be written, the tool is not started: STATE_FILE (exit 8).
+  If `safe` cannot be written after an OK, the exit code is still 0 and the output
+  line says that the file still says `unknown`.
+* If `amp_safe` is killed while the tool runs, the file stays `unknown`.
+* Each write replaces the file: temporary file in the same directory, fsync,
+  rename, fsync of the directory, mode 0644. The directory must exist and must not
+  be a symlink. A symlink at the file's place is replaced, never followed. Readers
+  and other writers must also replace the file, not edit it in place.
+* Without `--state-file` nothing is written.
+
+### Callers that run as root
+
+The power service runs its hooks as root; the state file lives in a directory of
+user `englacial`, and `amp_safe` and the binary are in that user's checkout. Run
+directly, root would execute a user-writable script and write into a
+user-controlled directory (the file would then belong to root; `englacial` could
+still replace it, but not edit it). Avoid both by dropping to `englacial` in the
+hook itself. Recommended hook for `config/power.toml`:
+
+```
+amp_safe = ["/usr/bin/setpriv", "--reuid=englacial", "--regid=englacial", "--init-groups", "--reset-env",
+            "/home/englacial/englacial-radar-runner/tools/sdr_gpio_safe/amp_safe",
+            "--timeout", "14", "--state-file", "<the manager's state file>"]
+amp_safe_timeout_s = 15.0
+```
+
+* `setpriv` replaces itself with `amp_safe` (same process, same process group), so
+  the exit code and the power service's kill at `amp_safe_timeout_s` work as
+  before, and that limit must still be longer than `--timeout`.
+* `--reset-env` sets `HOME` to `/home/englacial`. Without it UHD would look for its
+  configuration file under root's home, which `englacial` cannot read.
+* `englacial` can open the SDR: the udev rule `uhd-usrp.rules` gives mode 0666 to
+  USB 2500:0023.
+* Not yet run as root: it is step A.6 of the first run.
 
 ## Time limits
 
@@ -165,9 +216,12 @@ Nothing can overheat in this part. Trigger the scope on GPIO_0 falling.
    (exit 6) within the time, and no disturbance of the running radar. Stop the
    radar.
 6. The real hook path: configure the power service's `amp_safe` hook with the
-   intended command and `amp_safe_timeout_s`, and let the service run it as root
-   (the bench procedure in `power/README.md`). Expected: exit 0 in the journal,
-   GPIO_0 as in step 2, hook time inside the limit.
+   command under "Callers that run as root" and its `amp_safe_timeout_s`, and let
+   the service run it (the bench procedure in `power/README.md`). Expected: exit 0
+   in the journal, GPIO_0 as in step 2, hook time inside the limit, the state file
+   `safe` and owned by `englacial`. First check by hand what the hook will run:
+   `sudo setpriv --reuid=englacial --regid=englacial --init-groups --reset-env /usr/bin/env`
+   must show `HOME=/home/englacial`.
 
 ### B. Amplifier powered, VVA/J8 at 5 V, output into the attenuators
 
