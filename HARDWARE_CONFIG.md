@@ -32,6 +32,7 @@ NVMe drive:
 * NVMe drive that can be used for data recording on a Pimoroni NVMe Base Duo board
 * Patriot M.2 P300 1 TB, one ext4 partition mounted at `/mnt/nvme` (fstab, by UUID, `nofail`)
 * Used by the orca HIL harness (`/mnt/nvme/orca-hil`)
+* Second drive added 2026-11-18: Patriot M.2 P300 1 TB at `/dev/nvme1n1`, no partition or filesystem, not mounted, not in use yet
 
 UPS:
 * Geekworm UPS Scap 5V5A (supercapacitor UPS HAT for Pi 5, "100F"; measured effective capacitance ~60 F)
