@@ -315,7 +315,68 @@ DEFAULTS = {
             "max_mb": 5.0,                      # then the file is renamed to .1 and a new one started
         },
     },
+    # ---------------------------------------------------------------------------
+    # Alerts to ntfy (radar_runner/alerts/README.md). Read only: nothing here
+    # changes what another service does.
+    "alerts": {
+        "loop_interval_s": 1.0,
+        "unit_name": "-",                       # shown in every alert; "-" = the host name
+        # These three: a name in paths.state_dir, or a full path.
+        "queue_dir": "alerts-queue",            # one file per alert waiting to be sent
+        "inbox_dir": "alerts-inbox",            # test alerts from alertctl
+        "state_file": "alerts-state.json",
+        "queue_max": 200,                       # then the lowest priority, oldest first, is dropped
+        "title_max_chars": 120,
+        "message_max_chars": 1500,
+        # server, topic and token belong in /etc/radar-runner/secrets.yaml. "-" = not set: alerts are queued only.
+        "ntfy": {
+            "server": "-",                      # https://... (plain http only to this host itself)
+            "topic": "-",
+            "token": "-",
+            "timeout_s": 15.0,                  # the whole request, connection included
+            "retry_s": 10.0,                    # wait after a failed send; doubles with every failure, up to:
+            "retry_max_s": 300.0,
+            "max_per_round": 5,                 # sends per loop round at most
+        },
+        # Storm limit, per kind of alert: at most `burst` in any `window_s`; the
+        # rest are counted and reported. All kinds together, urgent ones excepted:
+        # at most `max_per_hour`.
+        "storm": {
+            "burst": 3,
+            "window_s": 3600.0,
+            "max_per_hour": 30,
+        },
+        "summary_after_s": 180.0,               # the boot summary is sent at this uptime (or at the start, if later)
+        # How long each condition must last before it is an alert.
+        "conditions": {
+            "status_stale_s": 120.0,            # the status file of telemetry, watcher, manager or power old or missing
+            "watcher_not_ok_s": 300.0,          # the safety watcher says the radar may not run
+            "not_ready_s": 600.0,               # the radar manager is not ready
+            "gps_s": 600.0,                     # no GPS fix, or no receiver
+            "logging_fallback_s": 300.0,        # the sensor logs are not on the data drive
+            "pi_hot_s": 60.0,                   # the Pi throttling, or its SoC at or above pi_temp_c
+            "pi_temp_c": 80.0,
+            "power_warning_s": 30.0,            # a warning of the power service
+            "clear_s": 60.0,                    # gone for this long: "cleared"
+        },
+        "error_rate_warn": 0.05,                # a run with ORCA's error count above this fraction of its pulses
+
+        "disk": {
+            "free_gb_levels": [200.0, 100.0, 50.0, 25.0],   # data drive: one alert at each; the last one is high priority
+            "rearm_fraction": 0.1,              # a level alerts again once the free space was 10 % above it
+            "sd_free_gb_min": 5.0,              # the SD card
+        },
+        "events": {
+            "watcher_file": "-",                # "-" = watcher.events_file in paths.state_dir
+            "manager_file": "-",                # "-" = manager.events.file
+            "max_read_kb": 256,                 # read from each file per round at most
+        },
+    },
 }
+
+# Sections that a later stage will define. A file may already contain them
+# (offload: stage 9); they are passed over without a warning and not used.
+RESERVED = ("offload",)
 
 _TYPE_NAMES = {bool: "true or false", int: "a whole number", float: "a number", str: "text",
                list: "a list", dict: "a section"}
@@ -397,7 +458,8 @@ def load(repo_file=REPO_FILE, local_file=LOCAL_FILE, secrets_file=SECRETS_FILE, 
         if path is None:         # None leaves a layer out
             continue
         try:
-            _merge(config, _read_layer(path, optional, secret, warnings), path, "", warnings)
+            layer = _read_layer(path, optional, secret, warnings)
+            _merge(config, {k: v for k, v in layer.items() if k not in RESERVED}, path, "", warnings)
         except Exception as e:   # a config problem must never stop a service
             warnings.append(f"{path}: internal error ({type(e).__name__}): skipped")
     return config, warnings

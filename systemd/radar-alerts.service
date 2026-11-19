@@ -1,0 +1,50 @@
+# Radar alerts: reads the other services' status files and event logs, queues
+# alerts on disk and sends them to ntfy; a summary at every boot.
+# Documentation: radar_runner/alerts/README.md
+
+[Unit]
+Description=Radar alerts (ntfy, with a queue on disk)
+Documentation=file:///home/englacial/englacial-radar-runner/radar_runner/alerts/README.md
+# Ordered after the network stack is set up, but it does not need the network:
+# without it, alerts are queued on disk and sent when the link returns. No
+# Wants= or Requires= on anything, and no other unit depends on this one: it is
+# an observer, and its failure changes nothing for the other services.
+After=local-fs.target network.target
+# No start-rate limit: systemd never gives up restarting it.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=englacial
+Group=englacial
+WorkingDirectory=/home/englacial/englacial-radar-runner
+# -B: no __pycache__ in the checkout. -u: unbuffered output.
+ExecStart=/home/englacial/englacial-radar-runner/.venv/bin/python -B -u -m radar_runner.alerts
+Restart=always
+RestartSec=10
+# The loop pings at least once a second and between sends (each at most
+# alerts.ntfy.timeout_s, 15 s). No ping for 60 s: kill it and restart.
+WatchdogSec=60
+WatchdogSignal=SIGKILL
+TimeoutStartSec=30
+# A send in progress (at most 15 s) is finished; the state file is then saved.
+TimeoutStopSec=30
+# It must never take anything from the radar or the services that protect it:
+# low processor and disk priority, a memory limit, and first in line for the
+# kernel's out-of-memory killer.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+MemoryMax=200M
+OOMScoreAdjust=500
+# It may write only in the two user directories (its own status, state, queue
+# and inbox are there); everything else is read-only to it.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-/run/radar-runner/user -/var/lib/radar-runner/user
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+#!/bin/sh
+# alertctl: look at the alerts service and send a test alert through it. Help: alertctl --help
+# Runs radar_runner/alerts/ctl.py on the repository's Python environment (it reads the YAML
+# config), from any directory and through a symlink (e.g. /usr/local/bin/alertctl).
+repo=$(dirname "$(dirname "$(readlink -f "$0")")")
+export PYTHONPATH="$repo"
+exec "$repo/.venv/bin/python" -B -m radar_runner.alerts.ctl "$@"

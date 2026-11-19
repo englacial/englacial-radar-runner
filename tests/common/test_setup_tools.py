@@ -235,7 +235,9 @@ def test_check_script_runs_and_reports_every_item():
                  # stage 4
                  "radar-manager.service unit file", "radarctl command", "radar manager answers",
                  "radar is killed if the manager dies", "front panel pins usable by", "real-time priority for the radar",
-                 "make-amplifier-safe tool", "power service hook stop_radar", "power service hook amp_safe"):
+                 "make-amplifier-safe tool", "power service hook stop_radar", "power service hook amp_safe",
+                 # stage 5
+                 "radar-alerts.service unit file", "alertctl command", "alerts status file"):
         assert name in r.stdout, name
 
 
