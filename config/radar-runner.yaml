@@ -83,3 +83,46 @@ telemetry:
     # receiver's RAM, through gpsd) a little after every OLA start. "" = never run it.
     receiver_fix_command: "/usr/bin/python3 -B /home/englacial/englacial-radar-runner/setup/gps_receiver.py --apply --ram"
     receiver_fix_delay_s: 15.0
+
+# Safety watcher: stops the radar and resets the SDR GPIO on unsafe amplifier readings.
+# The rules, and where each number comes from: radar_runner/watcher/README.md
+watcher:
+  loop_interval_s: 0.25       # how often everything is looked at and /run/radar-runner/user/watcher.json rewritten
+  radar_exe: /home/englacial/orca/sdr/build/radar   # a process with this executable is a radar process
+  telemetry_status_file: telemetry.json       # the telemetry service's status: a file name in paths.run_dir, or a full path
+  # The next two and reset.state_file: a file name in paths.state_dir, or a full path.
+  override_file: override-no-amp-telemetry    # the user's "run without amplifier telemetry" (radarctl override no-amp-telemetry on)
+  events_file: watcher-events.jsonl           # the event log: trips, clears, actions and their results
+  events_max_mb: 5.0          # then the file is renamed to .1 and a new one started
+  telemetry_lost_s: 3.0       # no usable amplifier reading for this long: not ok (the radar may not run)
+  require_case_temp: true     # a reading without the case temperature (TMP117) is not usable
+  # A limit trips only on trip_samples readings in a row spanning trip_span_s (one damaged reading does
+  # nothing), and clears only after clear_hold_s of readings on the good side of the recover level.
+  trip_samples: 3
+  trip_span_s: 1.0
+  clear_hold_s: 30.0
+  temp_warn_c: 50.0           # amplifier sensor or case sensor: warning
+  temp_trip_c: 55.0           # stop the radar
+  temp_clear_c: 50.0          # the stop clears below this
+  cold_warn_c: -40.0          # warning only, below this (the amplifier's rating; no cold limit is decided)
+  voltage_min_v: 26.0         # 28 V rail while the amplifier is powered: stop outside these two
+  voltage_max_v: 30.5
+  voltage_recover_margin_v: 0.5   # the stop clears this far inside the two limits (26.5-30.0 V)
+  unpowered_below_v: 20.0     # below this the amplifier is unpowered: no trip and no action, but not ok
+  allow_unpowered: false      # true: an unpowered amplifier is ok (bench work with the 28 V off). PER UNIT
+  enabled_current_a: 0.5      # above this the amplifier is enabled (shutdown 0.156 A, enabled about 2.5 A)
+  idle_enabled_s: 5.0         # enabled for this long with no radar process: run the reset tool
+  reset:
+    command: /home/englacial/englacial-radar-runner/tools/sdr_gpio_safe/amp_safe
+    timeout_s: 30.0           # amp_safe --timeout (a first contact after power-up took 16.7 s)
+    kill_margin_s: 5.0        # amp_safe is given up on this long after its own timeout
+    state_file: sdr-state     # amp_safe --state-file: the record shared with the radar manager
+    retry_prompt_s: 2.0       # wait before the next run after ASSUME_ENABLED (exit 3)
+    retry_s: 5.0              # wait after any other result, while the amplifier stays enabled
+    stuck_after_attempts: 3   # still enabled after this many runs: "stuck enabled", urgent
+    stuck_retry_s: 60.0       # while stuck: one run this often (each run is an enable pulse)
+  stop_grace_s: 5.0           # not ok for this long with a radar process still alive: SIGINT to it
+  radar_exit_s: 5.0           # still alive this long after SIGINT: SIGKILL
+  kill_retry_s: 5.0           # still alive: SIGKILL again this often
+  pi_temp_warn_c: 80.0        # Pi SoC temperature: warning only
+  telemetry_gap_warn_s: 1.0   # the telemetry loop's longest recent gap between rounds: warning only
