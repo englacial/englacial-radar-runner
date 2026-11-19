@@ -272,9 +272,9 @@ TODO: The presum to use. With the first field measurements of the Starlink rate,
 
 # Alerts
 
-The user should receive alerts. They go to both ntfy and Slack.
+The user should receive alerts. They go to ntfy only (user decision, 2026-11-19; Slack was dropped). The topic and access token are in `/etc/radar-runner/secrets.yaml`.
 
-* Every alert goes to Slack as the shared record. ntfy carries the same alerts with a priority, so that urgent ones (amplifier stuck enabled, over temperature) can break through on the phone.
+* Each alert carries a priority, so that urgent ones (amplifier stuck enabled, over temperature) can break through on the phone.
 * Alerts raised offline are queued and sent when the link returns.
 * Alert text goes to third-party services, so it leaves out positions.
 * A short summary is sent at each boot (disk use, last collection, any faults). A day without one is itself a sign of trouble.
@@ -312,7 +312,7 @@ What makes either method trustworthy is a **check script** that tests every item
 Things that must not be copied blindly to a second Pi are kept apart from the common setup:
 
 * Identity: hostname, SSH host keys, machine ID and the Tailscale login
-* Secrets: the bucket credentials, the ntfy topic and the Slack webhook, in one file outside git
+* Secrets: the bucket credentials, the ntfy topic and token, in one file outside git
 * Settings measured on one unit: sensor calibration, thresholds and the expected turn-on peak, in a per-unit config file layered over the defaults
 * The NVMe mount: mounted by filesystem label instead of by UUID, so that any drive with the right label works
 * Settings stored in hardware, not on the card: the Pi's bootloader configuration, the GPS receiver settings and the OLA settings. The last two are applied at every boot anyway; the check script covers the bootloader
@@ -336,7 +336,7 @@ The setup script is proven by using it: one card is built from the stock image b
 | Button and LEDs | gpiozero with the lgpio backend |
 | GPIO reset tool | Small C++ program against the patched UHD, ported from `gpio_hold.cpp` |
 | Config | One YAML file for this repository |
-| Alerts | HTTP posts to ntfy and to a Slack incoming webhook, with a queue on disk for offline periods |
+| Alerts | HTTP posts to ntfy, with a queue on disk for offline periods |
 | Offload | rclone to a Google Cloud Storage bucket, rate-limited and low priority |
 | Tests | pytest, a stand-in for the radar binary, `gpsfake` |
 
@@ -483,9 +483,9 @@ Done when:
 
 ## Stage 5: Alerts
 
-Builds: posts to ntfy and Slack with a queue on disk, alerts for every fault table row that calls for one, and the boot summary.
+Builds: posts to ntfy with a queue on disk, alerts for every fault table row that calls for one, and the boot summary.
 
-Needs from the user: an ntfy topic and a Slack webhook.
+Needs from the user: nothing more; the ntfy topic and token are in place and a test notification was sent on 2026-11-19.
 
 Done when: alerts raised with the network unplugged arrive after it returns, an urgent alert breaks through on the phone, and a failure of either service does not affect any other service.
 

@@ -1,0 +1,517 @@
+"""Radar config limits (radar_runner/manager/limits.py) against real ORCA config files.
+
+The files in fixtures/orca_configs are copies, unchanged:
+    orca_default.yaml       ~/orca/config/default.yaml (numbers as 56e6, anchors, pwr_amp_pin "-1")
+    run300_d05_soak.yaml    ~/radar-testbench/pa_bringup: the 2 h soak at 300 MHz, tx_gain 72, written by ruamel
+    pa_soak.yaml            the 10 W soak at 100 MHz, tx_gain 52 (VVA 0 V)
+    pa_1w.yaml              100 MHz, tx_gain 0
+"""
+import copy
+import os
+
+import pytest
+
+from radar_runner.manager import limits as L
+from radar_runner.common import config as _shared_config
+
+MANAGER_DEFAULTS = _shared_config.DEFAULTS["manager"]
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LIMITS = MANAGER_DEFAULTS["limits"]
+
+
+def fixture(name):
+    with open(os.path.join(HERE, "fixtures", "orca_configs", name + ".yaml")) as f:
+        return f.read()
+
+
+def good():
+    """The bench's 300 MHz config with the TX gain under the default cap."""
+    config = L.load(fixture("run300_d05_soak"))
+    config["RF0"]["tx_gain"] = 40.0
+    return config
+
+
+def problems(change, limits=LIMITS):
+    config = good()
+    change(config)
+    return L.check(config, limits)
+
+
+def setter(section, key, value):
+    def change(config):
+        config[section][key] = value
+    return change
+
+
+# --------------------------------------------------------------------- reading YAML
+
+def test_orca_number_formats_are_read_as_numbers():
+    config = L.load(fixture("orca_default"))
+    assert config["GENERATE"]["sample_rate"] == 56e6 and type(config["GENERATE"]["sample_rate"]) is float
+    assert config["GENERATE"]["chirp_length"] == 20e-6
+    assert config["GENERATE"]["lo_offset_sw"] == 0.0
+    assert config["RF0"]["freq"] == 450e6
+    assert config["CHIRP"]["pulse_rep_int"] == 200e-6
+    for text, value in (("56e6", 56e6), ("1e-05", 1e-5), ("-2.5E+3", -2500.0), ("0e6", 0.0), ("1.3e-05", 1.3e-5)):
+        assert L.load(f"a: {text}")["a"] == value and type(L.load(f"a: {text}")["a"]) is float
+    # Things that are not numbers stay text.
+    for text in ("e6", "1e", "abc", "1f6", "0x1e6g"):
+        assert type(L.load(f"a: {text}")["a"]) is str
+
+
+def test_anchors_and_aliases_are_resolved():
+    config = L.load(fixture("orca_default"))
+    assert config["RF0"]["rx_rate"] == 56e6                 # *s_rate
+    assert config["CHIRP"]["tx_duration"] == 20e-6          # *pulse_len
+    assert config["FILES"]["chirp_loc"] == "chirp.bin"      # *ch_sent
+    assert config["PLOT"]["rx_samps"] == "rx_samps.bin"     # *save_loc
+
+
+def test_quoted_values_as_orca_writes_them():
+    config = L.load(fixture("orca_default"))
+    assert config["GPIO"]["pwr_amp_pin"] == "-1" and config["DEVICE"]["tx_channels"] == "0"
+    assert L.load(fixture("run300_d05_soak"))["GPIO"]["pwr_amp_pin"] == "2"
+
+
+@pytest.mark.parametrize("text, message", [
+    ("RF0: {tx_gain: 40, tx_gain: 80}", "appears twice"),
+    ("RF0:\n  tx_gain: 40\nRF0:\n  tx_gain: 80\n", "appears twice"),
+    ("- a\n- b\n", "not a mapping"),
+    ("a: [1, 2", "not valid YAML"),
+    ("", "not a mapping"),
+    ("a: !!python/object/apply:os.system ['true']", "not valid YAML"),
+])
+def test_unusable_files_are_refused(text, message):
+    with pytest.raises(L.ConfigError, match=message):
+        L.load(text)
+
+
+def test_load_file_errors(tmp_path):
+    with pytest.raises(L.ConfigError, match="cannot read"):
+        L.load_file(str(tmp_path / "missing.yaml"))
+    (tmp_path / "bin.yaml").write_bytes(b"\xff\xfe\x00")
+    with pytest.raises(L.ConfigError, match="not UTF-8"):
+        L.load_file(str(tmp_path / "bin.yaml"))
+    (tmp_path / "big.yaml").write_text("a: 1\n" * 300000)
+    with pytest.raises(L.ConfigError, match="larger than"):
+        L.load_file(str(tmp_path / "big.yaml"))
+
+
+# ------------------------------------------------------------------ the real files
+
+def test_orca_default_config_is_refused_for_every_reason_that_applies():
+    found = L.check(L.load(fixture("orca_default")), LIMITS)
+    assert found == [
+        "GPIO.pwr_amp_pin is -1, must be 2 (-1 leaves the amplifier enable unmanaged)",
+        "GPIO.pwr_amp_active_low must be true",
+        "RF0.tx_gain 65 is above the cap of 43",
+        "chirp band 437.5-462.5 MHz is outside the allowed 225-400 MHz",
+    ]
+
+
+def test_bench_soak_config_passes_except_for_the_conservative_gain_cap():
+    config = L.load(fixture("run300_d05_soak"))
+    assert L.check(config, LIMITS) == ["RF0.tx_gain 72 is above the cap of 43"]
+    assert L.check(config, dict(LIMITS, max_tx_gain=72.0)) == []        # the per-unit value for VVA 5 V
+
+
+def test_100_mhz_bench_configs_are_outside_the_band():
+    assert L.check(L.load(fixture("pa_soak")), LIMITS) == [
+        "RF0.tx_gain 52 is above the cap of 43",
+        "chirp band 87.5-112.5 MHz is outside the allowed 225-400 MHz"]
+    assert L.check(L.load(fixture("pa_1w")), LIMITS) == [
+        "chirp band 87.5-112.5 MHz is outside the allowed 225-400 MHz"]
+
+
+def test_good_config_passes():
+    assert L.check(good(), LIMITS) == []
+
+
+# ------------------------------------------------------------------- each limit
+
+@pytest.mark.parametrize("value", ["-1", -1, "3", 0, "2.5", "two", None, True])
+def test_amplifier_pin_must_be_the_bench_pin(value):
+    found = problems(setter("GPIO", "pwr_amp_pin", value))
+    assert len(found) == 1 and "GPIO.pwr_amp_pin" in found[0]
+
+
+@pytest.mark.parametrize("value", ["2", 2, 2.0])
+def test_amplifier_pin_forms_that_the_radar_reads_as_2(value):
+    assert problems(setter("GPIO", "pwr_amp_pin", value)) == []
+
+
+@pytest.mark.parametrize("value, ok", [(True, True), ("true", True), ("yes", True), ("on", True),
+                                       (False, False), ("false", False), ("no", False), (1, False), ("1", False)])
+def test_amplifier_enable_must_be_active_low(value, ok):
+    assert (problems(setter("GPIO", "pwr_amp_active_low", value)) == []) is ok
+
+
+def test_missing_active_low_means_false_in_orca_and_is_refused():
+    assert problems(lambda c: c["GPIO"].pop("pwr_amp_active_low")) == ["GPIO.pwr_amp_active_low must be true"]
+
+
+def test_gpio_bank():
+    assert problems(setter("GPIO", "gpio_bank", "RXA")) == ["GPIO.gpio_bank is RXA, must be FP0"]
+
+
+@pytest.mark.parametrize("value, ok", [(43, True), (43.0, True), ("43", True), (43.5, False), ("44", False),
+                                       (76, False), ("4e1", True), ("5e1", False), (-1, False),
+                                       ("high", False), (None, False), (float("nan"), False), (float("inf"), False),
+                                       ([40], False), (True, False)])
+def test_tx_gain_cap(value, ok):
+    assert (problems(setter("RF0", "tx_gain", value)) == []) is ok
+
+
+def test_tx_gain_cap_is_a_setting():
+    assert problems(setter("RF0", "tx_gain", 52), dict(LIMITS, max_tx_gain=52.0)) == []
+    assert problems(setter("RF0", "tx_gain", 52.1), dict(LIMITS, max_tx_gain=52.0)) != []
+
+
+@pytest.mark.parametrize("tx, pri, ok", [(13e-6, 200e-6, True), (30e-6, 200e-6, True), (30.1e-6, 200e-6, False),
+                                         (13e-6, 80e-6, False), (13e-6, 0, False), (0, 200e-6, False)])
+def test_enable_duty_cap(tx, pri, ok):
+    def change(config):
+        config["CHIRP"].update(tx_duration=tx, pulse_rep_int=pri, rx_duration=max(tx, 42e-6))
+    found = problems(change)
+    assert (found == []) is ok
+    if not ok:
+        assert any("duty" in f or "positive" in f for f in found)
+
+
+def test_receive_window_must_cover_the_transmit_pulse():
+    found = problems(setter("CHIRP", "rx_duration", 12e-6))
+    assert len(found) == 1 and "the receive window (12 us) is shorter than the transmit burst (13 us)" in found[0]
+    assert problems(setter("CHIRP", "rx_duration", 13e-6)) == []
+    assert "tx_lead" in problems(setter("CHIRP", "tx_lead", 13e-6))[0]
+    assert "tx_lead" in problems(setter("CHIRP", "tx_lead", -1e-6))[0]
+
+
+@pytest.mark.parametrize("freq, offset, width, ok", [
+    (290e6, 10e6, 30e6, True),          # 285-315 MHz, as on the bench
+    (240e6, 0, 30e6, True),             # 225-255: on the edge
+    (239e6, 0, 30e6, False),
+    (385e6, 0, 30e6, True),             # 370-400
+    (386e6, 0, 30e6, False),
+    (290e6, 100e6, 30e6, False),        # the software offset moves the chirp out of the band
+    (450e6, 0, 25e6, False),
+    (300e6, 0, 0, False),
+])
+def test_chirp_band_must_lie_inside_the_allowed_band(freq, offset, width, ok):
+    def change(config):
+        config["RF0"]["freq"] = freq
+        config["GENERATE"].update(lo_offset_sw=offset, chirp_bandwidth=width)
+    assert (problems(change) == []) is ok
+
+
+@pytest.mark.parametrize("value, ok", [(True, True), ("true", True), (False, False), ("false", False), ("maybe", False)])
+def test_transmit_must_be_enabled(value, ok):
+    assert (problems(setter("RF0", "transmit", value)) == []) is ok
+
+
+def test_transmit_defaults_to_true_as_in_orca():
+    assert problems(lambda c: c["RF0"].pop("transmit")) == []
+
+
+def test_gpsdo_clock_is_refused_because_orca_would_open_the_gps():
+    found = problems(setter("DEVICE", "clk_ref", "gpsdo"))
+    assert len(found) == 1 and "gpsdo makes ORCA open and reconfigure the GPS receiver" in found[0]
+    assert problems(setter("DEVICE", "clk_ref", "external")) == []
+
+
+def test_only_one_channel_and_fc32():
+    assert "tx_channels" in problems(setter("DEVICE", "tx_channels", "0,1"))[0]
+    assert "cpu_format" in problems(setter("DEVICE", "cpu_format", "sc16"))[0]
+
+
+def test_pulse_counts():
+    assert problems(setter("CHIRP", "num_pulses", 0)) != []
+    assert problems(setter("CHIRP", "num_pulses", -2)) != []
+    assert problems(setter("CHIRP", "num_pulses", 10000)) == []
+    assert problems(setter("CHIRP", "num_presums", 0)) != []
+
+
+@pytest.mark.parametrize("section", ["GPIO", "RF0", "CHIRP", "GENERATE", "DEVICE", "FILES"])
+def test_missing_section_is_refused(section):
+    assert problems(lambda c: c.pop(section)) != []
+
+
+def test_every_problem_is_reported_not_only_the_first():
+    def change(config):
+        config["RF0"].update(tx_gain=80, transmit=False)
+        config["GPIO"]["pwr_amp_pin"] = "-1"
+        config["CHIRP"]["rx_duration"] = 1e-6
+    assert len(problems(change)) == 4
+
+
+# ------------------------------------------------------------ the derived config
+
+def test_derived_config_points_the_output_at_the_collection_and_chunks_it():
+    config = L.load(fixture("orca_default"))
+    derived = L.derive(config, "../../mnt/nvme/radar-runner/collections/b00001_s001_x", 5000)
+    assert derived["FILES"] == {"chirp_loc": "chirp.bin", "output_dir": "../../mnt/nvme/radar-runner/collections/b00001_s001_x",
+                                "save_loc": "rx_samps.bin", "gps_loc": "gps_log.txt", "max_chirps_per_file": 5000}
+    assert derived["GENERATE"]["out_file"] == "chirp.bin" and derived["GENERATE"]["show_plot"] is False
+    assert config["FILES"]["output_dir"] == "data"          # the input is not changed
+    # Everything else is the same.
+    for section in config:
+        if section not in ("FILES", "GENERATE", "GPIO", "RF0", "CHIRP"):
+            assert derived[section] == config[section]
+
+
+def test_derived_config_holds_the_checked_values_in_canonical_form():
+    config = good()
+    config["RF0"]["tx_gain"] = "4e1"            # text that the radar would read as 40
+    config["GPIO"]["pwr_amp_pin"] = "2"
+    config["GPIO"]["pwr_amp_active_low"] = "yes"
+    derived = L.derive(config, "x", 1000)
+    assert derived["RF0"]["tx_gain"] == 40.0 and type(derived["RF0"]["tx_gain"]) is float
+    assert derived["GPIO"]["pwr_amp_pin"] == 2 and derived["GPIO"]["pwr_amp_active_low"] is True
+    text = L.dump(derived)
+    assert "tx_gain: 40.0" in text and "pwr_amp_pin: 2\n" in text and "pwr_amp_active_low: true" in text
+    assert L.load(text) == derived              # reads back as written
+    assert L.check(L.load(text), LIMITS) == []
+
+
+def test_dump_writes_exponents_that_every_reader_takes_as_numbers():
+    text = L.dump(L.derive(L.load(fixture("orca_default")), "x", 1000))
+    assert "&" not in text and "*" not in text              # no anchors
+    assert "chirp_length: 2.0e-05" in text and "sample_rate: 56000000.0" in text
+    import yaml
+    plain = yaml.safe_load(text)                # also plain YAML 1.1 readers get numbers
+    assert plain["GENERATE"]["chirp_length"] == 2e-5 and plain["CHIRP"]["pulse_rep_int"] == 2e-4
+
+
+def test_derive_refuses_what_it_cannot_read():
+    config = good()
+    config["RF0"]["tx_gain"] = "loud"
+    with pytest.raises(L.ConfigError, match="RF0.tx_gain is not a number"):
+        L.derive(config, "x", 1000)
+
+
+def test_output_check(tmp_path):
+    orca = tmp_path / "home" / "orca"
+    root = tmp_path / "nvme" / "collections"
+    (root / "c1").mkdir(parents=True)
+    orca.mkdir(parents=True)
+    rel = os.path.relpath(str(root / "c1"), str(orca))
+    derived = L.derive(good(), rel, 1000)
+    assert L.check_output(derived, str(orca), str(root)) == []
+    for change, text in (
+            (setter("FILES", "output_dir", "data"), "not below the data root"),
+            (setter("FILES", "output_dir", os.path.relpath(str(root), str(orca))), "not below the data root"),
+            (setter("FILES", "output_dir", rel + "/../../elsewhere"), "not below the data root"),
+            (setter("FILES", "save_loc", "../rx_samps.bin"), "FILES.save_loc must be a plain file name"),
+            (setter("FILES", "chirp_loc", "other.bin"), "would not transmit the chirp that was generated"),
+            (setter("FILES", "max_chirps_per_file", -1), "written in chunks")):
+        bad = copy.deepcopy(derived)
+        change(bad)
+        found = L.check_output(bad, str(orca), str(root))
+        assert found and text in found[0]
+
+
+def test_output_check_follows_symlinks(tmp_path):
+    orca, root, sd = tmp_path / "orca", tmp_path / "nvme", tmp_path / "sdcard"
+    for d in (orca, root, sd):
+        d.mkdir()
+    (root / "sneaky").symlink_to(sd)            # a link out of the data drive
+    derived = L.derive(good(), os.path.relpath(str(root / "sneaky"), str(orca)), 1000)
+    assert "not below the data root" in L.check_output(derived, str(orca), str(root))[0]
+
+
+# ----------------------------------------------------------------------- chunks
+
+def test_record_size_follows_the_radar():
+    assert L.record_bytes(L.load(fixture("run300_d05_soak"))) == 2352 * 8      # "Number of RX samples: 2352"
+    assert L.record_bytes(L.load(fixture("orca_default"))) == 1120 * 8
+
+
+@pytest.mark.parametrize("presums, chunk_mb, max_s, expected", [
+    (1000, 128, 300, 1_500_000),        # 300 s / 0.2 s per record = 1500 records (28 MB): the time limit
+    (1000, 10, 300, 531_000),           # 10 MB / 18816 B = 531 records: the size limit
+    (10, 128, 300, 68_020),             # 128 MB / 18816 B = 6802 records, 13.6 s
+    (1, 128, 300, 6_802),
+    (1000, 128, 0.01, 1_000),           # never less than one record
+])
+def test_pulses_per_file(presums, chunk_mb, max_s, expected):
+    config = L.load(fixture("run300_d05_soak"))
+    config["CHIRP"]["num_presums"] = presums
+    value = L.pulses_per_file(config, chunk_mb * 1e6, max_s)
+    assert value == expected and value % presums == 0
+
+
+def test_default_chunk_is_a_few_hundred_megabytes_at_most():
+    config = L.load(fixture("run300_d05_soak"))
+    for presums in (1, 10, 100, 1000):
+        config["CHIRP"]["num_presums"] = presums
+        n = L.pulses_per_file(config, MANAGER_DEFAULTS["data"]["chunk_mb"] * 1e6, MANAGER_DEFAULTS["data"]["chunk_max_s"])
+        size = n / presums * L.record_bytes(config)
+        seconds = n * 200e-6
+        assert size <= 128e6 and seconds <= 300.0
+
+
+# ------------------------------------------- the fields ORCA really computes with
+
+def test_orca_sizes_bursts_from_rf1_so_rf1_rates_must_equal_rf0():
+    # sdr.cpp reads its rates from RF1 and main.cpp sizes the bursts from them, while the
+    # hardware is clocked at RF0's rates: RF1.tx_rate = 4 x RF0.tx_rate makes every burst
+    # four times as long on the air, which a check of tx_duration alone does not see.
+    found = problems(setter("RF1", "tx_rate", 4 * 56e6))
+    assert any("RF1.tx_rate (2.24e+08) differs from RF0's (5.6e+07)" in f for f in found)
+    assert any("enable duty 0.260" in f for f in found)             # 52 us every 200 us, against the cap of 0.15
+    found = problems(setter("RF1", "rx_rate", 28e6))
+    assert any("RF1.rx_rate (2.8e+07) differs from RF0's" in f for f in found)
+    assert problems(lambda c: c.pop("RF1")) != []                   # ORCA cannot run without the section either
+
+
+def test_burst_lengths_follow_orca_arithmetic():
+    config = good()
+    assert L.burst(config) == {"tx_samples": 728, "rx_samples": 2352,      # as the radar's own log says
+                               "tx_s": 728 / 56e6, "rx_s": 2352 / 56e6}
+    config["RF1"]["tx_rate"] = 4 * 56e6
+    config["RF1"]["rx_rate"] = 28e6
+    on_air = L.burst(config)
+    assert on_air["tx_samples"] == 2912 and on_air["tx_s"] == pytest.approx(52e-6)
+    assert on_air["rx_samples"] == 1176 and on_air["rx_s"] == pytest.approx(21e-6)
+    assert L.record_bytes(config) == 1176 * 8                       # the record follows RF1.rx_rate, as in ORCA
+
+
+def test_duty_is_computed_from_the_real_burst_even_when_only_the_duty_rule_is_looked_at():
+    def change(config):
+        config["RF1"]["tx_rate"] = 4 * 56e6
+        config["CHIRP"]["rx_duration"] = 60e-6
+    assert any("duty" in f and "52 us every 200 us" in f for f in problems(change))
+
+
+def test_chirp_generated_at_another_rate_than_it_is_played_is_refused():
+    # 14 MS/s chirp played at 56 MS/s: four times the bandwidth and the offset on the air.
+    found = problems(setter("GENERATE", "sample_rate", 14e6))
+    assert any("GENERATE.sample_rate (1.4e+07) differs from RF0.tx_rate (5.6e+07)" in f for f in found)
+
+    def narrow(config):
+        config["GENERATE"].update(sample_rate=14e6, chirp_bandwidth=10e6, lo_offset_sw=0.0)
+        config["RF0"]["freq"] = 380e6
+    found = problems(narrow)                                        # 375-385 MHz as written, 360-400 as played
+    assert len(found) == 1 and "differs from RF0.tx_rate" in found[0]
+
+    def out_of_band(config):
+        config["GENERATE"].update(sample_rate=14e6, chirp_bandwidth=12e6, lo_offset_sw=0.0)
+        config["RF0"]["freq"] = 380e6
+    assert any("chirp band 356-404 MHz is outside" in f for f in problems(out_of_band))
+
+
+def test_chirp_that_does_not_fit_in_the_sample_rate_is_refused():
+    def change(config):
+        config["GENERATE"].update(chirp_bandwidth=30e6, lo_offset_sw=20e6)     # reaches 35 MHz; Nyquist is 28
+    assert any("does not fit in the sample rate of 56 MHz: it would alias" in f for f in problems(change))
+
+
+@pytest.mark.parametrize("chirp, pulse, tx, ok", [
+    (10e-6, 13e-6, 13e-6, True),        # the bench config
+    (10e-6, 13e-6, 20e-6, True),        # shorter than the burst: the rest is zeros
+    (10e-6, 13.1e-6, 13e-6, False),     # the radar would cut the pulse off
+    (14e-6, 13e-6, 13e-6, False),       # the chirp is longer than its pulse
+    (20e-6, None, 13e-6, False),        # no pulse_length: it defaults to chirp_length
+    (10e-6, None, 13e-6, True),
+])
+def test_chirp_and_pulse_must_fit_in_the_transmit_burst(chirp, pulse, tx, ok):
+    def change(config):
+        config["GENERATE"]["chirp_length"] = chirp
+        if pulse is None:
+            config["GENERATE"].pop("pulse_length")
+        else:
+            config["GENERATE"]["pulse_length"] = pulse
+        config["CHIRP"]["tx_duration"] = tx
+    assert (problems(change) == []) is ok
+
+
+def test_real_configs_have_equal_rates():
+    for name in ("orca_default", "run300_d05_soak", "pa_soak", "pa_1w"):
+        found = L.check(L.load(fixture(name)), LIMITS)
+        assert not any("differs from" in f or "cut the chirp" in f for f in found), (name, found)
+
+
+def test_derived_config_writes_the_rates_in_canonical_form():
+    config = good()
+    config["RF1"]["tx_rate"] = "56e6"
+    derived = L.derive(config, "x", 1000)
+    assert derived["RF1"]["tx_rate"] == 56e6 and type(derived["RF1"]["tx_rate"]) is float
+    assert L.check(L.load(L.dump(derived)), LIMITS) == []
+
+
+def test_continuous_or_counted():
+    config = good()
+    assert L.continuous(config) is True
+    config["CHIRP"]["num_pulses"] = 10000
+    assert L.continuous(config) is False
+
+
+# ------------------------------------------------- the clock and what the SDR really runs at
+
+def all_rates(config, rate):
+    for section, key in (("RF0", "tx_rate"), ("RF0", "rx_rate"), ("RF1", "tx_rate"), ("RF1", "rx_rate"),
+                         ("GENERATE", "sample_rate")):
+        config[section][key] = rate
+
+
+def rate_problems(rate, clk):
+    def change(config):
+        all_rates(config, rate)
+        config["DEVICE"]["clk_rate"] = clk
+    return problems(change)
+
+
+@pytest.mark.parametrize("rate, clk", [
+    (200e6, 56e6),      # the SDR would run at 56 MS/s: bursts 3.6 times longer, duty about 0.5
+    (35e6, 56e6),       # not a whole divider: coerced to 28 or 56 MS/s
+    (40e6, 56e6),       # runs faster than asked: the band widens 1.4 times
+    (56e6, 28e6),       # faster than the clock
+    (56e6, 112e6),      # a clock the SDR does not have
+    (56e6, 61.45e6),
+    (2e6, 4e6),         # clock below the SDR's range
+    (0.1e6, 56e6),      # a divider of 560
+])
+def test_rates_the_sdr_would_coerce_are_refused(rate, clk):
+    found = rate_problems(rate, clk)
+    assert any("clk_rate" in p for p in found), found
+
+
+@pytest.mark.parametrize("rate, clk", [(56e6, 56e6), (28e6, 56e6), (14e6, 56e6), (61.44e6, 61.44e6),
+                                       (30.72e6, 61.44e6)])
+def test_rates_that_divide_the_clock_pass_the_clock_rule(rate, clk):
+    assert not any("clk_rate" in p for p in rate_problems(rate, clk))
+
+
+def test_the_bench_config_still_passes():
+    assert L.check(good(), LIMITS) == []
+
+
+def test_a_missing_or_unreadable_clock_rate_is_refused():
+    assert any("clk_rate" in p for p in problems(lambda c: c["DEVICE"].pop("clk_rate")))
+    assert any("clk_rate" in p for p in problems(setter("DEVICE", "clk_rate", "fast")))
+
+
+def test_the_mixer_frequency_must_be_in_the_band():
+    assert problems(setter("RF0", "lo_offset", 0.0)) == []
+    assert problems(lambda c: c["RF0"].pop("lo_offset")) == []           # ORCA's default is 0
+    found = problems(setter("RF0", "lo_offset", -70e6))                 # mixer at 220 MHz
+    assert any("mixer frequency 220 MHz" in p for p in found), found
+    found = problems(setter("RF0", "lo_offset", 111e6))                 # mixer at 401 MHz
+    assert any("mixer frequency" in p for p in found), found
+    assert any("lo_offset" in p for p in problems(setter("RF0", "lo_offset", "x")))
+
+
+def test_the_chirp_must_be_within_half_the_clock_of_the_mixer():
+    # Chirp 285-315 MHz; mixer at 290 + 40 = 330 MHz with a 56 MHz clock reaches down to 302 MHz only.
+    found = problems(setter("RF0", "lo_offset", 40e6))
+    assert any("half the clock rate" in p for p in found), found
+    assert problems(setter("RF0", "lo_offset", 15e6)) == []             # 305 MHz: 285-315 is within 28 MHz
+
+
+def test_the_derived_config_carries_the_clock_and_offset_as_numbers():
+    config = good()
+    config["DEVICE"]["clk_rate"] = "56e6"
+    config["RF0"]["lo_offset"] = "0"
+    derived = L.derive(config, "data/x", 100)
+    assert derived["DEVICE"]["clk_rate"] == 56e6 and type(derived["DEVICE"]["clk_rate"]) is float
+    assert derived["RF0"]["lo_offset"] == 0.0 and type(derived["RF0"]["lo_offset"]) is float

@@ -850,7 +850,19 @@ def test_the_radar_binary_comes_from_the_managers_settings_unless_set_explicitly
     assert W.radar_exe(config) == "/opt/orca/sdr/build/radar"
     config["watcher"]["radar_exe"] = "/somewhere/else/radar"
     assert W.radar_exe(config) == "/somewhere/else/radar"
-    # Without the manager's settings: the manager's own defaults if that code is there, else the usual place.
+    # The defaults as they are: the manager's ORCA checkout.
+    orca = C.DEFAULTS["manager"]["orca"]
+    assert W.radar_exe(copy.deepcopy(C.DEFAULTS)) == "/home/englacial/orca/sdr/build/radar"
+    # The allowance outlasts the time in which the manager itself holds a stop for ORCA's start line.
+    assert C.DEFAULTS["watcher"]["radar_setup_s"] > orca["start_timeout_s"] + orca["stop_timeout_s"]
+    # ... and the files that both use are the same files.
+    from radar_runner.manager import ampsafe, gates
+    assert C.DEFAULTS["watcher"]["reset"]["state_file"] == ampsafe.STATE_FILE
+    assert C.DEFAULTS["watcher"]["override_file"] == gates.OVERRIDE_NO_AMP_TELEMETRY
+    watcher_gate = C.DEFAULTS["manager"]["gates"]["watcher"]
+    assert (watcher_gate["require_true"], watcher_gate["require_false"], watcher_gate["reason_field"],
+            watcher_gate["max_age_s"]) == (["ok"], ["tripped"], "reason", 5.0)
+    # Without the manager's settings at all: the usual place.
     config = copy.deepcopy(C.DEFAULTS)
     config.pop("manager", None)
     assert W.radar_exe(config) == "/home/englacial/orca/sdr/build/radar"
@@ -879,7 +891,7 @@ def test_a_stand_in_radar_that_is_still_setting_up_is_not_signalled(rig):
     d = r.status().data
     assert radar.poll() is None and d["ok"] is False and d["radar"]["setting_up"] == [radar.pid]
     assert d["counters"]["radar_sigint"] == 0 and [w["warning"] for w in d["warnings"]] == ["radar_setting_up"]
-    r.radar_age = 31.0
+    r.radar_age = 66.0
     r.run(1.0)
     assert gone(radar) == -signal.SIGINT
     assert r.status().data["conditions"]["pin"]["signalled_by_watcher"] is True

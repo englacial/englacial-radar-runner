@@ -1,0 +1,27 @@
+--- a/sdr/main.cpp
++++ b/sdr/main.cpp
+@@ -287,7 +287,10 @@
+ 
+   string yaml_filename;
+   if (argc >= 2) {
+-    yaml_filename = "../../" + string(argv[1]);
++    yaml_filename = string(argv[1]);
++    if (yaml_filename[0] != '/') {
++      yaml_filename = "../../" + yaml_filename;
++    }
+   } else {
+     yaml_filename = "../../config/default.yaml";
+   }
+@@ -601,7 +604,11 @@
+   set_thread_priority_safe(1.0, true);
+ 
+   // open file to stream from
+-  ifstream infile("../../" + output_dir + "/" + chirp_loc, ifstream::binary);
++  string chirp_path = output_dir + "/" + chirp_loc;
++  if (chirp_path[0] != '/') {
++    chirp_path = "../../" + chirp_path;
++  }
++  ifstream infile(chirp_path, ifstream::binary);
+ 
+   if (!infile.is_open())
+   {

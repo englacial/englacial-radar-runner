@@ -1,0 +1,57 @@
+# Radar manager: starts and stops the radar (button, radarctl, later GPS motion).
+# Documentation: radar_runner/manager/README.md. Installed by setup/setup.sh, which never
+# enables or starts it: the first start is done by hand with the radar under supervision.
+
+[Unit]
+Description=Radar manager (starts and stops the radar; button, LEDs, radarctl)
+Documentation=file:///home/englacial/englacial-radar-runner/radar_runner/manager/README.md
+# The directories under /run and /var/lib (tmpfiles) and the data drive. No
+# Requires= on the other services: the manager reads their status files and
+# treats a missing or old one as "not ready".
+After=systemd-tmpfiles-setup.service local-fs.target
+# No start-rate limit: systemd never gives up restarting it. A restarted
+# manager starts no radar by itself (the wish to run is not kept across a
+# restart), except through the motion trigger.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=englacial
+Group=englacial
+WorkingDirectory=/home/englacial/englacial-radar-runner
+ExecStart=/home/englacial/englacial-radar-runner/.venv/bin/python -B -u -m radar_runner.manager
+Restart=always
+RestartSec=10
+
+# The radar asks for real-time priority for its two threads. A login shell of
+# user englacial may (rtprio 99 in /etc/security/limits.conf), and every bench
+# measurement was made that way; a service may not unless this is set.
+LimitRTPRIO=99
+
+# The loop turns ten times a second and pings once a second. No ping for 30 s:
+# kill the manager and restart it.
+WatchdogSec=30
+WatchdogSignal=SIGKILL
+
+# Stopping. The radar must never be left running without the manager:
+#  * systemctl stop / shutdown: SIGTERM goes to the manager only (KillMode=mixed).
+#    It stops the radar with SIGINT (gone within orca.urgent_stop_budget_s, killed
+#    if need be), makes the amplifier safe if that is needed, and exits. The helper programs are not signalled,
+#    so the amplifier tool is never interrupted half way.
+#  * the manager dies (crash, watchdog, kill -9): the kernel kills the radar at
+#    once (the manager starts it with `setpriv --pdeathsig KILL`).
+#  * whatever is left in the unit's control group after TimeoutStopSec gets SIGKILL.
+KillMode=mixed
+# Longest clean stop: orca.urgent_stop_budget_s (3) + amp_safe.confirm_timeout_s (5)
+# + amp_safe.timeout_s (40) x 3 attempts + 15 s. Keep TimeoutStopSec above that sum.
+TimeoutStopSec=160
+TimeoutStartSec=30
+
+# After every stop of the unit, clean or not, once all its processes are gone:
+# if the SDR's amplifier pin is not known to be safe (the manager died or was
+# killed while a radar ran, or its own attempt failed), make it safe now.
+ExecStopPost=/home/englacial/englacial-radar-runner/bin/radar-manager-stop-hook
+
+[Install]
+WantedBy=multi-user.target

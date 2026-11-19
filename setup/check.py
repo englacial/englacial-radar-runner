@@ -899,6 +899,202 @@ def _(name):
         "trips", "telemetry_losses", "tool_runs", "radar_sigint", "radar_sigkill", "stalls")))
 
 
+section("setup.sh: radar manager")
+
+MANAGER_STATE_DIR = "/var/lib/radar-runner/user"
+POWER_OFF_BUDGET_S = 48.0       # the last resort of the power-off sequence must come within this of the loss
+AMP_SAFE = os.path.join(REPO, "tools", "sdr_gpio_safe", "amp_safe")
+
+
+def manager_settings():
+    """The manager's merged settings and what it finds wrong with the radar config, read with the
+    repository's own Python environment (PyYAML). Returns a dict, or raises Skip."""
+    code = ("import json, os; from radar_runner.common import config as C; from radar_runner.manager import limits\n"
+            "c, w = C.load(secrets_file=None); m = c['manager']\n"
+            "out = {'manager': m, 'warnings': w, 'paths': c['paths']}\n"
+            "p = m['radar_config']\n"
+            "out['radar_config_exists'] = os.path.exists(p)\n"
+            "try:\n"
+            "    out['problems'] = limits.check(limits.load_file(p), m['limits']) if os.path.exists(p) else None\n"
+            "except limits.ConfigError as e:\n"
+            "    out['problems'] = [str(e)]\n"
+            "print(json.dumps(out))")
+    rc, text, err = run(os.path.join(REPO, ".venv", "bin", "python"), "-B", "-c", code)
+    if rc != 0:
+        raise Skip(f"the manager's settings could not be read: {(err or text)[-200:]}")
+    return json.loads(text)
+
+
+@item("radar-manager.service unit file")
+def _(name):
+    mine = read(os.path.join(REPO, "systemd", "radar-manager.service"))
+    theirs = read("/etc/systemd/system/radar-manager.service")
+    check(name, theirs is not None and mine == theirs,
+          "not installed" if theirs is None else "identical to systemd/radar-manager.service" if mine == theirs
+          else "differs from systemd/radar-manager.service")
+    enabled, active = unit_state("radar-manager.service")
+    # Not enabled is the expected state until the supervised first start has been done by hand.
+    report(PASS if (enabled, active) == ("enabled", "active") else INFO, "radar-manager.service",
+           f"{enabled}, {active}" + ("" if active == "active" else
+                                     " (setup.sh never enables it: see \"First start with the real radar\" "
+                                     "in radar_runner/manager/README.md)"))
+
+
+@item("radarctl command")
+def _(name):
+    link, target = "/usr/local/bin/radarctl", os.path.join(REPO, "bin", "radarctl")
+    real = os.path.realpath(link) if os.path.lexists(link) else None
+    check(name, real == os.path.realpath(target), f"{link} -> {real}" if real else f"{link} missing", target)
+    rc, text, err = run(target, "status")
+    if rc == 0:
+        check("radar manager answers", True, text.split("\n")[0])
+    elif rc == 3:
+        report(INFO, "radar manager answers", "the manager is not running")
+    else:
+        report(FAIL, "radar manager answers", f"radarctl status: exit {rc}: {(err or text)[:200]}")
+
+
+@item("radar is killed if the manager dies (setpriv --pdeathsig)")
+def _(name):
+    rc, _text, err = run("/usr/bin/setpriv", "--pdeathsig", "KILL", "/bin/true")
+    check(name, rc == 0, "setpriv --pdeathsig works" if rc == 0 else f"exit {rc}: {err}")
+
+
+@item(f"front panel pins usable by {OWNER.pw_name}")
+def _(name):
+    chips = [f"/dev/{n}" for n in sorted(os.listdir("/dev")) if n.startswith("gpiochip")]
+    groups = {g.gr_gid for g in grp.getgrall() if OWNER.pw_name in g.gr_mem} | {OWNER.pw_gid}
+    usable = [c for c in chips if (os.stat(c).st_mode & 0o060) == 0o060 and os.stat(c).st_gid in groups]
+    check(name, bool(usable), ", ".join(usable) or "no GPIO chip is readable and writable by the user's groups",
+          "the chip of the 40-pin header (pinctrl-rp1) usable through a group")
+
+
+@item("real-time priority for the radar")
+def _(name):
+    unit = read("/etc/systemd/system/radar-manager.service") or ""
+    limits = read("/etc/security/limits.conf") or ""
+    shell = re.search(rf"^{re.escape(OWNER.pw_name)}\s+\S+\s+rtprio\s+(\d+)", limits, re.M)
+    check(name, "LimitRTPRIO=99" in unit,
+          ("unit: LimitRTPRIO=99" if "LimitRTPRIO=99" in unit else "unit: no LimitRTPRIO=99 (or not installed)")
+          + f"; login shells: rtprio {shell.group(1) if shell else 'not set'} (as the bench runs were made)")
+
+
+@item("make-amplifier-safe tool")
+def _(name):
+    binary = os.path.join(os.path.dirname(AMP_SAFE), "build", "sdr_gpio_safe")
+    hook = os.path.join(REPO, "bin", "radar-manager-stop-hook")
+    ok = all(os.access(p, os.X_OK) for p in (AMP_SAFE, binary, hook))
+    check(name, ok, ", ".join(f"{os.path.relpath(p, REPO)} {'ok' if os.access(p, os.X_OK) else 'MISSING'}"
+                              for p in (AMP_SAFE, binary, hook)), "all three executable")
+    m = manager_settings()["manager"]["amp_safe"]
+    command = [str(a) for a in m["command"]]
+    try:
+        own = float(command[command.index("--timeout") + 1])
+    except (ValueError, IndexError):
+        own = None
+    check("manager's limit for the tool is longer than the tool's own", own is not None and m["timeout_s"] > own,
+          f"manager.amp_safe.timeout_s {m['timeout_s']:g} s, tool --timeout {own if own is None else format(own, 'g')} s")
+    record = read(os.path.join(MANAGER_STATE_DIR, "sdr-state"))
+    report(INFO, "SDR amplifier pin record", " ".join(record.split("\n")[:2]) if record else
+           "no record yet (treated as unknown)")
+
+
+@item("radar config and its limits")
+def _(name):
+    s = manager_settings()
+    m = s["manager"]
+    for w in s["warnings"]:
+        report(FAIL, "config warning", w)
+    if not s["radar_config_exists"]:
+        report(INFO, name, f"{m['radar_config']} does not exist yet: the manager stays \"not ready\" until it does")
+    else:
+        check(name, not s["problems"], f"{m['radar_config']}: " + ("passes the limits" if not s["problems"]
+                                                                    else "; ".join(s["problems"])))
+    conservative = m["limits"]["max_tx_gain"] == 43.0
+    report(INFO, "per-unit limits", f"max_tx_gain {m['limits']['max_tx_gain']:g}, max_enable_duty "
+           f"{m['limits']['max_enable_duty']:g}" + (" (the conservative defaults: set the unit's values in "
+                                                    "/etc/radar-runner/local.yaml)" if conservative else ""))
+    root, mount = m["gates"]["data"]["root"], m["gates"]["data"]["mount_point"]
+    parent = os.path.dirname(root)
+    try:
+        owner = pwd.getpwuid(os.stat(root if os.path.isdir(root) else parent).st_uid).pw_name
+    except OSError:
+        owner = None
+    check("collection directory on the data drive", os.path.ismount(mount) and owner == OWNER.pw_name,
+          f"{root if os.path.isdir(root) else parent} belongs to {owner}; {mount} "
+          f"{'is' if os.path.ismount(mount) else 'is NOT'} mounted", f"owner {OWNER.pw_name}, on the mounted drive")
+
+
+def power_hook_findings(power, state_file):
+    """What is right and wrong with the radar's hooks in the power service's config.
+
+    `power` is power.toml as a dict, `state_file` the record that the manager keeps.
+    Returns a list of (ok, name, observed, expected); ok None = information only.
+    No I/O: tests/common/test_setup_tools.py runs it on made-up configs.
+    """
+    out = []
+    hooks = power.get("hooks", {})
+    hook_time = 0.0
+    for hook in ("stop_radar", "amp_safe"):
+        argv = [str(a) for a in hooks.get(hook) or []]
+        if not argv:
+            out.append((None, f"power service hook {hook}",
+                        "not set (setup.sh prints the lines to add after the manager's first start)", ""))
+            continue
+        limit = hooks.get(f"{hook}_timeout_s", 5.0)
+        hook_time += limit + 1.0            # the power service gives a hook 1 s more to die
+        try:
+            own = float(argv[argv.index("--timeout") + 1])
+        except (ValueError, IndexError):
+            own = None
+        out.append((own is not None and limit > own and argv[0] == "/usr/bin/setpriv", f"power service hook {hook}",
+                    f"limit {limit:g} s, command's own --timeout {own if own is None else format(own, 'g')} s, "
+                    f"run through {os.path.basename(argv[0])}",
+                    "through setpriv (never a user's file as root), and the limit longer than --timeout"))
+        if hook == "amp_safe":
+            # The record that the hook reads must be the one the manager keeps.
+            through_script = any(a.endswith("/bin/radar-manager-stop-hook") for a in argv)
+            if "--state-file" in argv:                                  # the tool called directly
+                where = argv.index("--state-file") + 1
+            elif "--timeout" in argv:                                   # bin/radar-manager-stop-hook
+                where = argv.index("--timeout") + 2
+            else:
+                where = len(argv)
+            given = argv[where] if where < len(argv) else "/var/lib/radar-runner/user/sdr-state"
+            out.append((given == state_file, "power service hook amp_safe reads the manager's record",
+                        given, state_file))
+            out.append((through_script, "power service hook amp_safe runs the tool only when needed",
+                        "through bin/radar-manager-stop-hook" if through_script else "calls the tool every time",
+                        "bin/radar-manager-stop-hook (every run of the tool enables the amplifier for half a second)"))
+    # Worst case of the power-off sequence, every step at its limit (power/README.md): the signals
+    # agree 1.8 s after the loss, ride-through, the hooks, sync, guard record 3 s, 0.4 s.
+    shutdown = power.get("shutdown", {})
+    command_at = (1.8 + shutdown.get("ride_through_s", 8.0) + hook_time + shutdown.get("sync_timeout_s", 5.0)
+                  + 3.0 + 0.4)
+    last_resort = command_at + shutdown.get("last_resort_after_s", 10.0)
+    out.append((last_resort <= POWER_OFF_BUDGET_S, "power-off sequence fits the capacitor",
+                f"worst case: hooks {hook_time:g} s, power-off command {command_at:.1f} s after the loss, "
+                f"last resort at {last_resort:.1f} s",
+                f"last resort within {POWER_OFF_BUDGET_S:g} s (the capacitor lasted about 58 s at room temperature)"))
+    return out
+
+
+@item("power service hooks for the radar")
+def _(name):
+    text = read("/etc/radar-runner/power.toml")
+    if text is None:
+        raise Skip("/etc/radar-runner/power.toml missing or unreadable")
+    try:
+        state_dir = manager_settings()["paths"]["state_dir"]
+    except Skip:
+        state_dir = MANAGER_STATE_DIR
+    for ok, what, observed, expected in power_hook_findings(tomllib.loads(text), os.path.join(state_dir, "sdr-state")):
+        if ok is None:
+            report(INFO, what, observed)
+        else:
+            check(what, ok, observed, expected)
+
+
 section("setup.sh: time (chrony, fake-hwclock)")
 
 

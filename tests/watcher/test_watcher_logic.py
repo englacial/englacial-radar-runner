@@ -911,7 +911,7 @@ def test_a_radar_younger_than_the_set_up_allowance_is_not_signalled():
     sim.run(60.0)
     sim.radar_age = 0.0
     sim.radar = (55,)
-    sim.run(29.5)
+    sim.run(64.5)
     assert sim.signals == [] and "radar_setting_up" in sim.logic.warnings
     assert sim.logic.snapshot(sim.t)["radar"]["setting_up"] == [55]
     sim.run(1.0)
@@ -929,7 +929,7 @@ def test_an_old_radar_is_stopped_while_a_young_one_next_to_it_is_left_until_it_i
     sim.run(10.0)
     assert {pids for _, _, pids in sim.signals} == {(10,)}
     sim.radar = (11,)
-    sim.run(25.0)
+    sim.run(60.0)
     assert [pids for _, sig, pids in sim.signals if pids == (11,)][:1] == [(11,)]
 
 

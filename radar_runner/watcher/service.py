@@ -92,14 +92,8 @@ def radar_exe(config):
     explicit = config["watcher"]["radar_exe"]
     if explicit != RADAR_FROM_MANAGER:
         return explicit
-    orca = (config.get("manager") or {}).get("orca")
-    if orca is None:
-        try:        # until the manager's settings are part of the shared defaults
-            from ..manager.config import MANAGER_DEFAULTS
-            orca = MANAGER_DEFAULTS["orca"]
-        except Exception:
-            return RADAR_FALLBACK
     try:
+        orca = config["manager"]["orca"]
         return os.path.normpath(os.path.join(orca["dir"], orca["radar_cwd"], orca["radar_command"][0]))
     except (KeyError, IndexError, TypeError):
         return RADAR_FALLBACK

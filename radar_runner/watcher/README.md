@@ -86,7 +86,7 @@ checksum. **And one good reading in between hides nothing:**
 | No telemetry, override set | not a problem; everything that can still be judged is | ok, warning | plan |
 | Enabled current (above 0.5 A) for 5 s with no radar process | run the reset tool, see below | not ok, tripped | `pa_guard.py` `IDLE_ENABLED_TRIP_S`, `CURRENT_SHUTDOWN_MAX_A` (shutdown 0.156 A, enabled about 2.5 A) |
 | No telemetry and no radar process for 20 s, and the pin not known to be safe | run the reset tool, see below | not ok, tripped | chosen here |
-| Status not ok for 5 s with a radar process alive that is at least 30 s old | SIGINT; SIGKILL 5 s later; SIGKILL again every 5 s while it lasts | | see "Stopping a radar" |
+| Status not ok for 5 s with a radar process alive that is at least 65 s old | SIGINT; SIGKILL 5 s later; SIGKILL again every 5 s while it lasts | | see "Stopping a radar" |
 
 A falling rail during a power loss passes through 20-26 V. If three readings
 catch it there, that is a supply trip in the event log at the end of a day;
@@ -113,15 +113,20 @@ only if a radar process is still there afterwards:
   seconds ok count down at a quarter of that rate. So telemetry that comes and
   goes (2 s of readings, 4 s without) does not start the 5 s afresh each time,
   and 20 s of ok do.
-* **Set-up allowance:** a radar process younger than `radar_setup_s` (30 s) is
+* **Set-up allowance:** a radar process younger than `radar_setup_s` (65 s) is
   never signalled; it is signalled when it reaches that age if the status is
   still not ok. ORCA has no SIGINT handler until the SDR is set up (firmware
   and FPGA load: 17 s at a first contact after power-up), and UHD holds the
   amplifier pin low during the set-up: a radar that dies there leaves the
   amplifier enabled. The status shows such a radar under `radar.setting_up`
   with the warning `radar_setting_up`. There is no exception for an
-  over-temperature or stuck trip: the allowance is itself the bound (30 s), and
-  the manager does not start a radar while the status is not ok.
+  over-temperature or stuck trip: the allowance is itself the bound, and the
+  manager does not start a radar while the status is not ok. The 65 s are the
+  manager's `orca.start_timeout_s` (60 s, for which it holds a stop until ORCA's
+  start line) plus its `stop_timeout_s` (3 s) and a margin: until then the stop
+  is the manager's, and the watcher's SIGINT cannot land in ORCA's set-up while
+  the manager is still waiting for it to end. A manager that dies takes its
+  radar with it (`setpriv --pdeathsig KILL`).
 * SIGINT, then SIGKILL after `radar_exit_s` (5 s, `pa_guard.py`
   `RADAR_SIGINT_GRACE_S`), then SIGKILL every `kill_retry_s` (5 s).
 * **After any signal from the watcher the pin counts as not known safe**
@@ -280,7 +285,7 @@ sudo systemctl stop radar-watcher radar-telemetry      # until the next boot, or
 Both, and the watcher first. The bench tools need the OLA's port, so the
 telemetry service has to be stopped for them; with only that one stopped the
 watcher's status is not ok and **it stops every bench radar** once the radar
-is 30 s old, and after 20 s without telemetry it runs the reset tool if the
+is 65 s old, and after 20 s without telemetry it runs the reset tool if the
 record does not say `safe`. The watcher is enabled, so it is back after every
 reboot: stop the two again.
 
@@ -342,7 +347,7 @@ copies of `sleep` named `radar`, and runs the service once as a real process.
 Everything that needs the real reset tool or a real radar: the tool run from
 the watcher (its time, the result, the current afterwards), `BUSY` while ORCA
 runs, the lock probe against a real `amp_safe`, SIGINT and SIGKILL to the real
-radar and the state of the amplifier after each, whether 30 s covers ORCA's
+radar and the state of the amplifier after each, whether 65 s covers ORCA's
 set-up in every case, the SDR's USB product string before and after its first
 start, the unit under systemd (the tool surviving a stop of the watcher), and
 the stage's "done when" items.
