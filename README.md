@@ -10,11 +10,14 @@ except the radar acquisition code itself (`~/orca`). Plan and stages:
 |---|---|
 | `power/`, `config/power.toml`, `systemd/radar-power.service` | Power service (stage 1). Standard library only, run as root by `/usr/bin/python3`; independent of everything below. See `power/README.md` |
 | `radar_runner/common/` | Shared code for all other services: status files, config, logging, systemd notification, the service loop |
+| `radar_runner/common/bootcount.py` | The boot counter used in names that must stay unique and ordered without a clock |
+| `radar_runner/telemetry/`, `systemd/radar-telemetry.service` | Telemetry service (stage 2): OLA, Pi, UPS and GPS readings logged and published. See `radar_runner/telemetry/README.md` |
 | `radar_runner/example.py` | A minimal service to copy. Not installed |
 | `config/radar-runner.yaml` | Settings of those services, with every default |
 | `setup/` | System setup: `setup.sh`, `check.py`, `SYSTEM_CHANGES.md`, the files it installs (`files/`), version pins (`pins.toml`), and the Python environment tools |
 | `tests/power/` | Power service tests (unittest) |
 | `tests/common/` | Tests of the shared code and of `setup.sh` (pytest) |
+| `tests/telemetry/` | Telemetry service tests (pytest), with a recorded OLA session in `data/` |
 | `.venv/`, `wheelhouse/` | Python environment and the wheels it is built from. Not in git |
 
 ## Python environment
@@ -61,8 +64,9 @@ setup/check.py              # PASS/FAIL per item; also after every update, and t
 
 What each change is, why, and how to revert it: `setup/SYSTEM_CHANGES.md`,
 which also lists the three bench tests that must follow enabling the hardware
-watchdog. The script installs no packages; chrony and rclone come with the
-stages that configure them (2 and 9).
+watchdog. The script's last step installs chrony and fake-hwclock in place of
+systemd-timesyncd (needs the internet; every other step works without). rclone
+comes with stage 9.
 
 ## Writing a service
 

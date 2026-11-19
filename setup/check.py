@@ -1,7 +1,9 @@
 #!/usr/bin/python3 -B
 """Check this system against the setup that the radar manager expects.
 
-    setup/check.py
+    setup/check.py               everything that can be checked by looking
+    setup/check.py --receiver    also ask the GPS receiver for one setting and its buffer error flags
+                                 (two read-only polls through gpsd; nothing is ever set)
 
 Prints one line per item:
 
@@ -36,6 +38,9 @@ FILES = os.path.join(REPO, "setup", "files")
 OWNER = pwd.getpwuid(os.stat(REPO).st_uid)       # the user that owns the checkout
 HOME = OWNER.pw_dir
 IS_ROOT = os.geteuid() == 0
+if set(sys.argv[1:]) - {"--receiver"}:
+    sys.exit("usage: setup/check.py [--receiver]")
+ASK_RECEIVER = "--receiver" in sys.argv[1:]
 PASS, FAIL, SKIP, INFO = "PASS", "FAIL", "SKIP", "INFO"
 
 results = []
@@ -355,7 +360,7 @@ def _(name):
 
 @item("time daemon")
 def _(name):
-    # chrony (with GPS as a time source) replaces systemd-timesyncd in stage 2, not before.
+    # chrony (with GPS as a time source) replaces systemd-timesyncd from stage 2; details further down.
     daemons = [f"{unit} ({package_version(package)})" for unit, package in
                (("systemd-timesyncd.service", "systemd-timesyncd"), ("chrony.service", "chrony"))
                if unit_state(unit)[1] == "active"]
@@ -671,6 +676,237 @@ def _(name):
           f"power_present {d.get('power_present')}, capacitor {d.get('capacitor_v')} V")
     warnings = d.get("warnings") or {}
     check("power service warnings", not warnings, json.dumps(warnings) if warnings else "none")
+
+
+section("setup.sh: gpsd")
+
+GPS_DEVICE = "/dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver-if00"
+
+
+@item("gpsd.service enabled and running")
+def _(name):
+    enabled, active = unit_state("gpsd.service")
+    check(name, (enabled, active) == ("enabled", "active"), f"{enabled}, {active}", "enabled, active")
+
+
+@item("gpsd keeps reading without clients, with the receiver named")
+def _(name):
+    args = out("ps", "-C", "gpsd", "-o", "args=")
+    check(name, " -n " in args + " " and GPS_DEVICE in args, args or "gpsd is not running",
+          f"gpsd -n {GPS_DEVICE}")
+
+
+@item("gpsd started with the receiver, hotplug path off")
+def _(name):
+    device = next((l.split("=", 1)[1] for l in (read(os.path.join(FILES, "etc/systemd/system/gpsd.service.d/radar-runner.conf")) or "").splitlines()
+                   if l.startswith("BindsTo=")), "")
+    link = f"/etc/systemd/system/{device}.wants/gpsd.service"
+    check("the receiver's device unit wants gpsd.service", os.path.islink(link), "link present" if os.path.islink(link) else "no link",
+          "link present (setup.sh creates it)")
+    exec_start = out("systemctl", "show", "gpsdctl@ttyACM0.service", "-p", "ExecStart", "--value")
+    check("Ubuntu's gpsdctl hotplug path switched off", "/bin/true" in exec_start and "gpsdctl add" not in exec_start,
+          "no-op" if "/bin/true" in exec_start else "still runs gpsdctl add", "no-op (the receiver was opened twice at boot otherwise)")
+    enabled, _active = unit_state("radar-gps-receiver.service")
+    check("radar-gps-receiver.service (once-per-boot receiver setting check)", enabled == "enabled", enabled, "enabled")
+
+
+@item("gpsd hotplug (USBAUTO in /etc/default/gpsd)")
+def _(name):
+    found = re.findall(r'^USBAUTO="?(\w+)"?', read("/etc/default/gpsd") or "", re.M)
+    check(name, bool(found) and found[-1] == "true", f"USBAUTO={found[-1]}" if found else "not set",
+          'USBAUTO="true": a replugged receiver is added by udev and gpsdctl')
+
+
+@item("GPS receiver")
+def _(name):
+    present = os.path.exists(GPS_DEVICE)
+    check(name + " on USB", present, GPS_DEVICE + (" exists" if present else " missing"))
+    import socket
+    devices, reply = None, {}
+    try:
+        with socket.create_connection(("127.0.0.1", 2947), timeout=3) as sock:
+            f = sock.makefile("rwb")
+            f.readline()
+            f.write(b'?WATCH={"enable":true};\n?DEVICES;\n?POLL;\n')     # questions to gpsd, not to the receiver
+            f.flush()
+            for _ in range(12):
+                line = f.readline()
+                if line.startswith(b'{"class":"DEVICES"'):
+                    devices = json.loads(line).get("devices") or []
+                elif line.startswith(b'{"class":"POLL"'):
+                    reply = json.loads(line)
+                    break
+    except OSError as e:
+        report(FAIL, name + " known to gpsd", f"cannot ask gpsd: {e}")
+        return
+    paths = [d.get("path") for d in devices or []]
+    tpv = (reply.get("tpv") or [{}])[0]
+    # Exactly one: two entries would mean that the receiver was added twice (by its stable name
+    # on gpsd's command line and again by the hotplug path) and is being read through both.
+    check(name + " known to gpsd, once", len(paths) == 1 and reply.get("active") == 1,
+          f"{len(paths)} device(s) {paths}, {reply.get('active', 0)} active; fix mode {tpv.get('mode')}, time {tpv.get('time')}",
+          "exactly 1 device, active")
+    report(INFO, name + " fix", {2: "2D fix", 3: "3D fix"}.get(tpv.get("mode"), "no position fix (chrony gets GPS time only with a fix)"))
+
+
+@item("GPS receiver settings (asked of the receiver)")
+def _(name):
+    if not ASK_RECEIVER:
+        raise Skip("not asked: setup/check.py --receiver reads them (two read-only polls through gpsd, nothing is set)")
+    # Read only: -g reads one configuration item from the RAM layer (0), -p MON-COMMS polls the port
+    # statistics. No -z, -x, -e, -d here, ever: this script changes nothing, least of all the receiver.
+    ubxtool = ("ubxtool", "-P", "27.50", "-w", "1.5")
+    rc, text, err = run(*ubxtool, "-g", "CFG-UART1OUTPROT-NMEA,0", timeout=30)
+    if rc is None:
+        report(FAIL, name, err)
+        return
+    values = re.findall(r"item CFG-UART1OUTPROT-NMEA/0x[0-9a-fA-F]+ val (-?\d+)", text)
+    check("GPS receiver: NMEA output on UART1 off", values[-1:] == ["0"],
+          f"CFG-UART1OUTPROT-NMEA = {values[-1]} in RAM" if values else "no answer from the receiver",
+          "0 (with 1 and the OLA's 10 Hz rate the receiver's transmit buffer overflows; setup/SYSTEM_CHANGES.md, section 11)")
+    rc, text, err = run(*ubxtool, "-p", "MON-COMMS", timeout=30)
+    m = re.search(r"txErrors x([0-9a-fA-F]+)", text)
+    peak = re.search(r"\(USB\)\s+txPending \d+ txBytes \d+ txUsage \d+ txPeakUsage (\d+)", text)
+    check("GPS receiver: no transmit buffer errors", bool(m) and not int(m.group(1), 16) & 0xC0,
+          (f"txErrors 0x{int(m.group(1), 16):02x}" + (f", USB buffer peak {peak.group(1)} %" if peak else ""))
+          if m else "no answer from the receiver", "memory (0x40) and allocation (0x80) flags clear")
+
+
+section("setup.sh: telemetry service")
+
+
+@item("radar-telemetry.service unit file")
+def _(name):
+    mine = read(os.path.join(REPO, "systemd", "radar-telemetry.service"))
+    theirs = read("/etc/systemd/system/radar-telemetry.service")
+    check(name, theirs is not None and mine == theirs,
+          "not installed" if theirs is None else "identical to systemd/radar-telemetry.service" if mine == theirs
+          else "differs from systemd/radar-telemetry.service")
+    enabled, active = unit_state("radar-telemetry.service")
+    check("radar-telemetry.service", (enabled, active) == ("enabled", "active"), f"{enabled}, {active}",
+          "enabled, active (stopped by hand for bench work? see radar_runner/telemetry/README.md)")
+
+
+@item("sensor log directory on the data drive")
+def _(name):
+    path = "/mnt/nvme/radar-runner"
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        report(FAIL, name, f"{path}: {e.strerror} (the logs then go to the SD card)")
+        return
+    owner = pwd.getpwuid(st.st_uid).pw_name
+    check(name, owner == OWNER.pw_name and os.path.ismount("/mnt/nvme"),
+          f"{path} belongs to {owner}; /mnt/nvme {'is' if os.path.ismount('/mnt/nvme') else 'is NOT'} mounted",
+          f"owner {OWNER.pw_name}, on the mounted drive")
+
+
+@item("telemetry status file")
+def _(name):
+    r = status_files.read_status(status_files.status_path("telemetry"), 5.0)
+    if not r.ok:
+        report(FAIL, name, f"{r.state}: {r.error}")
+        return
+    d = r.data
+    check(name, True, f"fresh ({r.age_s:.1f} s old): state {d.get('state')}, boot {d.get('boot_count')}")
+    amp = d.get("amp") or {}
+    check("amplifier readings fresh", amp.get("fresh") is True,
+          f"{amp.get('temp_c')} C, {amp.get('current_a')} A, {amp.get('voltage_v')} V, {amp.get('age_s')} s old"
+          + (f"; {amp.get('reason')}" if amp.get("reason") else ""), "fresh: true")
+    for source, entry in sorted((d.get("sources") or {}).items()):
+        check(f"telemetry source {source}", entry.get("health") == "ok",
+              entry.get("health", "?") + (f": {entry.get('reason')}" if entry.get("reason") else ""), "ok")
+    logs = d.get("logging") or {}
+    check("sensor logs written to the data drive", logs.get("location") == "primary" and logs.get("writer") == "running",
+          f"{logs.get('location')}, writer {logs.get('writer')}: {logs.get('directory')}"
+          + (f" ({logs.get('reason')})" if logs.get("reason") else "") + f", {logs.get('rows_dropped')} rows dropped",
+          "primary, writer running")
+    loop = d.get("loop") or {}
+    check("telemetry loop runs evenly", loop.get("recent_longest_gap_s", 99) <= 1.0,
+          f"longest gap between rounds: {loop.get('recent_longest_gap_s')} s lately, {loop.get('longest_gap_s')} s since it started",
+          "1 s or less in the last minutes")
+    retry = (d.get("sources") or {}).get("ola", {}).get("retry") or {}
+    check("OLA not in a failure back-off", not retry.get("failures_in_a_row"),
+          f"{retry.get('failures_in_a_row')} failures in a row; waiting for: {retry.get('waiting_for')}", "0 failures")
+    check("boot counter", not d.get("boot_count_problem") and d.get("boot_count", 0) > 0,
+          d.get("boot_count_problem") or f"boot {d.get('boot_count')}")
+
+
+section("setup.sh: time (chrony, fake-hwclock)")
+
+
+@item("time packages")
+def _(name):
+    pinned("chrony package", package_version("chrony"), "chrony_version")
+    pinned("fake-hwclock package", package_version("fake-hwclock"), "fake_hwclock_version")
+    old = package_version("systemd-timesyncd")
+    check("systemd-timesyncd removed", not old, f"installed ({old})" if old else "not installed",
+          "replaced by chrony")
+
+
+@item("chrony.service")
+def _(name):
+    enabled, active = unit_state("chrony.service")
+    check(name, (enabled, active) == ("enabled", "active"), f"{enabled}, {active}", "enabled, active")
+
+
+@item("chrony steps the clock at any time (makestep 1 -1)")
+def _(name):
+    if not package_version("chrony"):
+        report(FAIL, name, "chrony is not installed")
+        return
+    text = out("journalctl", "-b", "-u", "chrony.service", "-o", "cat", "--no-pager")
+    if not text:
+        raise Skip("chrony's log is not readable" + ("" if IS_ROOT else " (needs root or group adm)"))
+    lines = text.split("\n")
+    started = max((i for i, line in enumerate(lines) if "chronyd version" in line and "starting" in line), default=-1)
+    found = [line for line in lines[started + 1:] if "New makestep" in line]
+    check(name, bool(found) and found[-1].endswith("New makestep 1.000000 -1"),
+          found[-1].strip() if found else "not set since chronyd started (Ubuntu's 'makestep 1 3' is in effect)",
+          "'New makestep 1.000000 -1' in chrony's log after its start")
+
+
+@item("chrony time sources")
+def _(name):
+    rc, text, err = run("chronyc", "-c", "sources")
+    if rc != 0:
+        report(FAIL, name, err or text or "chronyc failed")
+        return
+    rows = [line.split(",") for line in text.split("\n") if line.count(",") >= 9]
+    gps = [r for r in rows if r[2] == "GPS"]
+    reach = int(gps[0][5], 8) if gps else 0
+    check("chrony GPS source (gpsd)", bool(gps) and reach != 0,
+          f"reach {gps[0][5]} (octal), last offset {float(gps[0][7]) * 1000:+.1f} ms" if gps else "no GPS source configured",
+          "samples arriving (needs gpsd -n and a position fix)")
+    ntp = [r for r in rows if r[0] == "^"]
+    report(INFO, "chrony NTP sources", f"{len(ntp)} configured, {sum(1 for r in ntp if int(r[5], 8))} reachable")
+    selected = [r[2] for r in rows if r[1] == "*"]
+    rc, text, _ = run("chronyc", "-c", "tracking")
+    fields = text.split(",")
+    synced = rc == 0 and len(fields) >= 14 and fields[13] != "Not synchronised"
+    check("clock synchronised by chrony", synced,
+          f"source {', '.join(selected) or 'none'}; system clock off by {float(fields[4]) * 1000:+.2f} ms"
+          if len(fields) >= 14 else "no answer", "a selected source")
+
+
+@item("fake-hwclock saves the clock")
+def _(name):
+    states = {u: unit_state(u) for u in ("fake-hwclock-load.service", "fake-hwclock-save.service", "fake-hwclock-save.timer")}
+    ok = all(e == "enabled" for e, _ in states.values()) and states["fake-hwclock-save.timer"][1] == "active"
+    check("fake-hwclock units", ok, ", ".join(f"{u} {e}/{a}" for u, (e, a) in states.items()),
+          "all enabled, the timer active")
+    timers = out("systemctl", "show", "fake-hwclock-save.timer", "-p", "TimersMonotonic", "-p", "TimersCalendar")
+    check("fake-hwclock saves every minute", "OnUnitActiveUSec=1min" in timers and "OnCalendar" not in timers,
+          " ".join(timers.split()) or "no timers", "OnUnitActiveUSec=1min and no hourly calendar timer")
+    saved = (read("/etc/fake-hwclock.data") or "").strip()
+    try:
+        import calendar
+        import time
+        age = time.time() - calendar.timegm(time.strptime(saved, "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        report(FAIL, name, f"/etc/fake-hwclock.data: {saved or 'missing or empty'}")
+        return
+    check(name, -5 <= age <= 180, f"last saved {saved} UTC, {age:.0f} s ago", "saved within the last 3 minutes")
 
 
 section("Optional setup.sh steps (not applied by default)")

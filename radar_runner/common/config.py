@@ -45,6 +45,57 @@ DEFAULTS = {
     "logging": {
         "level": "info",                         # debug, info, warning or error
     },
+    # The telemetry service (radar_runner/telemetry/README.md).
+    "telemetry": {
+        "loop_interval_s": 0.25,                 # how often the sources are read
+        "status_interval_s": 0.5,                # how often telemetry.json is rewritten
+        "data_root": "/mnt/nvme/radar-runner",   # sensor logs go to <data_root>/telemetry/
+        "data_mount": "/mnt/nvme",               # must be a mount point for data_root to be used ("-": no check)
+        "fallback_dir": "/var/lib/radar-runner/user/telemetry-fallback",   # on the SD card
+        "fallback_max_mb": 1000,                 # oldest fallback files are deleted above this
+        "flush_interval_s": 1.0,                 # rows are handed to the kernel this often
+        "fsync_interval_s": 30.0,                # each file is forced to the drive this often
+        "ola": {
+            "port": "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+            "baud": 115200,
+            "log_interval_s": 0.0,               # 0: log every row (about 10 per second)
+            "fresh_s": 2.0,                      # amplifier readings older than this are not fresh
+            "boot_timeout_s": 25.0,              # no header this long after opening: drive the menus anyway
+            "menu_timeout_s": 15.0,              # wait for each menu
+            "silent_s": 20.0,                    # no valid row for this long: reopen the port (resets the OLA)
+            "reopen_s": 5.0,                     # wait before reopening; doubles with every failure, up to:
+            "reopen_max_s": 3600.0,
+            "retry_s": 30.0,                     # wait before driving the menus again; doubles, up to:
+            "retry_max_s": 3600.0,
+            "stable_s": 300.0,                   # good rows for this long: the waits start short again
+            # Calibration of the three ADC readings (bench values; see amp_values in telemetry/ola.py).
+            "temp_divider": 2.0,
+            "temp_mv_per_c": 10.0,
+            "current_divider": 2.0,
+            "current_mv_per_a": 500.0,
+            "current_cal": 1.5,
+            "voltage_ratio": 11.0,
+        },
+        "pi": {
+            "interval_s": 2.0,
+        },
+        "ups": {
+            "interval_s": 1.0,
+            "stale_after_s": 3.0,                # the power service rewrites its file about once a second
+        },
+        "gps": {
+            "host": "127.0.0.1",
+            "port": 2947,
+            "interval_s": 1.0,
+            "stale_after_s": 5.0,                # no new fix time for this long: stale
+            "answer_timeout_s": 10.0,            # no answer from gpsd for this long: reconnect
+            "reconnect_s": 5.0,
+            "no_data_error_s": 30.0,             # receiver present but no fix time for this long: error
+            # Run a little after every OLA start ("" = never): see setup/gps_receiver.py
+            "receiver_fix_command": "/usr/bin/python3 -B /home/englacial/englacial-radar-runner/setup/gps_receiver.py --apply --ram",
+            "receiver_fix_delay_s": 15.0,
+        },
+    },
 }
 
 _TYPE_NAMES = {bool: "true or false", int: "a whole number", float: "a number", str: "text",

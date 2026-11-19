@@ -4,21 +4,25 @@ Every change outside this repository. Use it to rebuild a system, to compare
 two systems, or to undo a change. Add each new system change here when it is made.
 
 Reference host: `englacial-radar-1`, Raspberry Pi 5, Ubuntu 24.04.5 LTS, kernel
-`6.8.0-1068-raspi`, systemd 255. Written 2026-11-18 (stage 0).
+`6.8.0-1068-raspi`, systemd 255. Written 2026-11-18 (stage 0); sections 11-13
+added 2026-11-19 (stage 2).
 
 ```
 setup/setup.sh --dry-run     # show what would change; no root needed
 tmux                         # a dropped SSH session must not interrupt the next command
-sudo setup/setup.sh          # apply sections 1-10; safe to run again, also after an interruption
+sudo setup/setup.sh          # apply sections 1-13; safe to run again, also after an interruption
 sudo reboot                  # logind and journald read their files at boot
 setup/check.py               # one PASS/FAIL line per item below
 ```
 
 The script only writes files that this project owns (copied from
 `setup/files/`, same path as on the system), so reverting a change is deleting
-its file. It never touches network configuration or SSH, installs or removes no
-package, never restarts or stops the power service, and never reboots. Its one
-Tailscale change is section 5.
+its file. It never touches network configuration or SSH, never restarts or
+stops the power service or the telemetry service, and never reboots. Its one
+Tailscale change is section 5. Its one package change is section 13 (chrony
+and fake-hwclock in place of systemd-timesyncd), which is the last step and the
+only one that needs the internet. It restarts gpsd (section 11) and chrony
+(section 13) when their settings change.
 
 After section 8 (watchdog) is applied, the three bench tests listed there must
 be done before the system ships.
@@ -192,14 +196,226 @@ be done before the system ships.
 So that a run that was interrupted after installing a file is completed by
 simply running the script again.
 
+### 11. gpsd owns the GPS receiver
+
+**Changed 2026-11-19 after the first boot with stage 2** (this paragraph overrides anything
+below that contradicts it):
+
+- Ubuntu's hotplug path is switched off by a second drop-in,
+  `/etc/systemd/system/gpsdctl@.service.d/radar-runner.conf` (`gpsdctl add` becomes a no-op).
+  With the receiver both on gpsd's command line and added by the hotplug path, gpsd opened it
+  twice at boot ("Device or resource busy ... device activation failed, freeing device") and
+  delivered nothing.
+- gpsd is tied to the receiver instead: `BindsTo=`/`After=` the receiver's device unit in the
+  gpsd drop-in, and a link `/etc/systemd/system/<device unit>.wants/gpsd.service`, so systemd starts gpsd
+  when the receiver appears and stops it when it is unplugged. Revert: delete both drop-ins,
+  delete that link, `systemctl daemon-reload`.
+- The receiver setting `CFG-UART1OUTPROT-NMEA = 0` (no NMEA on the unused UART1; with it on and
+  the OLA's 10 Hz rate the transmit buffer overflows and gpsd gets no fix) was written to RAM,
+  battery-backed memory and flash on 2026-11-19 with `ubxtool -z CFG-UART1OUTPROT-NMEA,0`. It
+  had been believed to be in flash already and was found back at 1 after a power-off of a few
+  minutes. `radar-gps-receiver.service` now runs `setup/gps_receiver.py --apply` once per boot,
+  after gpsd, and sets it again if it is not 0. Revert: `systemctl disable
+  radar-gps-receiver.service` and delete the unit file.
+- Correction to the two points above, same day: the value in the receiver's RAM goes back to 1
+  at every start of gpsd (four of four observed; not after an OLA reset alone), while the
+  battery-backed and flash values stay 0. `radar-gps-receiver.service` therefore runs
+  `setup/gps_receiver.py --apply --ram` 20 s after every start of gpsd, as user englacial, and
+  does not restart gpsd. The telemetry service runs the same command about 15 s after every
+  OLA start (`telemetry.gps.receiver_fix_command`; "" switches that off).
+
+- **What:** a drop-in for `gpsd.service` that replaces its command line with
+  `gpsd -n /dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver-if00`
+  and adds `Restart=on-failure`; `systemctl enable gpsd.service`; one restart of
+  gpsd when it is not yet running that way. `/etc/default/gpsd` is not touched.
+- **Why:** as shipped, gpsd is started on demand (by its socket), opens the
+  receiver only while a client is connected, and has no receiver after a
+  restart of gpsd itself.
+  - `-n`: gpsd reads the receiver all the time, so chrony always has GPS time
+    (gpsd(8) asks for `-n` with a time daemon).
+  - enabled: gpsd runs from boot, whether or not anything connects.
+  - the receiver on the command line, by its stable name: gpsd has it again
+    after gpsd restarts. The name has no serial number, so a replacement
+    receiver of the same type gets the same name.
+- **Hotplug stays Ubuntu's:** a receiver that appears later, or is unplugged
+  and replugged, is added by udev (`60-gpsd.rules`, USB ID `1546:01a9`) through
+  `gpsdctl@ttyACM<n>.service`, which runs `gpsdctl add /dev/ttyACM<n>`
+  (`USBAUTO="true"` in `/etc/default/gpsd`, the package default; `check.py`
+  verifies it). This path is needed: gpsd 3.25 drops a device that it cannot
+  open (tested with a private gpsd instance: "device activation failed, freeing
+  device") and never looks for it again. After a replug gpsd therefore knows
+  the receiver as `/dev/ttyACM<n>`, not by the long name; clients must not
+  filter on the device path (the telemetry service does not).
+  At boot both paths name the same receiver; gpsd opens a serial device
+  exclusively, so the second one is refused and dropped (from the gpsd source;
+  **to confirm on the bench:** `gpspipe -w -n 5 | grep DEVICES` after a reboot
+  shows one device).
+- **Load:** gpsd reading this receiver (10 Hz, all satellite messages) uses
+  0.7 % of one core, all the time.
+- **File:** `/etc/systemd/system/gpsd.service.d/radar-runner.conf`
+- **Verify:** `ps -C gpsd -o args=`; `systemctl is-enabled gpsd`;
+  `gpspipe -w -n 5`; unplug and replug the receiver and repeat.
+- **Revert:** delete the file, `sudo systemctl daemon-reload`,
+  `sudo systemctl disable gpsd.service`, `sudo systemctl restart gpsd`.
+
+**Receiver settings (stored in the receiver, not on the card).** Checked on
+2026-11-19 with `ubxtool -g <key>,<layer>` after a power cycle, before and
+after an OLA reset (ZED-F9P, HPG 1.51, protocol 27.50):
+
+| Key | RAM | BBR | Flash | Default |
+|---|---|---|---|---|
+| `CFG-UART1OUTPROT-NMEA` | 0 | 0 | 0 | 1 |
+| `CFG-RATE-MEAS` (ms) | 100 | 100 | 100 | 1000 |
+| `CFG-I2COUTPROT-NMEA` | 0 | 0 | 0 | 1 |
+| `CFG-MSGOUT-UBX_NAV_PVT_USB`, `..._NAV_SAT_USB`, `..._NAV_SIG_USB` and five more that gpsd switches on | 1 | 1 | 1 | 0 |
+| `CFG-MSGOUT-UBX_MON_SPAN_USB`, `..._MON_RF_USB` (from the `gps_jam` logger) | 10 | 10 | 10 | 0 |
+
+- The setting that prevents the transmit-buffer overflow (`CFG-UART1OUTPROT-NMEA`
+  = 0) **is in the receiver's flash and battery-backed memory already**, and it
+  survived the power cycle of 2026-11-19 00:29. Settings that gpsd and the
+  bench tools only ever wrote to RAM are in flash as well. The likely cause: the
+  OLA's firmware saves the receiver's whole current configuration to flash
+  whenever the OLA starts (the SparkFun library's `saveConfiguration()`).
+  Nobody ran a save on purpose.
+- An OLA reset (opening its serial port) changed none of the 30 keys read, in
+  any layer. The receiver skipped one 100 ms epoch twice (while the OLA
+  configured it); no NMEA and no error text appeared on USB; the fix was kept.
+- So nothing is applied at boot, and nothing in this repository ever writes
+  to the receiver. The telemetry service only asks gpsd for positions; it
+  reports a receiver that is present but delivers no fix data
+  (`sources.gps.health: error`), which is how the overflow showed.
+  `setup/check.py --receiver` reads the setting and the receiver's
+  transmit-buffer error flags by hand, read-only.
+- Two reasons not to set it from software: the value is in flash already; and
+  if the OLA does save the receiver's configuration when it starts, a value
+  written "to RAM only" is in flash after the next OLA reset.
+- **A replaced or factory-reset receiver** has `CFG-UART1OUTPROT-NMEA` = 1.
+  `check.py --receiver` then fails. By hand, once, with the layer given
+  (1 = RAM; without a third field `ubxtool -z` writes RAM, BBR **and flash**):
+  `ubxtool -P 27.50 -z CFG-UART1OUTPROT-NMEA,0,1`.
+- **Every OLA start touches the receiver.** Opening the OLA's serial port
+  resets the OLA, and the OLA then configures the receiver (and, it seems,
+  saves to its flash). The telemetry service therefore opens the port once and
+  spaces out reopenings after failures up to an hour
+  (`radar_runner/telemetry/README.md`).
+- Not changed, to decide: the receiver runs at 10 Hz because the OLA sets it
+  (and saved it). gpsd then asks for all satellite messages at every epoch:
+  21 kB/s on USB, whose transmit buffer has peaked at 88 %
+  (`ubxtool -p MON-COMMS`).
+
+### 12. Telemetry service
+
+- **What:** `systemd/radar-telemetry.service` copied to `/etc/systemd/system/`,
+  enabled and started if it is not enabled yet; the directory
+  `/mnt/nvme/radar-runner` created for user `englacial` (the drive's top
+  directory belongs to root). A running service is never restarted or stopped;
+  one that was stopped by hand stays stopped. If another program has the OLA's
+  serial port open (a bench run of `pa_guard.py`), the script stops there and
+  does not enable or start the service: starting it would reset the OLA under
+  that program.
+- **Why and how it works:** `radar_runner/telemetry/README.md`.
+- **Side effect:** the service keeps the OLA's serial port. The bench tools
+  that open it (`pa_guard.py`, `pa_run.py`) cannot run until it is stopped:
+  `sudo systemctl stop radar-telemetry`.
+- **Verify:** `systemctl status radar-telemetry`;
+  `python3 -m json.tool /run/radar-runner/user/telemetry.json`;
+  `ls /mnt/nvme/radar-runner/telemetry/`
+- **Revert:** `sudo systemctl disable --now radar-telemetry && sudo rm /etc/systemd/system/radar-telemetry.service && sudo systemctl daemon-reload`.
+  The logs stay.
+
+### 13. Time: chrony and fake-hwclock in place of systemd-timesyncd
+
+- **What:** `apt-get install --no-install-recommends chrony fake-hwclock`
+  (chrony 4.5-1ubuntu4, fake-hwclock 0.13, and chrony's dependency
+  `tzdata-legacy`); apt removes `systemd-timesyncd`, which cannot be installed
+  together with chrony. Three files:
+
+  | File | What it does |
+  |---|---|
+  | `/etc/chrony/conf.d/radar-runner.conf` | GPS time from gpsd: `refclock SHM 0 refid GPS poll 3 offset 0.070 delay 0.2` |
+  | `/etc/systemd/system/chrony.service.d/radar-runner.conf` | `chronyc makestep 1 -1` after chrony starts: step the clock whenever it is off by more than 1 s |
+  | `/etc/systemd/system/fake-hwclock-save.timer.d/radar-runner.conf` | save the clock every minute (the package: every hour) |
+
+  Ubuntu's `/etc/chrony/chrony.conf` (NTP pools, `rtcsync`) is not changed.
+- **The install is guarded.** The script first asks apt what it would do
+  (`apt-get -s`) and stops, with nothing changed, if anything but
+  `systemd-timesyncd` would be removed or any installed package upgraded. It
+  downloads everything first, including `systemd-timesyncd` itself. If the
+  install fails, or chrony does not run afterwards, it installs
+  `systemd-timesyncd` again from the downloaded copy and says so. apt runs
+  non-interactively with needrestart switched off for the call (section 6 makes
+  it list-only anyway); no package script in this set touches ssh or tailscaled.
+  Without internet the step fails at the download and nothing changes; it is
+  the last step, so everything else is applied. If the install itself was cut
+  short (power, a killed session), the next run says so and names the command
+  that finishes it: `sudo dpkg --configure -a`. The once-a-minute clock save
+  adds two lines a minute to the journal ("Starting", "Finished"); that is
+  left as it is.
+- **Why chrony:** it takes time from gpsd as well as from NTP, and works with
+  neither. No PPS reaches the Pi, so GPS time is the time of the receiver's
+  messages over USB: they arrive about 70 ms late (measured against NTP: median
+  69 ms, 58-82 ms), which `offset 0.070` corrects, and `delay 0.2` makes chrony
+  prefer NTP servers whenever it can reach them. gpsd delivers time only once
+  the receiver has a position fix.
+- **Why fake-hwclock:** the Pi's clock chip has no battery (after a long
+  power-off it reads 1970-01-01; after a short one it is still right).
+  `systemd-timesyncd` saved the time about every minute and restored it at
+  boot. Ubuntu's chrony does not. Compared:
+
+  | Way to restore the time at boot | Behind after a clean shutdown | Behind after a hard power cut |
+  |---|---|---|
+  | `systemd-timesyncd` (before) | by the off time | off time + up to about 1 min |
+  | `chronyd -s` with its drift file | by the off time | off time + up to 1 h; the whole session if chrony never had a time source in it (the drift file is written at exit, and at most hourly while synchronised) |
+  | `fake-hwclock` as packaged | by the off time | off time + up to 1 h |
+  | **`fake-hwclock`, saving every minute (chosen)** | by the off time | off time + up to 1 min |
+  | the initramfs `fixrtc` script alone (root file system's last mount time) | by the whole previous session | the same |
+
+  `chronyd -s` would also read the clock chip itself, a second mechanism to
+  reason about. fake-hwclock is one shell script: `date > /etc/fake-hwclock.data`
+  every minute and at shutdown, `date -s` at boot (before `sysinit.target`) if
+  the saved time is later than the clock. Like `systemd-timesyncd`, it saves
+  whatever the clock says, so the clock never runs backwards from boot to boot.
+- **What the clock does at boot:**
+
+  | Boot | Clock |
+  |---|---|
+  | always, first | the kernel reads the clock chip (right after a short outage, 1970 after a long one); `fixrtc` raises it to the root file system's last mount time; fake-hwclock raises it to the last saved time. It is now behind by the time the Pi was off (plus up to 1 min after a hard cut), never ahead |
+  | with internet | chrony reaches the NTP pools within seconds of the link coming up and steps the clock. GPS is then a second source, within its 0.1 s margin |
+  | no internet, GPS with sky view | about half a minute after the receiver has a fix (and gpsd has seen four fixes), chrony steps the clock to GPS time, good to a few tens of milliseconds |
+  | neither | the clock keeps running from the restored time, behind by the off time. Logs are ordered by boot counter and uptime. When GPS or the internet appears later, even hours later, chrony steps the clock then |
+
+  After a long offline period chrony looks up the NTP pool names again with
+  growing pauses (up to about an hour), so NTP can take that long to come back
+  after the link does; GPS covers the gap.
+- **Why step at any time (`makestep 1 -1`):** Ubuntu's `makestep 1 3` allows a
+  step only in chrony's first three clock updates (24 s after the first GPS
+  time). If that first time was wrong, the clock would then be slewed, at
+  most 5 s per minute, for the rest of the day. Stepping whenever the clock is
+  off by more than 1 s costs a visible jump in the wall clock, which nothing
+  here depends on: status ages use uptime, the logs carry uptime in every row
+  and start a new file when the date changes, and the telemetry service logs
+  each step. It is set with `chronyc` from the service drop-in because a file in
+  `/etc/chrony/conf.d` cannot override the `makestep 1 3` that follows it in
+  Ubuntu's `chrony.conf`. If the command fails, chrony runs with `makestep 1 3`.
+- **Not verifiable before the install** (no root here): that chrony attaches
+  to gpsd's shared memory under Ubuntu's AppArmor profile (from the source it
+  does so as root before dropping privileges, and segment 0 belongs to root),
+  the timer change, and the whole install on this system.
+- **Verify:** `chronyc sources` (a `#* GPS` or `#+ GPS` line with a non-zero
+  reach; `^*` marks a selected NTP server); `chronyc tracking`;
+  `journalctl -b -u chrony | grep makestep` shows `New makestep 1.000000 -1`;
+  `cat /etc/fake-hwclock.data` is less than a minute old;
+  `systemctl list-timers fake-hwclock-save.timer`.
+  Without internet: unplug the network, reboot, and watch `chronyc sources`
+  select GPS and `journalctl -b -u chrony` report the step.
+- **Revert:** `sudo apt-get install systemd-timesyncd` (removes chrony),
+  `sudo apt-get remove fake-hwclock`, delete the three files,
+  `sudo systemctl daemon-reload`.
+- **An alternative in hardware:** a clock battery on the Pi 5's J5 connector
+  would keep the right time across power-offs and make fake-hwclock a fallback.
+
 ## Deferred to later stages (not done by `setup.sh`)
 
-- **chrony** (replacing `systemd-timesyncd`): stage 2, together with its GPS
-  time source. Not before, because this Pi has no clock battery:
-  `systemd-timesyncd` saves the time regularly and restores it at boot, so the
-  clock at least never runs backwards. chrony as Ubuntu configures it does not,
-  and every boot without internet would start at the time of an earlier boot.
-  `check.py` shows which time daemon is running.
 - **rclone**: stage 9, with the offload. Ubuntu's package is 1.60.1 (2022);
   check then that it is recent enough.
 
@@ -254,7 +470,6 @@ simply running the script again.
 | Patched UHD in `~/uhd-patched` (source `~/uhd`, `ORCA_UHD_BUILD.yaml`) * | built by hand, see `~/radar-testbench/UHD_751_FIX.md` | the radar |
 | ORCA checkout in `~/orca` * | cloned by hand | the radar |
 | Bootloader EEPROM: version 2026/01/21, `BOOT_ORDER=0xf461`, defaults otherwise * | stored in the Pi, not on the card | boot |
-| `systemd-timesyncd` as the time daemon * | stock image; see "Deferred" | clock |
 
 ## Considered and left alone
 
@@ -291,8 +506,10 @@ In this order, before `setup/setup.sh`:
 8. Per-unit files in `/etc/radar-runner/`: `power.toml` (arm it after the
    stage 1 tests), `local.yaml` (calibration and thresholds), `secrets.yaml`
    (`root:englacial`, mode `0640`).
-9. Settings stored in hardware: bootloader EEPROM (compare with `check.py`);
-   the GPS receiver and OLA settings are applied at every boot from stage 2.
+9. Settings stored in hardware: bootloader EEPROM (compare with `check.py`).
+   The OLA's ADC settings are applied by the telemetry service at every start.
+   The GPS receiver's settings are in its flash (section 11); the telemetry
+   service checks the one that matters and sets it in RAM if needed.
 
 Not yet stored for a rebuild without internet: the Ubuntu image, the `.deb`
 files of the packages above, the UHD source and FPGA images.

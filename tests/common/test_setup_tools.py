@@ -1,5 +1,6 @@
 """The lock-file helpers (setup/uvlock.py), the drop-in files and a smoke test of setup/check.py."""
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -98,7 +99,11 @@ def installed_files():
 
 def test_only_drop_in_files_owned_by_this_project():
     allowed = ("etc/tmpfiles.d/", "etc/systemd/logind.conf.d/", "etc/systemd/journald.conf.d/",
-               "etc/systemd/system.conf.d/", "etc/apt/apt.conf.d/", "etc/needrestart/conf.d/")
+               "etc/systemd/system.conf.d/", "etc/apt/apt.conf.d/", "etc/needrestart/conf.d/",
+               # stage 2: drop-ins for gpsd, chrony and fake-hwclock only
+               "etc/systemd/system/gpsd.service.d/", "etc/systemd/system/gpsdctl@.service.d/",
+               "etc/systemd/system/chrony.service.d/",
+               "etc/systemd/system/fake-hwclock-save.timer.d/", "etc/chrony/conf.d/")
     for rel in installed_files():
         assert rel.startswith(allowed), rel
         assert "radar-runner" in rel or rel == "etc/systemd/logind.conf.d/ups.conf", rel
@@ -119,6 +124,23 @@ def test_drop_in_file_contents():
         "[Manager]", "RuntimeWatchdogSec=30s", "RebootWatchdogSec=10min"]
     assert 'APT::Periodic::Enable "0";' in settings("etc/apt/apt.conf.d/99zz-radar-runner-no-auto-updates")
     assert settings("etc/needrestart/conf.d/radar-runner.conf") == ["$nrconf{restart} = 'l';"]
+    # Stage 2. gpsd: reads without clients, the receiver by its stable name, restarted if it dies.
+    device = r"dev-serial-by\x2did-usb\x2du\x2dblox_AG_\x2d_www.u\x2dblox.com_u\x2dblox_GNSS_receiver\x2dif00.device"
+    # Ubuntu's hotplug path is off: with both, the receiver was opened twice at boot and gpsd delivered nothing.
+    assert settings("etc/systemd/system/gpsdctl@.service.d/radar-runner.conf") == [
+        "[Service]", "ExecStart=", "ExecStart=/bin/true", "ExecStop=", "ExecStop=/bin/true"]
+    assert settings("etc/systemd/system/gpsd.service.d/radar-runner.conf") == [
+        "[Unit]", "BindsTo=" + device, "After=" + device, "[Service]", "ExecStart=",
+        "ExecStart=/usr/sbin/gpsd -n /dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver-if00",
+        "Restart=on-failure", "RestartSec=5"]
+    # chrony: GPS from gpsd's shared memory; nothing else (the NTP pools stay Ubuntu's). No "makestep" here:
+    # Ubuntu's chrony.conf would override it, so it is set by the service drop-in, and a failure there is ignored.
+    assert settings("etc/chrony/conf.d/radar-runner.conf") == ["refclock SHM 0 refid GPS poll 3 offset 0.070 delay 0.2"]
+    assert settings("etc/systemd/system/chrony.service.d/radar-runner.conf") == [
+        "[Service]", "ExecStartPost=-/usr/bin/chronyc makestep 1 -1"]
+    # fake-hwclock: every minute by monotonic timers (the hourly calendar timer is cleared).
+    assert settings("etc/systemd/system/fake-hwclock-save.timer.d/radar-runner.conf") == [
+        "[Timer]", "OnCalendar=", "OnBootSec=1min", "OnUnitActiveSec=1min", "AccuracySec=5s"]
     # Not a multiple of 16 s: the hardware counter of this watchdog wraps there.
     assert int(re.search(r"RuntimeWatchdogSec=(\d+)s", open(os.path.join(
         FILES, "etc/systemd/system.conf.d/radar-runner-watchdog.conf")).read()).group(1)) % 16 != 0
@@ -183,11 +205,14 @@ def test_check_script_runs_and_reports_every_item():
     lines = [line for line in r.stdout.split("\n") if line and not line.startswith("==")]
     assert all(re.match(r"(PASS|FAIL|SKIP|INFO)  \S|check: \d+ pass", line) for line in lines), lines
     assert "the check itself failed" not in r.stdout
-    assert "chrony:" not in r.stdout and "rclone" not in r.stdout       # deferred to stages 2 and 9
+    assert "rclone" not in r.stdout                                     # deferred to stage 9
     summary = re.search(r"check: (\d+) pass, (\d+) FAIL, (\d+) skip, (\d+) info", r.stdout)
     assert summary and (int(summary.group(2)) > 0) == (r.returncode == 1)
     for rel in installed_files():
         assert f"  /{rel}" in r.stdout
+    # Without --receiver nothing is asked of the GPS receiver.
+    assert "SKIP  GPS receiver settings (asked of the receiver): not asked" in r.stdout
+    assert "NMEA output on UART1" not in r.stdout
     for name in ("OS release", "kernel", "bootloader", "Tailscale", "SSH enabled", "NVMe mounted",
                  "orca mamba environment", "patched UHD", "ORCA checkout", "repository version",
                  "virtual environment matches uv.lock", "wheelhouse complete", "radar-power.service",
@@ -198,5 +223,49 @@ def test_check_script_runs_and_reports_every_item():
                  "journald Storage", "systemd RebootWatchdogSec on disk", "watchdog settings in use",
                  "time daemon", "identity: machine-id", "identity: SSH host keys", "identity: Tailscale node",
                  "shutdown inhibitor delay", "power key ignored", "/run/radar-runner/user",
-                 "/var/lib/radar-runner/user", "held packages"):
+                 "/var/lib/radar-runner/user", "held packages",
+                 # stage 2
+                 "gpsd.service enabled and running", "gpsd keeps reading without clients", "gpsd hotplug",
+                 "GPS receiver on USB", "GPS receiver known to gpsd, once", "radar-telemetry.service unit file",
+                 "sensor log directory on the data drive", "telemetry status file", "chrony package",
+                 "fake-hwclock package", "systemd-timesyncd removed", "chrony.service",
+                 "chrony steps the clock at any time", "fake-hwclock units", "fake-hwclock saves"):
         assert name in r.stdout, name
+
+
+UBXTOOL_STAND_IN = """#!/usr/bin/python3
+import json, sys
+with open({log!r}, "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\\n")
+if "-g" in sys.argv:
+    print("UBX-CFG-VALGET:\\n version 1 layer 0 position 0\\n  layers (ram)\\n    item CFG-UART1OUTPROT-NMEA/0x10740002 val {value}")
+else:
+    print("UBX-MON-COMMS:\\nversion 0 nPorts 3 txErrors x{errors} reserved1 0\\n  Port: 0x300 (USB)\\n"
+          "   txPending 0 txBytes 26542809 txUsage 5 txPeakUsage 88")
+"""
+
+
+@pytest.mark.parametrize("value, errors, expected", [("0", "10", "PASS"), ("1", "90", "FAIL")])
+def test_check_script_asks_the_receiver_only_when_told_and_only_reads(tmp_path, value, errors, expected):
+    """With --receiver: two polls through (a stand-in for) ubxtool, and never an option that sets anything."""
+    log = tmp_path / "ubxtool.log"
+    tool = tmp_path / "ubxtool"
+    tool.write_text(UBXTOOL_STAND_IN.format(log=str(log), value=value, errors=errors))
+    tool.chmod(0o755)
+    env = dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}")
+    r = subprocess.run(["/usr/bin/python3", "-B", os.path.join(REPO, "setup", "check.py"), "--receiver"],
+                       capture_output=True, text=True, timeout=300, cwd="/", env=env)
+    assert r.returncode in (0, 1) and r.stderr == ""
+    assert f"{expected}  GPS receiver: NMEA output on UART1 off: CFG-UART1OUTPROT-NMEA = {value} in RAM" in r.stdout
+    assert f"{expected}  GPS receiver: no transmit buffer errors: txErrors 0x{errors}, USB buffer peak 88 %" in r.stdout
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert calls == [["-P", "27.50", "-w", "1.5", "-g", "CFG-UART1OUTPROT-NMEA,0"],
+                     ["-P", "27.50", "-w", "1.5", "-p", "MON-COMMS"]]
+    for call in calls:
+        assert not {"-z", "-x", "-e", "-d", "-c", "-S", "-s"} & set(call)
+
+
+def test_check_script_rejects_unknown_options():
+    r = subprocess.run(["/usr/bin/python3", "-B", os.path.join(REPO, "setup", "check.py"), "--fix"],
+                       capture_output=True, text=True, timeout=60, cwd="/")
+    assert r.returncode != 0 and "usage: setup/check.py [--receiver]" in r.stderr and r.stdout == ""

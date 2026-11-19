@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """Stand-in for the system commands that setup/setup.sh calls, for test_setup_script.py.
 
-Linked under the names systemctl, snap, tailscale, ... in a directory that the
+Linked under the names systemctl, snap, tailscale, apt-get, ... in a directory that the
 test puts first in PATH. Its picture of the system is a JSON file ($FAKE_STATE):
 queries are answered from it, and commands that would change the real system
 change it instead and are recorded in its "log".
@@ -58,12 +58,91 @@ if tool == "systemctl":
         if os.path.exists(destdir + "/etc/systemd/system.conf.d/radar-runner-watchdog.conf"):
             state["watchdog"] = "30s"
         done(0, record=True)
+    if verb == "add-wants":
+        link = destdir + "/etc/systemd/system/" + args[1] + ".wants/" + args[2]
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        if not os.path.islink(link):
+            os.symlink("/etc/systemd/system/" + args[2], link)
+        done(0, record=True)
     if verb == "enable":
         state["units"].append(unit)
         state["enabled"].append(unit)
+        if "--now" in args:
+            state["active"].append(unit)
+        done(0, record=True)
+    # Only gpsd, chrony and the clock-save timer may be restarted or started; never a service of this project.
+    if verb == "restart" and unit in ("gpsd.service", "chrony.service", "fake-hwclock-save.timer"):
+        if unit == "gpsd.service":
+            state["active"].append(unit)
+            drop_in = destdir + "/etc/systemd/system/gpsd.service.d/radar-runner.conf"
+            if os.path.exists(drop_in):
+                with open(drop_in) as f:
+                    state["gpsd_args"] = [line.split("=", 1)[1].strip() for line in f if line.startswith("ExecStart=/")][-1]
+        done(0, record=True)
+    if verb == "start" and unit in ("chrony.service", "systemd-timesyncd.service", "fake-hwclock-save.timer"):
+        if unit == "chrony.service" and state.get("chrony_wont_start"):
+            done(1, record=True)
+        if unit == "systemd-timesyncd.service" and "systemd-timesyncd" not in state["installed"]:
+            done(5, record=True)
         state["active"].append(unit)
         done(0, record=True)
-    done(1, record=True)        # anything else (restart, stop, ...) is not expected
+    done(1, record=True)        # anything else (stop, restart of another unit, ...) is not expected
+
+if tool == "ps":
+    done(0 if "gpsd.service" in state["active"] else 1, state["gpsd_args"] if "gpsd.service" in state["active"] else None)
+
+if tool == "apt-get":
+    # The plan and the result of installing chrony and fake-hwclock in place of systemd-timesyncd.
+    env_ok = os.environ.get("DEBIAN_FRONTEND") == "noninteractive" and os.environ.get("NEEDRESTART_SUSPEND") == "1"
+    packages = [a for a in args if not a.startswith("-") and a != "install"]
+    new = [p for p in packages if p not in state["installed"]]
+    if "-s" in args:
+        if state.get("dpkg_interrupted"):
+            print("E: dpkg was interrupted, you must manually run 'dpkg --configure -a' to correct the problem.",
+                  file=sys.stderr)
+            done(100)
+        if state.get("apt_broken"):
+            print("E: Unable to locate package chrony", file=sys.stderr)
+            done(100)
+        lines = ["NOTE: This is only a simulation!", "Reading package lists...", "The following NEW packages will be installed:"]
+        if "chrony" in new and "systemd-timesyncd" in state["installed"]:
+            lines.append("Remv systemd-timesyncd [255.4-1ubuntu8.18]")
+        if "chrony" in new:
+            lines.append("Inst tzdata-legacy (2026e-0ubuntu0.24.04.1 Ubuntu:24.04/noble-security [all])")
+        lines += [f"Inst {p} (1.0 Ubuntu:24.04/noble [arm64])" for p in new]
+        lines += state.get("apt_extra_plan", [])
+        lines += [f"Conf {p} (1.0 Ubuntu:24.04/noble [arm64])" for p in new]
+        done(0, "\n".join(lines))
+    if not env_ok:
+        print("apt-get: would have been interactive or let needrestart act", file=sys.stderr)
+        done(98, record=True)
+    if "--download-only" in args:
+        done(100 if state.get("offline") else 0, None if state.get("offline") else "Download complete and in download only mode",
+             record=True)
+    if packages == ["systemd-timesyncd"]:                       # the way back
+        if state.get("timesyncd_gone_for_good"):
+            done(100, record=True)
+        state["installed"] = [p for p in state["installed"] if p != "chrony"] + ["systemd-timesyncd"]
+        state["active"] = [u for u in state["active"] if u != "chrony.service"] + ["systemd-timesyncd.service"]
+        done(0, record=True)
+    if "chrony" in new:                                         # dpkg removes the old time daemon first
+        state["installed"] = [p for p in state["installed"] if p != "systemd-timesyncd"]
+        state["active"] = [u for u in state["active"] if u != "systemd-timesyncd.service"]
+    if state.get("apt_install_fails"):
+        print("dpkg: error processing package chrony (--configure)", file=sys.stderr)
+        done(100, record=True)
+    state["installed"] += new
+    if "chrony" in new:
+        state["units"].append("chrony.service")
+        state["enabled"].append("chrony.service")
+        if not state.get("chrony_wont_start"):
+            state["active"].append("chrony.service")
+    if "fake-hwclock" in new:
+        for unit in ("fake-hwclock-load.service", "fake-hwclock-save.service", "fake-hwclock-save.timer"):
+            state["units"].append(unit)
+            state["enabled"].append(unit)
+        state["active"].append("fake-hwclock-save.timer")
+    done(0, "Setting up chrony ...", record=True)
 
 if tool == "busctl":
     done(0, 's "ignore"' if args[-1] == "HandlePowerKey" else f"t {state['inhibit_usec']}")

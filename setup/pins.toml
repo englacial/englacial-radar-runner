@@ -13,4 +13,6 @@ bootloader_config = ""        # "rpi-eeprom-config" output on one line, e.g. "[a
 orca_commit = ""              # git commit of ~/orca (full hash)
 uhd_commit = ""               # "commit" in ~/uhd-patched/ORCA_UHD_BUILD.yaml
 gpsd_version = ""             # package version, e.g. "3.25-3ubuntu3.2"
+chrony_version = ""           # package version, e.g. "4.5-1ubuntu4"
+fake_hwclock_version = ""     # package version, e.g. "0.13"
 repo_tag = ""                 # release tag of this repository that should be checked out

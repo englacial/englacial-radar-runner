@@ -1,0 +1,47 @@
+# Radar telemetry service: reads the OLA (amplifier sensors), the Pi's sensors,
+# the UPS readings and the GPS position; logs them and publishes the latest
+# values in /run/radar-runner/user/telemetry.json.
+# Documentation, and how to stop it for bench work: radar_runner/telemetry/README.md
+
+[Unit]
+Description=Radar telemetry service (sensor logs and latest readings)
+Documentation=file:///home/englacial/englacial-radar-runner/radar_runner/telemetry/README.md
+# Started once the local file systems are mounted (the default dependencies
+# order it after sysinit.target, which comes after local-fs.target). It needs
+# nothing else: not the network, not gpsd, not the power service, not the data
+# drive. Each of those may be missing or come later; the service reports it
+# and carries on. The drive is mounted "nofail", so local-fs.target does not
+# wait for it; "After=mnt-nvme.mount" only orders this service behind the
+# mount attempt (at most its 10 s device timeout when the drive is absent), so
+# that a normal boot starts on the drive and not on the fallback directory.
+After=local-fs.target mnt-nvme.mount
+# No start-rate limit: systemd never gives up restarting it.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=englacial
+Group=englacial
+WorkingDirectory=/home/englacial/englacial-radar-runner
+# -B: no __pycache__ in the checkout. -u: unbuffered output.
+ExecStart=/home/englacial/englacial-radar-runner/.venv/bin/python -B -u -m radar_runner.telemetry
+Restart=always
+# Every start opens the OLA's serial port, which resets the OLA. A service that
+# keeps dying must not do that every 2 s: the pause between restarts grows from
+# 2 s to 5 min over six restarts (the count starts again at each boot, at a
+# manual start, and with "systemctl reset-failed radar-telemetry").
+RestartSec=2
+RestartSteps=6
+RestartMaxDelaySec=5min
+# The loop pings four times a second. No ping for 30 s: kill it and restart.
+WatchdogSec=30
+WatchdogSignal=SIGKILL
+TimeoutStartSec=30
+# At a stop the logs are written out and synced; a drive that hangs is given up on after 5 s.
+TimeoutStopSec=10
+# Sensor logging must not take processor time from the radar.
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

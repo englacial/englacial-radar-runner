@@ -66,11 +66,11 @@ Sequence on power loss:
 
 1. On the first sign of loss, stop the radar at once. This is cheap and reversible.
 2. If power is not back within 5-10 s, commit to shutdown.
-3. Drive the SDR GPIO to the amplifier-shutdown state and verify it.
+3. If the amplifier-enable pin is not known to be safe (see "When to run the GPIO reset tool"), drive the SDR GPIO to the amplifier-shutdown state and verify it.
 4. If the 28 V rail is present, also verify that the amplifier current is consistent with shutdown, and retry step 3 if it is not. This guards against the amplifier being left enabled when power returns while the Pi is shutting down.
 5. Flush data. Power off if main power is still absent; reboot instead if it has returned.
 
-* Step 3 is unconditional. During a power loss the 28 V rail is gone, so the amplifier current reads near zero whether or not the amplifier is enabled, and the current check in step 4 cannot tell the difference.
+* During a power loss the 28 V rail is gone, so the amplifier current reads near zero whether or not the amplifier is enabled, and the current check in step 4 cannot tell the difference. Step 3 therefore goes by the recorded pin state, not by the current.
 * Stopping the radar needs only one loss signal. Shutting down needs both signals to agree, or one signal with the other unreadable or faulty. The ride-through time counts only while that agreement holds without interruption. Two signals that contradict each other do not cause a shutdown; they cause a warning. The one exception is the low-voltage rule below.
 * A signal that reports a loss for longer than the capacitor could carry the Pi (180 s) is marked faulty and ignored until it reads normally again.
 * A low capacitor voltage (below 4.5 V) while the signals agree commits to shutdown immediately, regardless of the ride-through time. A capacitor that is discharging and below 4.5 V for 2 s commits by itself, whatever GPIO 26 says, because that cannot happen with main power present.
@@ -98,7 +98,9 @@ The OLA stays as the path to the amplifier sensors. If it proves unreliable in t
 
 * Storage structure: append-only text files, one line per sample, a new file per boot and per day. A file cut off mid-write stays readable up to the last full line. Sensor logs go to the NVMe drive, and to the SD card if the NVMe is missing.
 * GPS: gpsd owns the receiver. The motion trigger, the system clock and the raw logger are gpsd clients. This repository logs the raw data for PPK while the radar runs; ORCA does not open the GPS.
-* The receiver setting that prevents the transmit-buffer overflow is stored in RAM only and is lost at every power cycle. Either save it to the receiver's flash or apply it at every boot.
+* The receiver setting that prevents the transmit-buffer overflow (UART1 NMEA output off) is in the receiver's flash and survives power cycles (found 2026-11-19; the earlier note that it was in RAM only no longer holds). The telemetry service does not send anything to the receiver; `setup/check.py` reads the setting and the transmit-buffer error flags when run by hand.
+* The GPS stays connected to the OLA's Qwiic bus (user decision, 2026-11-19), with the power wire removed so that neither device can power the other. The OLA sets the receiver to 10 Hz, and the evidence suggests it saves the receiver's configuration to the receiver's flash each time the OLA starts (not proven). Each open of the OLA's serial port resets the OLA, so the telemetry service opens it once per boot and backs off for longer and longer when it has to retry.
+* At 10 Hz gpsd's messages already use most of the receiver's USB output capacity (the transmit buffer has peaked at 88 %). Raw logging for PPK in stage 6 adds to that, so the rate or the message set needs a decision then.
 * Time: the Pi's clock has no battery, so the system clock is set from GPS when there is no internet. File and directory names include a boot counter and a sequence number so that they stay unique and ordered if the clock is wrong at boot. The OLA's battery-backed clock is logged with every OLA reading as a cross-check; it is not used to set the system clock.
 
 PPS will be wired to the SDR, not the Pi. The system clock therefore comes from GPS messages over USB (tens of milliseconds), and precise radar timing comes from the SDR (see "Interface to ORCA").
@@ -109,7 +111,25 @@ PPS will be wired to the SDR, not the Pi. The system clock therefore comes from 
 
 * The manager generates the chirp, builds and runs the `radar` binary itself. `run.py` stays as it is for other users.
 * The build runs at each start. A failed build is a failed start.
-* The tool that resets the SDR GPIO to the amplifier-shutdown state lives in this repository (ported from `gpio_hold` on the bench). The manager runs it and verifies the result after any radar exit.
+* The tool that resets the SDR GPIO to the amplifier-shutdown state lives in this repository (`tools/sdr_gpio_safe/`, ported from `gpio_hold` on the bench).
+
+### When to run the GPIO reset tool
+
+Every UHD initialisation on this SDR drives the front-panel pins low as outputs, which enables the amplifier for about half a second with a short RF burst, until the program writes the pin. This is true of ORCA, of every UHD tool and of the reset tool itself. A reset run that fails or is killed after initialisation leaves a previously safe amplifier enabled. So the tool runs only when the pin is not known to be safe.
+
+The pin is known to be safe when the last thing that initialised the SDR was one of:
+
+* ORCA with the amplifier pin configured, exiting cleanly
+* a successful run of the reset tool
+* nothing at all since the SDR was powered (its pins float and the control board holds shutdown)
+
+The tool runs in every other case: ORCA killed or crashed, another UHD program used, a reset run that did not succeed, unknown history, or amplifier current above 0.5 A with no radar process. Where the 28 V rail is present, the current reading decides. The manager keeps a persistent "not known to be safe" flag for the power-loss sequence to consult.
+
+"OK" from the tool means the SDR is commanding the pin high; only the amplifier current confirms the amplifier itself.
+
+Measured on 2026-11-19 with the scope on GPIO_0, the 28 V on and the bench guard armed (first run of the tool, first contact after power-up): the pin read high while floating; there were no edges during the firmware load (5.9 s) or the FPGA load (8.2 s); the pin then went low for 480 ms, with the 12 V feed up by about 5.5 A (about 94 W), and went high at the tool's write and stayed high. The tool took 16.7 s in total and reported OK. Time limits for callers must allow for a first contact of that length. A second run with the firmware and FPGA already loaded took 3.5 s in total (1.5 s to initialise, plus the 1.5 s recheck). In that run a triggered capture showed one falling edge with no glitch in the 25 ms before it, the 12 V feed up by about 5.2 A within 1 ms, and no RF burst within the first 95 ms of the low period above the capture's sensitivity (about +17 dBm at the amplifier output). The bursts in the bring-up notes were seen later in the low period and at lower levels with the VVA at 5 V, so this capture neither confirms nor rules them out.
+
+TODO (deferred, user is interested): change the patched UHD so that it does not force the B2xx front-panel pins to outputs at initialisation. This should remove the start-up enable and its RF burst for ORCA, every UHD tool and the reset tool. A draft patch with its risks and test list is in `docs/uhd-proposals/`. It needs a UHD rebuild, a scope on GPIO_0 at start-up and a HIL re-run.
 
 ORCA changes. Each needs the user's approval before work starts.
 
@@ -173,7 +193,7 @@ There are three status LEDs and a momentary push-button switch on the radar box.
 
 There is also a momentary push-button switch read by the GPIO 4 input that is one of the on/off triggers, as specified above. Inputs from it should be debounced aggressively in software.
 
-PWM through the LED's built-in regulator has not been tested. If it does not work, breathing is replaced by a slow blink.
+PWM through the LED's built-in regulator works: on 2026-11-19 the user confirmed that breathing looks smooth, that the patterns are distinguishable and that button presses register. A slow blink remains available as a configured fallback.
 
 State table. "Ready, waiting for the button" and "ready, will start on motion" look the same for now.
 
@@ -419,6 +439,8 @@ Done when:
 * A hard power cut leaves every log readable up to its last full line
 * The clock sets itself from GPS with the network unplugged
 * The processor load of logging is measured and small
+
+Found 2026-11-19 at the first boot after installing stage 2, now fixed: gpsd delivers no data from the receiver after a boot. gpsd's log at boot shows "device open of /dev/ttyACM0 failed: Device or resource busy" and "device activation failed, freeing device", which fits the receiver being opened twice: once from gpsd's command line (our drop-in) and once by Ubuntu's udev hotplug path. Before the reboot, with gpsd only restarted, it worked. At the same boot the OLA's header had no GPS columns, so the OLA did not see the receiver on its Qwiic bus either; whether that has the same cause is not known. Candidate fix: take the device off gpsd's command line (keep `-n`), leave the hotplug path as the only way the device is added, and order `gpsdctl@.service` after `gpsd.socket`. Restarting gpsd by hand cleared the open failure but not the missing fixes: the receiver's `CFG-UART1OUTPROT-NMEA` then read 1 in RAM (read-only check, 04:16 UTC), gpsd was getting only a partial message set (fix mode 0, time not advancing), and the receiver did not answer a status poll. That is the transmit-buffer overflow again. So the setting is not durably stored after all: it survived the short power cycles earlier in the day and was lost when the system was off for a few minutes. The earlier finding that it was in the receiver's flash, and the decision to remove the service's receiver check on that basis, were wrong. Needed: the setting written to the receiver's flash deliberately (user approval), and a once-per-boot check that re-applies it if it is wrong. Also: the telemetry service's read of the `get_throttled` sysfs file makes the kernel print a one-time "deprecated, use hwmon sysfs instead" warning with a stack trace at every boot; read the hwmon undervoltage alarm instead. **Resolution (2026-11-19):** (1) The double open is fixed: Ubuntu's hotplug path is switched off and gpsd is tied to the receiver's device unit, so systemd starts gpsd when the receiver appears; a reboot confirmed one open and working fixes. (2) The setting was not lost from flash. Its value in the receiver's RAM goes back to 1 at every start of gpsd (four of four observed; an OLA reset alone does not do it), so gpsd's own set-up of the receiver is the likely cause. `radar-gps-receiver.service` now turns it off in RAM 20 s after every gpsd start, and the telemetry service does the same a little after every OLA start as a second layer; the first was confirmed by restarting gpsd (found 1, set 0, full 10 Hz fixes). Removing the earlier receiver check was a mistake and is reversed in this form. Still open: the `get_throttled` kernel warning.
 
 ## Stage 3: Safety watcher
 
