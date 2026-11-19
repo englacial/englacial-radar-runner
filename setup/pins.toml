@@ -1,0 +1,16 @@
+# Versions that setup/check.py compares this system against.
+#
+# "" means "not pinned yet": the check then prints what it finds as INFO and
+# does not fail. Fill a value in once it is decided, so that a clone, a
+# rebuilt card or a field update that differs shows up as a FAIL line.
+
+os_version = "24.04"          # VERSION_ID in /etc/os-release
+uv_version = "0.13.7"         # ~/.local/bin/uv (see setup/SYSTEM_CHANGES.md for the checksum)
+
+kernel = ""                   # uname -r, e.g. "6.8.0-1068-raspi"
+bootloader = ""               # first line of "vcgencmd bootloader_version", e.g. "2026/01/21 13:38:47"
+bootloader_config = ""        # "rpi-eeprom-config" output on one line, e.g. "[all] BOOT_UART=1 BOOT_ORDER=0xf461 NET_INSTALL_AT_POWER_ON=1"
+orca_commit = ""              # git commit of ~/orca (full hash)
+uhd_commit = ""               # "commit" in ~/uhd-patched/ORCA_UHD_BUILD.yaml
+gpsd_version = ""             # package version, e.g. "3.25-3ubuntu3.2"
+repo_tag = ""                 # release tag of this repository that should be checked out

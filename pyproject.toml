@@ -1,0 +1,39 @@
+# Python environment of the radar manager (everything except the power service,
+# which runs on /usr/bin/python3 with the standard library only).
+#
+# Build or rebuild the environment (works without internet): setup/build_venv.sh
+# Change a dependency (needs internet):                       see README.md
+
+[project]
+name = "radar_runner"
+version = "0.1.0"
+description = "Radar manager for the truck-towed radio echo sounder"
+requires-python = "==3.12.*"      # the system interpreter of Ubuntu 24.04
+dependencies = [
+    "pyserial>=3.5",
+    "PyYAML>=6.0",
+    "gpiozero>=2.0",
+    "lgpio>=0.2.2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+# The code runs from the checkout (WorkingDirectory in the systemd units), so
+# nothing is built or installed for this repository itself: the environment
+# holds only the dependencies, and a rebuild needs no build tools.
+package = false
+# Only /usr/bin/python3: never a uv-downloaded or conda interpreter.
+python-preference = "only-system"
+python-downloads = "never"
+# Lock for this machine type only, so that the stored wheels are the full set.
+environments = ["sys_platform == 'linux' and platform_machine == 'aarch64'"]
+# Ignore anything published to PyPI after this time when locking. Move it
+# forward deliberately when a dependency is updated.
+exclude-newer = "2026-11-11T00:00:00Z"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q -p no:cacheprovider"

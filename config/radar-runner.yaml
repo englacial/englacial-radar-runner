@@ -1,0 +1,28 @@
+# Radar manager configuration (all services except the power service, which
+# has its own file: config/power.toml).
+#
+# This file is layer 2 of 4. Each layer overrides the one before:
+#   1. the defaults built into radar_runner/common/config.py
+#   2. this file (in git; the same on every unit)
+#   3. /etc/radar-runner/local.yaml     this unit only: calibration, thresholds
+#   4. /etc/radar-runner/secrets.yaml   tokens and credentials (mode 0640, root:englacial)
+# Layers 3 and 4 are optional, are not in git, and may set any subset of the
+# settings below, in the same layout.
+#
+# Every value below is the built-in default. An unknown setting or a value of
+# the wrong type is ignored with a warning in the service's log and status
+# file; it never stops a service. To see the merged result and any warnings:
+#   cd ~/englacial-radar-runner && .venv/bin/python -m radar_runner.common.config
+
+paths:
+  # The first two belong to user englacial. Their parent directories belong to
+  # root and hold only the power service's files.
+  run_dir: /run/radar-runner/user                   # status files: <run_dir>/<service>.json
+  state_dir: /var/lib/radar-runner/user             # small state that must survive a reboot
+  power_status_file: /run/radar-runner/power.json   # written by the power service; read only
+
+status:
+  stale_after_s: 5.0    # a status file older than this is treated as "no information"
+
+logging:
+  level: info           # debug, info, warning or error

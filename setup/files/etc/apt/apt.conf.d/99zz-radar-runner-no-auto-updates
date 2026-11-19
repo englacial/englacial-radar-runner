@@ -1,0 +1,11 @@
+// Installed by englacial-radar-runner (setup/setup.sh; see
+// setup/SYSTEM_CHANGES.md). Delete this file to revert.
+//
+// No automatic package list updates, downloads or upgrades. The name sorts
+// last in this directory, so these values override 10periodic and
+// 20auto-upgrades. "apt update" and "apt install" by hand still work.
+APT::Periodic::Enable "0";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::AutocleanInterval "0";
+APT::Periodic::Unattended-Upgrade "0";

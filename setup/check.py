@@ -1,0 +1,692 @@
+#!/usr/bin/python3 -B
+"""Check this system against the setup that the radar manager expects.
+
+    setup/check.py
+
+Prints one line per item:
+
+    PASS  as expected
+    FAIL  not as expected (the exit status is then 1)
+    SKIP  could not be checked here, with the reason (for example: needs root)
+    INFO  observed value of something that has no expected value yet (setup/pins.toml)
+
+Run it on the original Pi, on a clone, on a rebuilt system and after every
+field update: a difference between two systems is a line that differs. It
+changes nothing, needs no root for almost everything, and uses the standard
+library only (/usr/bin/python3).
+
+What each setup item is and how to apply or revert it: setup/SYSTEM_CHANGES.md.
+"""
+import grp
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import tomllib
+
+sys.dont_write_bytecode = True
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path[:0] = [os.path.join(REPO, "setup"), REPO]
+import uvlock  # noqa: E402
+from radar_runner.common import status as status_files  # noqa: E402  (standard library only)
+
+FILES = os.path.join(REPO, "setup", "files")
+OWNER = pwd.getpwuid(os.stat(REPO).st_uid)       # the user that owns the checkout
+HOME = OWNER.pw_dir
+IS_ROOT = os.geteuid() == 0
+PASS, FAIL, SKIP, INFO = "PASS", "FAIL", "SKIP", "INFO"
+
+results = []
+with open(os.path.join(REPO, "setup", "pins.toml"), "rb") as _f:
+    PINS = tomllib.load(_f)
+
+
+class Skip(Exception):
+    pass
+
+
+def report(status, name, observed=""):
+    results.append(status)
+    text = " ".join(str(observed).split())
+    print(f"{status}  {name}" + (f": {text}" if text else ""), flush=True)
+
+
+def section(title):
+    print(f"\n== {title}", flush=True)
+
+
+def check(name, ok, observed, expected=None):
+    """PASS or FAIL with the observed value; a FAIL also shows what was expected."""
+    if ok:
+        report(PASS, name, observed)
+    else:
+        report(FAIL, name, f"{observed}" + (f" (expected: {expected})" if expected else ""))
+
+
+def pinned(name, observed, key):
+    """Compare with setup/pins.toml; no pin means INFO."""
+    want = PINS.get(key, "")
+    if not observed:
+        report(FAIL, name, "could not be determined")
+    elif not want:
+        report(INFO, name, f"{observed} (no pin: {key} in setup/pins.toml)")
+    else:
+        check(name, observed == want, observed, f"{want}, from setup/pins.toml")
+
+
+def run(*cmd, timeout=30):
+    """Return (exit status, stdout, stderr). The status is None if the command cannot be run."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=REPO,
+                           stdin=subprocess.DEVNULL, env=dict(os.environ, LC_ALL="C"))
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except FileNotFoundError:
+        return None, "", f"{cmd[0]}: command not found"
+    except subprocess.TimeoutExpired:
+        return None, "", f"{cmd[0]}: no answer within {timeout} s"
+    except OSError as e:
+        return None, "", f"{cmd[0]}: {e}"
+
+
+def out(*cmd, **kw):
+    return run(*cmd, **kw)[1]
+
+
+def read(path):
+    try:
+        with open(path, errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def item(name):
+    """Decorator: run a check now; a Skip becomes SKIP, any other exception a FAIL."""
+    def wrap(fn):
+        try:
+            fn(name)
+        except Skip as e:
+            report(SKIP, name, str(e))
+        except Exception as e:      # a broken check must not hide the others
+            report(FAIL, name, f"the check itself failed: {type(e).__name__}: {e}")
+        return fn
+    return wrap
+
+
+def unit_state(unit):
+    return out("systemctl", "is-enabled", unit) or "not-found", out("systemctl", "is-active", unit) or "unknown"
+
+
+def package_version(package):
+    rc, text, _ = run("dpkg-query", "-W", "-f=${db:Status-Status} ${Version}", package)
+    return text.split(" ", 1)[1] if rc == 0 and text.startswith("installed ") else ""
+
+
+def git(path, *args):
+    return out("git", "-c", f"safe.directory={path}", "-C", path, *args)
+
+
+def logind(prop):
+    rc, text, err = run("busctl", "get-property", "org.freedesktop.login1", "/org/freedesktop/login1",
+                        "org.freedesktop.login1.Manager", prop)
+    if rc != 0:
+        raise Skip(f"cannot ask logind: {err or text}")
+    return text.split(" ", 1)[1]
+
+
+def merged_settings(config, section):
+    """Settings of one section as systemd will read them: the main file and all drop-ins, in order."""
+    rc, text, err = run("systemd-analyze", "cat-config", config)
+    if rc != 0:
+        raise Skip(f"systemd-analyze cat-config {config}: {err or 'failed'}")
+    values, current = {}, None
+    for line in text.split("\n"):
+        line = line.strip()
+        if line.startswith("["):
+            current = line
+        elif current == f"[{section}]" and "=" in line and not line.startswith(("#", ";")):
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    return values
+
+
+def file_settings(rel):
+    """Settings in one of this project's drop-in files (setup/files/<rel>)."""
+    text = read(os.path.join(FILES, rel)) or ""
+    return dict(line.strip().split("=", 1) for line in text.split("\n")
+                if "=" in line and not line.lstrip().startswith(("#", ";", "[")))
+
+
+# ============================================================ the system
+
+section("System")
+
+
+@item("OS release")
+def _(name):
+    m = re.search(r'^VERSION_ID="?([^"\n]+)', read("/etc/os-release") or "", re.M)
+    pinned(name, m.group(1) if m else "", "os_version")
+
+
+@item("kernel")
+def _(name):
+    pinned(name, os.uname().release, "kernel")
+
+
+@item("identity: hostname")
+def _(name):
+    # Identity must differ between two units. The same value on two systems means a card was copied.
+    report(INFO, name, os.uname().nodename)
+    report(INFO, "identity: machine-id", (read("/etc/machine-id") or "unreadable").strip())
+    keys = []
+    for pub in sorted(p for p in os.listdir("/etc/ssh") if p.startswith("ssh_host_") and p.endswith(".pub")):
+        fields = out("ssh-keygen", "-lf", os.path.join("/etc/ssh", pub)).split()
+        if len(fields) >= 2:
+            keys.append(f"{fields[-1].strip('()')} {fields[1]}")
+    report(INFO, "identity: SSH host keys", ", ".join(keys) or "none readable")
+
+
+@item("systemd state")
+def _(name):
+    state = out("systemctl", "is-system-running")
+    failed = out("systemctl", "list-units", "--failed", "--no-legend", "--plain").split("\n")
+    failed = ", ".join(line.split()[0] for line in failed if line.strip())
+    check(name, state == "running", state + (f"; failed units: {failed}" if failed else ""), "running")
+
+
+section("Boot and hardware prerequisites (not automated by setup.sh)")
+
+
+@item("bootloader version")
+def _(name):
+    rc, text, err = run("vcgencmd", "bootloader_version")
+    if rc != 0:
+        raise Skip(f"vcgencmd: {err or text or 'failed'}" + ("" if IS_ROOT else " (may need root or group video)"))
+    pinned(name, text.split("\n")[0].strip(), "bootloader")
+
+
+@item("bootloader config")
+def _(name):
+    rc, text, err = run("rpi-eeprom-config")
+    if rc != 0:
+        raise Skip(f"rpi-eeprom-config: {err or text or 'failed'}" + ("" if IS_ROOT else " (may need root)"))
+    pinned(name, " ".join(text.split()), "bootloader_config")
+
+
+@item("bootloader update pending")
+def _(name):
+    rc, text, err = run("rpi-eeprom-update")
+    if rc is None:
+        raise Skip(err)
+    first = text.split("\n")[0].strip()
+    check(name, "up to date" in first, first or err, "BOOTLOADER: up to date (else it is flashed at the next boot)")
+
+
+@item("I2C enabled in /boot/firmware/config.txt")
+def _(name):
+    text = read("/boot/firmware/config.txt")
+    if text is None:
+        raise Skip("cannot read /boot/firmware/config.txt")
+    found = re.findall(r"^\s*dtparam=i2c_arm=(\w+)", text, re.M)
+    check(name, bool(found) and found[-1] == "on", f"dtparam=i2c_arm={found[-1]}" if found else "no dtparam=i2c_arm line",
+          "dtparam=i2c_arm=on")
+    check("I2C bus 1 device", os.path.exists("/dev/i2c-1"), "/dev/i2c-1 " + ("exists" if os.path.exists("/dev/i2c-1") else "missing"))
+
+
+@item(f"user {OWNER.pw_name} in groups dialout, i2c")
+def _(name):
+    groups = {g.gr_name for g in grp.getgrall() if OWNER.pw_name in g.gr_mem}
+    groups.add(grp.getgrgid(OWNER.pw_gid).gr_name)
+    missing = {"dialout", "i2c"} - groups
+    check(name, not missing, "missing: " + ", ".join(sorted(missing)) if missing else "yes",
+          "serial ports, GPIO and I2C without root")
+    report(INFO, f"all groups of {OWNER.pw_name}", ", ".join(sorted(groups)))
+
+
+@item("realtime priority limit for the radar (limits.conf)")
+def _(name):
+    lines = [" ".join(line.split()) for line in (read("/etc/security/limits.conf") or "").split("\n")]
+    want = f"{OWNER.pw_name} - rtprio 99"
+    check(name, want in lines, want if want in lines else "no such line", f"'{want}' in /etc/security/limits.conf")
+
+
+@item("UHD udev rules")
+def _(name):
+    path = "/etc/udev/rules.d/uhd-usrp.rules"
+    check(name, os.path.isfile(path), path + (" exists" if os.path.isfile(path) else " missing"))
+
+
+section("Remote access (setup.sh changes nothing here except Tailscale's self-update)")
+
+
+@item("Tailscale")
+def _(name):
+    rc, text, err = run("tailscale", "status", "--json")
+    if rc is None:
+        report(FAIL, name, err)
+        return
+    if rc != 0:
+        raise Skip(f"tailscale status: {err or text}" + ("" if IS_ROOT else " (may need root)"))
+    data = json.loads(text)
+    me = data.get("Self") or {}
+    check(name, data.get("BackendState") == "Running", f"{data.get('BackendState')}, version {data.get('Version')}", "Running")
+    report(INFO, "identity: Tailscale node", f"{me.get('DNSName') or me.get('HostName')} ({me.get('ID')})")
+    expiry = me.get("KeyExpiry")
+    check("Tailscale key expiry disabled", not expiry, f"key expires {expiry}" if expiry else "no expiry")
+    enabled, active = unit_state("tailscaled.service")
+    check("tailscaled.service", (enabled, active) == ("enabled", "active"), f"{enabled}, {active}", "enabled, active")
+
+
+@item("SSH enabled")
+def _(name):
+    states = {u: unit_state(u) for u in ("ssh.socket", "ssh.service")}
+    text = ", ".join(f"{u} {e}/{a}" for u, (e, a) in states.items())
+    check(name, any(e == "enabled" for e, _ in states.values()), text, "ssh.socket or ssh.service enabled")
+    listening = [line.split()[3] for line in out("ss", "-ltnH").split("\n") if line.split()[3:4]]
+    port22 = [a for a in listening if a.endswith(":22")]
+    check("SSH listening on port 22", bool(port22), ", ".join(port22) or "nothing listens on port 22")
+
+
+section("Storage")
+
+
+@item("NVMe mounted at /mnt/nvme")
+def _(name):
+    rc, text, _ = run("findmnt", "-n", "-o", "SOURCE,FSTYPE,LABEL,UUID", "/mnt/nvme")
+    check(name, rc == 0 and bool(text), text or "not mounted")
+    if rc == 0 and text:
+        report(INFO, "NVMe free space", out("df", "-h", "--output=avail,pcent", "/mnt/nvme").split("\n")[-1].strip())
+    lines = [line.split() for line in (read("/etc/fstab") or "").split("\n")
+             if line.split()[1:2] == ["/mnt/nvme"] and not line.lstrip().startswith("#")]
+    if len(lines) != 1:
+        report(FAIL, "NVMe line in /etc/fstab", f"{len(lines)} lines for /mnt/nvme")
+        return
+    spec, options = lines[0][0], lines[0][3].split(",")
+    check("NVMe fstab line has nofail", "nofail" in options, ",".join(options),
+          "nofail, so that a missing drive cannot stop the boot")
+    by = spec.split("=")[0]
+    report(INFO, "NVMe mounted by", f"{spec} ({'any drive with this label works' if by == 'LABEL' else 'only this one drive; optional: setup.sh --nvme-by-label'})")
+
+
+section("Radar software (not automated by setup.sh)")
+
+
+@item("orca mamba environment")
+def _(name):
+    python = os.path.join(HOME, "miniforge3", "envs", "orca", "bin", "python")
+    if not os.path.exists(python):
+        report(FAIL, name, f"{python} missing")
+        return
+    rc, text, err = run(python, "--version")
+    check(name, rc == 0, f"{text or err} at {os.path.dirname(os.path.dirname(python))}")
+
+
+@item("patched UHD build")
+def _(name):
+    path = os.path.join(HOME, "uhd-patched", "ORCA_UHD_BUILD.yaml")
+    text = read(path)
+    if text is None:
+        report(FAIL, name, f"{path} missing")
+        return
+    fields = dict(re.findall(r'^(\w+):\s*"?([^"\n]*)"?\s*$', text, re.M))
+    lib = os.path.join(HOME, "uhd-patched", "lib", "libuhd.so")
+    check(name, os.path.exists(lib) and fields.get("dirty") == "false",
+          f"{fields.get('uhd_version')}, built {fields.get('built_utc')}, dirty: {fields.get('dirty')}, "
+          f"libuhd.so {'present' if os.path.exists(lib) else 'MISSING'}", "library present, built from a clean tree")
+    pinned("patched UHD commit", fields.get("commit", ""), "uhd_commit")
+
+
+@item("ORCA checkout")
+def _(name):
+    path = os.path.join(HOME, "orca")
+    commit = git(path, "rev-parse", "HEAD")
+    pinned(name + " commit", commit, "orca_commit")
+    dirty = git(path, "status", "--porcelain")
+    report(INFO, name + " state", f"branch {git(path, 'branch', '--show-current') or '(detached)'}, "
+           + (f"{len(dirty.splitlines())} changed or untracked file(s)" if dirty else "clean"))
+
+
+@item("gpsd package")
+def _(name):
+    pinned(name, package_version("gpsd"), "gpsd_version")
+
+
+@item("time daemon")
+def _(name):
+    # chrony (with GPS as a time source) replaces systemd-timesyncd in stage 2, not before.
+    daemons = [f"{unit} ({package_version(package)})" for unit, package in
+               (("systemd-timesyncd.service", "systemd-timesyncd"), ("chrony.service", "chrony"))
+               if unit_state(unit)[1] == "active"]
+    synced = out("timedatectl", "show", "-p", "NTPSynchronized", "--value")
+    report(INFO, name, f"{', '.join(daemons) or 'none running'}; clock synchronised: {synced or 'unknown'}")
+
+
+section("This repository and its Python environment")
+
+
+@item("repository version")
+def _(name):
+    describe = git(REPO, "describe", "--tags", "--always", "--dirty")
+    tag = git(REPO, "describe", "--tags", "--exact-match")
+    changed = len(git(REPO, "status", "--porcelain").splitlines())
+    report(INFO, name, f"{describe or 'unknown'} at {REPO}" + (f", {changed} changed or untracked file(s)" if changed else ""))
+    if PINS.get("repo_tag"):
+        check("repository release tag", tag == PINS["repo_tag"] and not changed, tag or "not on a tag",
+              f"{PINS['repo_tag']} with no local changes, from setup/pins.toml")
+
+
+@item("uv")
+def _(name):
+    uv = os.path.join(HOME, ".local", "bin", "uv")
+    rc, text, err = run(uv, "--version")
+    if rc != 0:
+        report(FAIL, name, f"{uv}: {err or 'failed'}")
+        return
+    pinned(name, text.split()[1] if len(text.split()) > 1 else text, "uv_version")
+
+
+VENV_PYTHON = os.path.join(REPO, ".venv", "bin", "python")
+
+
+@item("virtual environment interpreter")
+def _(name):
+    cfg = read(os.path.join(REPO, ".venv", "pyvenv.cfg"))
+    if cfg is None:
+        report(FAIL, name, ".venv missing: run setup/build_venv.sh")
+        return
+    home = re.search(r"^home\s*=\s*(.+)$", cfg, re.M)
+    version = out(VENV_PYTHON, "--version")
+    check(name, bool(home) and home.group(1).strip() == "/usr/bin" and version.startswith("Python 3.12."),
+          f"{version}, base {home.group(1).strip() if home else 'unknown'}", "Python 3.12 from /usr/bin")
+
+
+@item("virtual environment matches uv.lock")
+def _(name):
+    if not os.path.exists(VENV_PYTHON):
+        report(FAIL, name, ".venv missing: run setup/build_venv.sh")
+        return
+    problems = uvlock.venv_problems(os.path.join(REPO, "uv.lock"), VENV_PYTHON)
+    count = len(uvlock.locked_packages(os.path.join(REPO, "uv.lock")))
+    check(name, not problems, "; ".join(problems) if problems else f"{count} packages, all at the locked versions",
+          "run setup/build_venv.sh")
+
+
+@item("wheelhouse complete")
+def _(name):
+    problems = uvlock.wheelhouse_problems(os.path.join(REPO, "uv.lock"), os.path.join(REPO, "wheelhouse"))
+    count = sum(len(p["wheels"]) for p in uvlock.locked_packages(os.path.join(REPO, "uv.lock")).values())
+    check(name, not problems, "; ".join(problems) if problems else f"{count} wheels, SHA-256 as in uv.lock",
+          "run setup/fetch_wheels.py (needs internet)")
+
+
+@item("config files load without warnings")
+def _(name):
+    rc, text, err = run(VENV_PYTHON, "-B", "-m", "radar_runner.common.config", timeout=60)
+    if rc != 0:
+        report(FAIL, name, err.split("\n")[-1] if err else "could not run")
+        return
+    warnings = [line for line in text.split("\n") if line.startswith("WARNING:")]
+    check(name, not warnings, " | ".join(warnings) if warnings else "no warnings")
+    for label, path in (("per-unit config", "/etc/radar-runner/local.yaml"), ("secrets file", "/etc/radar-runner/secrets.yaml")):
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            report(INFO, label, f"{path} not present (optional)")
+            continue
+        mode = st.st_mode & 0o777
+        if label == "secrets file":
+            check(label, not mode & 0o007, f"{path} mode {mode:04o}", "not readable by other users (0640 or 0600)")
+        else:
+            report(INFO, label, f"{path} present")
+
+
+# ============================================================ setup.sh steps
+
+section("setup.sh: files installed (setup/files/)")
+
+for _root, _dirs, _names in sorted(os.walk(FILES)):
+    for _n in sorted(_names):
+        _src = os.path.join(_root, _n)
+        _dst = "/" + os.path.relpath(_src, FILES)
+
+        @item(_dst)
+        def _(name, src=_src, dst=_dst):
+            mine, theirs = read(src), read(dst)
+            if theirs is None:
+                report(FAIL, name, "not installed" if not os.path.exists(dst) else "cannot be read")
+                return
+            st = os.stat(dst)
+            owner = f"{pwd.getpwuid(st.st_uid).pw_name}:{grp.getgrgid(st.st_gid).gr_name} {st.st_mode & 0o7777:04o}"
+            check(name, mine == theirs and owner == "root:root 0644",
+                  ("identical" if mine == theirs else "differs from setup/files") + f", {owner}",
+                  "identical, root:root 0644")
+
+section("setup.sh: directories")
+
+for _line in (read(os.path.join(FILES, "etc/tmpfiles.d/radar-runner.conf")) or "").split("\n"):
+    _f = _line.split()
+    if len(_f) >= 5 and _f[0] == "d":
+        @item(_f[1])
+        def _(name, mode=_f[2], user=_f[3], group=_f[4]):
+            want = f"{user}:{group} {int(mode, 8):04o}"
+            try:
+                st = os.stat(name)
+            except OSError as e:
+                report(FAIL, name, f"{e.strerror} (expected: {want})")
+                return
+            have = f"{pwd.getpwuid(st.st_uid).pw_name}:{grp.getgrgid(st.st_gid).gr_name} {st.st_mode & 0o7777:04o}"
+            check(name, have == want, have, want)
+
+section("setup.sh: shutdown path (logind)")
+
+
+@item("power key ignored (UPS wake-up contact)")
+def _(name):
+    value = logind("HandlePowerKey")
+    check(name, value == '"ignore"', f"HandlePowerKey={value}", 'HandlePowerKey="ignore"; after installing the file: reboot')
+
+
+@item("shutdown inhibitor delay")
+def _(name):
+    usec = int(logind("InhibitDelayMaxUSec"))
+    check(name, usec == 5_000_000, f"InhibitDelayMaxSec={usec / 1e6:g}", "5; after installing the file: reboot")
+
+
+@item("no shutdown delay lock held by unattended-upgrades")
+def _(name):
+    rc, text, err = run("systemd-inhibit", "--list", "--no-legend", "--no-pager")
+    if rc != 0:
+        raise Skip(err or "systemd-inhibit failed")
+    held = [line for line in text.split("\n") if "nattended" in line]
+    check(name, not held, held[0] if held else "none")
+
+
+section("setup.sh: automatic updates off")
+
+
+@item("apt periodic jobs")
+def _(name):
+    rc, text, err = run("apt-config", "dump")
+    if rc != 0:
+        raise Skip(err or "apt-config failed")
+    values = dict(re.findall(r'^APT::Periodic::([\w-]+) "(.*)";$', text, re.M))
+    for key in ("Enable", "Update-Package-Lists", "Unattended-Upgrade"):
+        value = values.get(key, "unset (default 1)" if key == "Enable" else "unset")
+        check(f"APT::Periodic::{key}", value == "0", f'"{value}"', '"0"')
+
+
+for _unit in ("apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrades.service", "fwupd-refresh.timer",
+              "rpi-eeprom-update.service"):
+    @item(_unit)
+    def _(name):
+        enabled, active = unit_state(name)
+        if enabled == "not-found":
+            report(PASS, name, "not on this system")
+        else:
+            check(name, enabled == "masked" and active != "active", f"{enabled}, {active}", "masked, inactive")
+
+
+@item("snap automatic refresh held forever")
+def _(name):
+    rc, text, err = run("snap", "refresh", "--time")
+    if rc is None:
+        report(PASS, name, "snapd is not installed")
+        return
+    if rc != 0:
+        raise Skip(err or text)
+    hold = re.search(r"^hold:\s*(.+)$", text, re.M)
+    check(name, bool(hold) and hold.group(1).strip() == "forever",
+          f"hold: {hold.group(1)}" if hold else "not held; " + ", ".join(text.split("\n")),
+          "'hold: forever' in 'snap refresh --time'")
+
+
+@item("Tailscale automatic self-update off")
+def _(name):
+    rc, text, err = run("tailscale", "debug", "prefs")
+    if rc is None:
+        report(PASS, name, "Tailscale is not installed")
+        return
+    if rc != 0:
+        raise Skip(f"tailscale debug prefs: {err or text}" + ("" if IS_ROOT else " (may need root)"))
+    auto = json.loads(text).get("AutoUpdate") or {}
+    check(name, auto.get("Apply") is not True, f"AutoUpdate Check: {auto.get('Check')}, Apply: {auto.get('Apply')}",
+          "Apply not true; fix: sudo tailscale set --auto-update=false")
+
+
+@item("needrestart only lists services")
+def _(name):
+    conf = "/etc/needrestart/needrestart.conf"
+    if not os.path.exists(conf):
+        report(PASS, name, "needrestart is not installed")
+        return
+    # needrestart's config is Perl; evaluate it the way needrestart does, drop-ins included.
+    rc, text, err = run("perl", "-e", 'our (%nrconf, $LOGPREF); %nrconf = (verbosity => 0); do $ARGV[0]; '
+                        'die $@ if $@; print defined $nrconf{restart} ? $nrconf{restart} : "unset";', conf)
+    if rc != 0:
+        raise Skip(f"cannot evaluate {conf}: {err}")
+    check(name, text == "l", f"restart mode '{text}'" + (" (Ubuntu default: restart services automatically after apt)"
+                                                          if text == "unset" else ""), "'l' (list only)")
+
+
+section("setup.sh: journal")
+
+
+@item("journal is persistent")
+def _(name):
+    check(name, os.path.isdir("/var/log/journal"), "/var/log/journal " + ("exists" if os.path.isdir("/var/log/journal") else "missing"))
+    usage = re.search(r"take up (\S+)", out("journalctl", "--disk-usage"))
+    report(INFO, "journal size now", usage.group(1) if usage else "unknown")
+
+
+@item("journal settings on disk (all files merged)")
+def _(name):
+    want = file_settings("etc/systemd/journald.conf.d/radar-runner.conf")
+    have = merged_settings("systemd/journald.conf", "Journal")
+    for key, value in want.items():
+        check(f"journald {key}", have.get(key) == value, f"{key}={have.get(key, '(default)')}", f"{key}={value}")
+
+
+@item("journal size limit in effect")
+def _(name):
+    size = re.fullmatch(r"(\d+)([KMGT])", file_settings("etc/systemd/journald.conf.d/radar-runner.conf")["SystemMaxUse"])
+    want = f"{float(size.group(1)):.1f}{size.group(2)}"
+    text = out("journalctl", "-b", "-t", "systemd-journald", "-o", "cat", "--no-pager")
+    found = re.findall(r"System Journal \(.*\) is \S+, max (\S+),", text)
+    if not found:
+        raise Skip("journald's start-up message is not readable" + ("" if IS_ROOT else " (needs root or group adm)"))
+    check(name, found[-1] == want, f"max {found[-1]}", f"max {want}; after installing the file: reboot")
+
+
+section("setup.sh: hardware watchdog")
+
+
+WATCHDOG = file_settings("etc/systemd/system.conf.d/radar-runner-watchdog.conf")
+
+
+@item("watchdog settings on disk (all files merged)")
+def _(name):
+    have = merged_settings("systemd/system.conf", "Manager")
+    for key, value in WATCHDOG.items():
+        check(f"systemd {key} on disk", have.get(key) == value, f"{key}={have.get(key, '(default)')}", f"{key}={value}")
+
+
+@item("watchdog settings in use")
+def _(name):
+    runtime = out("systemctl", "show", "-p", "RuntimeWatchdogUSec", "--value")
+    reboot = out("systemctl", "show", "-p", "RebootWatchdogUSec", "--value")
+    check(name, runtime == WATCHDOG["RuntimeWatchdogSec"] and reboot == WATCHDOG["RebootWatchdogSec"],
+          f"runtime {runtime or 'unknown'}, reboot {reboot or 'unknown'}",
+          f"runtime {WATCHDOG['RuntimeWatchdogSec']}, reboot {WATCHDOG['RebootWatchdogSec']}")
+
+
+@item("watchdog device")
+def _(name):
+    base = "/sys/class/watchdog/watchdog0/"
+    if not os.path.isdir(base):
+        report(FAIL, name, "no /sys/class/watchdog/watchdog0")
+        return
+    want = WATCHDOG["RuntimeWatchdogSec"].rstrip("s")
+    state, timeout, left = ((read(base + f) or "").strip() for f in ("state", "timeout", "timeleft"))
+    check(name, state == "active" and timeout == want,
+          f"{(read(base + 'identity') or '').strip()}: {state}, timeout {timeout} s", f"active, timeout {want} s")
+    if state == "active":
+        # Near zero would mean the kernel is not keeping the short hardware timer fed.
+        check("watchdog time left", left.isdigit() and int(left) >= 3, f"{left} s", "3 s or more at any moment")
+
+
+section("setup.sh: power service")
+
+
+@item("radar-power.service unit file")
+def _(name):
+    mine = read(os.path.join(REPO, "systemd", "radar-power.service"))
+    theirs = read("/etc/systemd/system/radar-power.service")
+    check(name, theirs is not None and mine == theirs,
+          "not installed" if theirs is None else "identical to systemd/radar-power.service" if mine == theirs
+          else "differs from systemd/radar-power.service")
+    enabled, active = unit_state("radar-power.service")
+    check("radar-power.service", (enabled, active) == ("enabled", "active"), f"{enabled}, {active}", "enabled, active")
+
+
+@item("power service config")
+def _(name):
+    text = read("/etc/radar-runner/power.toml")
+    if text is None:
+        report(FAIL, name, "/etc/radar-runner/power.toml missing or unreadable")
+        return
+    armed = tomllib.loads(text).get("armed", False)
+    report(INFO, name, f"/etc/radar-runner/power.toml: armed = {str(armed).lower()}")
+
+
+@item("power service status file")
+def _(name):
+    r = status_files.read_status(status_files.POWER_STATUS_FILE, 5.0)
+    if not r.ok:
+        report(FAIL, name, f"{r.state}: {r.error}")
+        return
+    d = r.data
+    check(name, True, f"fresh ({r.age_s:.1f} s old): state {d.get('state')}, mode {d.get('mode')}, "
+          f"power_present {d.get('power_present')}, capacitor {d.get('capacitor_v')} V")
+    warnings = d.get("warnings") or {}
+    check("power service warnings", not warnings, json.dumps(warnings) if warnings else "none")
+
+
+section("Optional setup.sh steps (not applied by default)")
+
+
+@item("held packages")
+def _(name):
+    rc, text, err = run("apt-mark", "showhold")
+    if rc != 0:
+        raise Skip(err or "apt-mark failed")
+    report(INFO, name, ", ".join(text.split()) or "none (optional: setup.sh --hold-packages)")
+
+
+# ============================================================ summary
+
+counts = {s: results.count(s) for s in (PASS, FAIL, SKIP, INFO)}
+print(f"\ncheck: {counts[PASS]} pass, {counts[FAIL]} FAIL, {counts[SKIP]} skip, {counts[INFO]} info"
+      + ("" if IS_ROOT else "  (not run as root)"))
+sys.exit(1 if counts[FAIL] else 0)
