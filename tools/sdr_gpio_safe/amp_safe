@@ -1,0 +1,132 @@
+#!/usr/bin/python3 -BEs
+"""amp_safe: the "make the amplifier safe" hook for the other services.
+
+Runs sdr_gpio_safe (see README.md), which puts the SDR's amplifier-enable pin into
+the shutdown state and verifies it, and makes sure the call ends:
+
+    amp_safe [--timeout SECONDS] [--tool PATH] [-- options for sdr_gpio_safe]
+
+* Returns within --timeout seconds (default 20), whatever the SDR does. The tool
+  gets a time limit of its own 1 s shorter; if it is still there 0.5 s after that
+  it is killed. A process stuck inside the kernel on a hung USB device survives
+  SIGKILL: it is then left behind and the call still returns in time.
+* Only one runs at a time: a second call waits for the first, inside its own
+  time. A tool left behind keeps later calls out (they time out) for as long
+  as it lives.
+* Prints one line to standard output and returns sdr_gpio_safe's exit code:
+    0 OK, 2 NOT_FOUND, 3 UNVERIFIED, 4 TIMEOUT (the tool's or this script's),
+    64 USAGE, and 5 FAILED when the tool could not be run or ended in any other way.
+  0 is returned only when the tool exited 0 and printed its OK line.
+
+Standard library only; runs on /usr/bin/python3 as any user, including root.
+"""
+import argparse
+import fcntl
+import os
+import subprocess
+import time
+
+OK, NOT_FOUND, UNVERIFIED, TIMEOUT, FAILED, USAGE = 0, 2, 3, 4, 5, 64
+NAMES = {OK: "OK", NOT_FOUND: "NOT_FOUND", UNVERIFIED: "UNVERIFIED", TIMEOUT: "TIMEOUT",
+         FAILED: "FAILED", USAGE: "USAGE"}
+DEFAULT_TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "sdr_gpio_safe")
+DEFAULT_TIMEOUT_S = 20.0
+TOOL_MARGIN_S = 1.0   # the tool's own time limit ends this long before ours
+KILL_MARGIN_S = 0.5   # SIGKILL this long before ours
+MIN_TOOL_S = 1.0      # the shortest time limit the tool accepts
+RESERVED = ("-h", "--help", "--timeout")   # not passed on: they would change what a result means
+
+t0 = time.monotonic()
+
+
+def finish(code, text):
+    line = " ".join(text.split())
+    print(f"amp_safe: {NAMES[code]} (exit {code}, {time.monotonic() - t0:.2f} s): {line}", flush=True)
+    os._exit(code)   # at once: nothing here may wait for a tool that was left behind
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        finish(USAGE, f"{message}; SDR not touched")
+
+
+def text_of(data):
+    return (data or b"").decode("utf-8", "replace")
+
+
+def last_tool_line(out):
+    lines = [l.strip() for l in text_of(out).splitlines() if l.startswith("sdr_gpio_safe:")]
+    return lines[-1] if lines else ""
+
+
+def error_tail(err):
+    """UHD's warnings and errors, shortened; its [INFO] lines are left out."""
+    lines = [l.strip() for l in text_of(err).splitlines() if l.strip() and not l.startswith("[INFO]")]
+    tail = " / ".join(lines)[-300:]
+    return f"; stderr: {tail}" if tail else ""
+
+
+def main():
+    parser = Parser(prog="amp_safe", description=__doc__, allow_abbrev=False,
+                    formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, metavar="SECONDS",
+                        help="return within this time, 3-300 (default %(default)s)")
+    parser.add_argument("--tool", default=DEFAULT_TOOL, metavar="PATH", help="the sdr_gpio_safe binary (default %(default)s)")
+    parser.add_argument("tool_options", nargs="*", metavar="OPTION", help="after --: options passed to sdr_gpio_safe")
+    args = parser.parse_args()
+    if not 3.0 <= args.timeout <= 300.0:    # also false for nan
+        parser.error("--timeout must be between 3 and 300 seconds")
+    for option in args.tool_options:
+        if option in RESERVED:
+            parser.error(f"{option} cannot be passed on to sdr_gpio_safe")
+    deadline = t0 + args.timeout
+
+    # One at a time. The lock is on the binary itself, which every caller can read, and the
+    # tool inherits it: a tool that outlives this script keeps holding it.
+    try:
+        lock = os.open(args.tool, os.O_RDONLY)
+    except OSError as e:
+        finish(FAILED, f"cannot run {args.tool}: {e.strerror}; SDR not touched, pin state unknown")
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if deadline - time.monotonic() < TOOL_MARGIN_S + MIN_TOOL_S + 0.1:
+                finish(TIMEOUT, "another sdr_gpio_safe was still running; not started, pin state unknown")
+            time.sleep(0.05)
+
+    tool_limit = deadline - time.monotonic() - TOOL_MARGIN_S
+    argv = [args.tool] + args.tool_options + ["--timeout", f"{tool_limit:.2f}"]
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                pass_fds=(lock,))
+    except OSError as e:
+        finish(FAILED, f"cannot run {args.tool}: {e.strerror}; SDR not touched, pin state unknown")
+
+    try:
+        out, err = proc.communicate(timeout=max(0.0, deadline - KILL_MARGIN_S - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            out, err = proc.communicate(timeout=max(0.0, deadline - 0.1 - time.monotonic()))
+            fate = "killed"
+        except subprocess.TimeoutExpired as e:
+            out, err = e.stdout, e.stderr
+            fate = f"could not be killed and was left behind (pid {proc.pid})"
+        line = last_tool_line(out)
+        finish(TIMEOUT, f"sdr_gpio_safe did not end by itself and {fate}; pin state unknown"
+                        f"{'; its last line: ' + line if line else ''}{error_tail(err)}")
+
+    rc = proc.returncode
+    line = last_tool_line(out)
+    if rc == OK and line.startswith("sdr_gpio_safe: OK:"):
+        finish(OK, line)
+    if rc in (NOT_FOUND, UNVERIFIED, TIMEOUT, USAGE) and line:
+        finish(rc, line + error_tail(err))
+    how = f"was ended by signal {-rc}" if rc < 0 else f"exited {rc}"
+    finish(FAILED, f"sdr_gpio_safe {how} without a valid result; pin state unknown: "
+                   f"{line or 'no result line'}{error_tail(err)}")
+
+
+main()
