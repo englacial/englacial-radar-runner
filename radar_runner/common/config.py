@@ -99,20 +99,22 @@ DEFAULTS = {
     # The safety watcher (radar_runner/watcher/README.md, which says where each number comes from).
     "watcher": {
         "loop_interval_s": 0.5,                  # how often everything is looked at and watcher.json rewritten
-        "radar_exe": "/home/englacial/orca/sdr/build/radar",    # a process with this executable is a radar
+        # A process with this executable is a radar. "manager": the binary that the radar manager runs
+        # (manager.orca: dir/radar_cwd/radar_command), so that the two cannot diverge; or a full path.
+        "radar_exe": "manager",
         "telemetry_status_file": "telemetry.json",      # a name in paths.run_dir, or a full path
         "override_file": "override-no-amp-telemetry",   # these three: a name in paths.state_dir, or a full path
         "events_file": "watcher-events.jsonl",
         "events_max_mb": 5.0,                    # then the file is renamed to .1 and a new one started
         "telemetry_lost_s": 3.0,                 # no usable amplifier reading for this long: not ok
         "require_case_temp": True,               # a reading without the case temperature is not usable
-        "trip_samples": 3,                       # readings in a row needed to trip (and to count as back) ...
-        "trip_span_s": 1.0,                      # ... which must span at least this long
+        "trip_samples": 3,                       # a limit trips when this many ...
+        "trip_window": 5,                        # ... of the last this many readings are beyond it ...
+        "trip_span_s": 1.0,                      # ... and those span at least this long
         "clear_hold_s": 30.0,                    # a trip clears after this long on the good side of the recover level
         "temp_warn_c": 50.0,                     # amplifier or case temperature: warning
         "temp_trip_c": 55.0,                     # ... stop
         "temp_clear_c": 50.0,                    # ... a stop clears below this
-        "cold_warn_c": -40.0,                    # warning only, below this
         "voltage_min_v": 26.0,                   # 28 V rail, while the amplifier is powered: stop outside these
         "voltage_max_v": 30.5,
         "voltage_recover_margin_v": 0.5,         # a stop clears this far inside the two limits
@@ -129,12 +131,15 @@ DEFAULTS = {
             "retry_s": 5.0,                      # ... after any other result, while the amplifier stays enabled
             "stuck_after_attempts": 3,           # still enabled after this many runs: stuck (urgent)
             "stuck_retry_s": 60.0,               # while stuck: one run this often
+            "blocked_after_s": 30.0,             # the tool cannot run (BUSY, ...) for this long: urgent
+            "blocked_retry_s": 15.0,             # ... and then one try this often
+            "blind_delay_s": 20.0,               # no telemetry and no radar this long, pin not known safe: run it
+            "blind_retry_s": 300.0,              # ... and again this often while that lasts
         },
         "stop_grace_s": 5.0,                     # not ok for this long with a radar process alive: SIGINT
+        "radar_setup_s": 30.0,                   # a radar process younger than this is never signalled
         "radar_exit_s": 5.0,                     # still alive this long after SIGINT: SIGKILL
         "kill_retry_s": 5.0,                     # still alive: SIGKILL again this often
-        "pi_temp_warn_c": 80.0,                  # Pi SoC temperature: warning only
-        "telemetry_gap_warn_s": 1.0,             # the telemetry loop's longest recent gap: warning only
     },
 }
 

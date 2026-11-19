@@ -36,17 +36,18 @@ class Sim:
         self.amp = dict(GOOD)
         self.telemetry = True           # readings arrive
         self.reason = "amplifier readings not fresh: the OLA is not set up for the amplifier readings (configuring)"
-        self.radar = ()
+        self.radar = ()                 # pids of the radar processes
+        self.radar_age = 1000.0         # the age that a radar process has when it first appears here
+        self._radar_born = {}
         self.override = False
-        self.power_lost = False
-        self.pi = {"soc_temp_c": 46.0, "throttled": ()}
-        self.gap = 0.25
+        self.pin_safe = True            # the shared record says "safe"
+        self.sdr = L.SDR_READY
+        self.tool_busy = False
         self.events = []
         self.signals = []               # (time, signal, pids)
         self.tool_starts = []           # times at which the logic asked for the reset tool
         self.statuses = []              # (time, ok, tripped, reason) at every round
         self._sample = None
-        self._pi_sample = None
         self._rounds = 0
 
     def round(self, dt=0.25):
@@ -54,13 +55,11 @@ class Sim:
         self._rounds += 1
         if self._rounds % 2 == 1 or dt > 0.25:
             self._sample = L.Sample(self.t - 0.25, **self.amp)
-        if self._rounds % 8 == 1:
-            self._pi_sample = L.PiSample(self.t - 0.5, self.pi["soc_temp_c"], tuple(self.pi["throttled"]))
+        self._radar_born = {pid: self._radar_born.get(pid, self.t - self.radar_age) for pid in self.radar}
         inp = L.Inputs(sample=self._sample if self.telemetry else None,
                        telemetry_reason="" if self.telemetry else self.reason,
-                       radar_pids=tuple(self.radar), override=self.override, power_lost=self.power_lost,
-                       pi=self._pi_sample if self.telemetry else None,
-                       telemetry_gap_s=self.gap if self.telemetry else None)
+                       radar=tuple((pid, self.t - born) for pid, born in self._radar_born.items()),
+                       override=self.override, pin_safe=self.pin_safe, sdr=self.sdr, tool_busy=self.tool_busy)
         self.carry_out(self.logic.step(self.t, inp))
         self.statuses.append((self.t, self.logic.ok, self.logic.tripped, self.logic.reason))
 
@@ -112,15 +111,13 @@ class Sim:
         return self.logic.snapshot(self.t, self.override)["conditions"][condition]["state"]
 
 
-def telemetry_status(up, amp=None, *, fresh=True, reason="", pi_temp=46.0, throttled=(), gap=0.25, age=0.25):
+def telemetry_status(up, amp=None, *, fresh=True, reason="", age=0.25):
     """What the telemetry service publishes, cut down to what the watcher reads."""
     values = dict(GOOD, **(amp or {}))
     return {"state": "ok",
             "amp": {"fresh": fresh, "reason": reason, "fresh_limit_s": 2.0, "age_s": age,
                     "sample_uptime_s": round(up - age, 3), **values},
-            "sources": {"pi": {"health": "ok", "sample_uptime_s": round(up - 1.0, 3),
-                               "values": {"soc_temp_c": pi_temp}, "throttled_now": list(throttled)}},
-            "loop": {"last_gap_s": 0.25, "recent_longest_gap_s": gap}}
+            "loop": {"last_gap_s": 0.25, "recent_longest_gap_s": 0.25}}
 
 
 # ---- stand-ins that run as real processes

@@ -89,7 +89,9 @@ telemetry:
 watcher:
   loop_interval_s: 0.5        # how often everything is looked at and /run/radar-runner/user/watcher.json rewritten
                               # (the telemetry service publishes a new reading every 0.5 s)
-  radar_exe: /home/englacial/orca/sdr/build/radar   # a process with this executable is a radar process
+  # A process with this executable is a radar process. "manager": the binary that the radar manager
+  # runs (manager.orca: dir/radar_cwd/radar_command), so that the two cannot diverge; or a full path.
+  radar_exe: manager
   telemetry_status_file: telemetry.json       # the telemetry service's status: a file name in paths.run_dir, or a full path
   # The next two and reset.state_file: a file name in paths.state_dir, or a full path.
   override_file: override-no-amp-telemetry    # the user's "run without amplifier telemetry" (radarctl override no-amp-telemetry on)
@@ -97,15 +99,16 @@ watcher:
   events_max_mb: 5.0          # then the file is renamed to .1 and a new one started
   telemetry_lost_s: 3.0       # no usable amplifier reading for this long: not ok (the radar may not run)
   require_case_temp: true     # a reading without the case temperature (TMP117) is not usable
-  # A limit trips only on trip_samples readings in a row spanning trip_span_s (one damaged reading does
-  # nothing), and clears only after clear_hold_s of readings on the good side of the recover level.
+  # A limit trips when trip_samples of the last trip_window readings are beyond it and those span
+  # trip_span_s (one damaged reading does nothing, and one good reading in between does not hide a
+  # fault). It clears only after clear_hold_s of readings on the good side of the recover level.
   trip_samples: 3
+  trip_window: 5
   trip_span_s: 1.0
   clear_hold_s: 30.0
   temp_warn_c: 50.0           # amplifier sensor or case sensor: warning
   temp_trip_c: 55.0           # stop the radar
   temp_clear_c: 50.0          # the stop clears below this
-  cold_warn_c: -40.0          # warning only, below this (the amplifier's rating; no cold limit is decided)
   voltage_min_v: 26.0         # 28 V rail while the amplifier is powered: stop outside these two
   voltage_max_v: 30.5
   voltage_recover_margin_v: 0.5   # the stop clears this far inside the two limits (26.5-30.0 V)
@@ -122,8 +125,13 @@ watcher:
     retry_s: 5.0              # wait after any other result, while the amplifier stays enabled
     stuck_after_attempts: 3   # still enabled after this many runs: "stuck enabled", urgent
     stuck_retry_s: 60.0       # while stuck: one run this often (each run is an enable pulse)
+    blocked_after_s: 30.0     # the tool cannot run at all (BUSY, NOT_FOUND, ...) for this long: urgent
+    blocked_retry_s: 15.0     # ... and then one try this often (such a try is no enable pulse)
+    blind_delay_s: 20.0       # no telemetry and no radar for this long, and the pin not known safe: run the tool
+    blind_retry_s: 300.0      # ... and again this often while that lasts
   stop_grace_s: 5.0           # not ok for this long with a radar process still alive: SIGINT to it
+                              # (seconds not ok count up, seconds ok count down: flapping does not restart it)
+  radar_setup_s: 30.0         # a radar process younger than this is never signalled: it may be setting up the
+                              # SDR (17 s at a first contact), and dying there leaves the amplifier enabled
   radar_exit_s: 5.0           # still alive this long after SIGINT: SIGKILL
   kill_retry_s: 5.0           # still alive: SIGKILL again this often
-  pi_temp_warn_c: 80.0        # Pi SoC temperature: warning only
-  telemetry_gap_warn_s: 1.0   # the telemetry loop's longest recent gap between rounds: warning only

@@ -4,6 +4,7 @@ stand-in radar processes, first in simulated time, then as a real process.
 No test runs the real amp_safe or sdr_gpio_safe, opens a device, or signals a process it did not start.
 """
 import copy
+import fcntl
 import json
 import os
 import shutil
@@ -43,11 +44,11 @@ class Notifier:
 class Rig:
     """A watcher on simulated clocks, with real files under tmp_path, a stand-in tool and stand-in radars."""
 
-    def __init__(self, tmp_path, **changes):
+    def __init__(self, tmp_path, up=UP0, **changes):
         self.tmp = tmp_path
         for name in ("run", "state"):
-            (tmp_path / name).mkdir()
-        self.up = UP0
+            (tmp_path / name).mkdir(exist_ok=True)
+        self.up = up
         self.tool = FakeTool(tmp_path / "tool")
         self.radars = FakeRadar(tmp_path / "orca")
         self.config = copy.deepcopy(C.DEFAULTS)
@@ -69,6 +70,10 @@ class Rig:
                                                uptime=lambda: self.up, threaded=False),
                                status=S.StatusWriter(str(tmp_path / "run" / "watcher.json"), wall=self.wall,
                                                      uptime=lambda: self.up, boot_id=S.current_boot_id()))
+        self.radar_age = 1000.0     # the stand-in radars count as long past their set-up
+        self.watcher.radar.with_ages = lambda now: tuple((pid, self.radar_age) for pid in self.watcher.radar.pids())
+        self.watcher.sdr_state = lambda: self.sdr
+        (tmp_path / "state" / "sdr-state").write_text("safe\nwritten by the test\n")
         self.watcher.setup()
         self._rounds = 0
 
@@ -91,6 +96,7 @@ class Rig:
         return data
 
     tool_ends = True
+    sdr = "ready"
 
     def run(self, seconds):
         data = None
@@ -123,6 +129,7 @@ def rig(tmp_path):
 
     def make(**changes):
         made.append(Rig(tmp_path, **changes))
+        made[-1].make = make
         return made[-1]
     yield make
     for r in made:
@@ -147,7 +154,9 @@ def test_good_telemetry_gives_an_ok_status_with_the_shared_fields(rig):
     d = read.data
     assert d["running"] is True and d["pid"] == os.getpid() and d["uptime_s"] == r.up
     assert d["amp"] == dict(GOOD, sample_uptime_s=pytest.approx(r.up - 0.5, abs=0.3))
-    assert d["conditions"]["telemetry"]["state"] == "ok" and d["pi"]["soc_temp_c"] == 46.0
+    assert d["conditions"]["telemetry"]["state"] == "ok"
+    assert d["conditions"]["pin"] == {"state": "ok", "since_uptime_s": None, "record_safe": True,
+                                      "signalled_by_watcher": False, "sdr": "unknown"}
     assert d["override"] == {"no_amp_telemetry": False, "file": str(r.tmp / "state" / "override-no-amp-telemetry")}
     assert d["reset_tool"] == {"running": False, "last": None, "command": str(r.tool.path),
                                "state_file": str(r.tmp / "state" / "sdr-state"), "runnable": True}
@@ -242,19 +251,6 @@ def test_the_override_file_makes_missing_telemetry_ok_and_shows_in_the_status(ri
     assert r.status().data["ok"] is False
 
 
-def test_a_reported_power_loss_makes_the_falling_rail_no_trip(rig):
-    r = rig()
-    r.run(3.0)
-    power = S.StatusWriter(str(r.tmp / "power.json"), wall=r.wall, uptime=lambda: r.up, boot_id="")
-    for volts in (24.0, 22.0, 21.0, 9.0, 0.3, 0.3):
-        r.amp["voltage_v"] = volts
-        for _ in range(4):
-            power.write({"state": "loss", "power_present": False})
-            r.round()
-    d = r.status().data
-    assert d["ok"] is False and d["tripped"] is False and d["conditions"]["voltage"]["state"] == "unpowered"
-    assert r.named("trip") == [] and r.tool.calls == []
-
 
 def test_an_over_temperature_trip_reaches_the_status_and_the_event_log(rig):
     r = rig()
@@ -289,34 +285,11 @@ def test_enabled_with_no_radar_runs_the_tool_with_the_timeout_and_the_shared_sta
     last = d["reset_tool"]["last"]
     assert (last["code"], last["name"]) == (0, "OK") and "amp_safe: OK (exit 0" in last["text"]
     assert last["time_utc"].endswith("Z") and d["counters"]["tool_runs"] == 1 and d["counters"]["tool_ok"] == 1
-    assert [e["event"] for e in r.events] == ["start", "trip", "reset_tool", "not_ok", "reset_tool_result", "clear", "ok"]
+    # The status says "tripped" before the tool starts.
+    assert [e["event"] for e in r.events] == ["start", "trip", "not_ok", "reset_tool", "reset_tool_result", "clear", "ok"]
     r.run(120.0)
     assert len(r.tool.calls) == 1
 
-
-@pytest.mark.parametrize("code, name", [(3, "ASSUME_ENABLED"), (2, "NOT_FOUND"), (4, "TIMEOUT"), (5, "FAILED"),
-                                        (6, "BUSY"), (7, "AMBIGUOUS"), (8, "STATE_FILE"), (64, "USAGE")])
-def test_every_failing_exit_code_is_retried_twice_then_stuck_with_one_run_a_minute(rig, code, name):
-    r = rig()
-    r.tool.plan(codes=[code])
-    r.run(3.0)
-    r.amp["current_a"] = ENABLED_A
-    r.run(25.0)
-    d = r.status().data
-    assert len(r.tool.calls) == 3
-    assert d["ok"] is False and d["tripped"] is True and d["conditions"]["amp_enabled"]["state"] == "stuck"
-    assert d["reason"].startswith("AMPLIFIER STUCK ENABLED") and f"last: {name} (exit {code})" in d["reason"]
-    assert (d["reset_tool"]["last"]["code"], d["reset_tool"]["last"]["name"]) == (code, name)
-    gaps = [b["uptime_s"] - a["uptime_s"] for a, b in zip(r.named("reset_tool"), r.named("reset_tool")[1:])]
-    assert gaps == pytest.approx([2.25 if code == 3 else 5.25] * 2, abs=0.3)
-    stuck, = r.named("stuck")
-    assert stuck["severity"] == "urgent" and stuck["current_a"] == ENABLED_A
-    r.run(125.0)
-    assert len(r.tool.calls) == 5                   # one a minute
-    r.tool.plan(codes=[0])                          # the next run succeeds and the current falls
-    r.run(62.0)
-    assert len(r.tool.calls) == 6 and r.status().data["ok"] is True
-    assert "no longer stuck enabled" in r.named("clear")[0]["text"]
 
 
 def test_when_the_state_file_cannot_be_written_the_tool_runs_without_it(rig):
@@ -353,16 +326,6 @@ def test_the_tool_runs_even_if_its_output_file_cannot_be_made(rig):
     assert (last["code"], last["text"]) == (0, "no output")
 
 
-def test_a_tool_that_cannot_be_started_is_reported_as_failed_and_the_state_becomes_stuck(rig):
-    r = rig(command="/nonexistent/amp_safe")
-    r.run(3.0)
-    assert r.status().data["reset_tool"]["runnable"] is False
-    r.amp["current_a"] = ENABLED_A
-    r.run(25.0)
-    d = r.status().data
-    assert d["conditions"]["amp_enabled"]["state"] == "stuck" and d["reset_tool"]["last"]["name"] == "FAILED"
-    assert "cannot start /nonexistent/amp_safe: No such file or directory" in d["reset_tool"]["last"]["text"]
-
 
 def test_a_tool_that_does_not_return_is_given_up_on_after_its_timeout_plus_the_margin(rig):
     r = rig(timeout_s=3.0, kill_margin_s=1.0)
@@ -386,7 +349,7 @@ def test_the_tool_never_runs_while_a_stand_in_radar_is_alive(rig):
     radar = r.radars.start()
     r.run(3.0)
     assert r.status().data["radar"] == {"running": True, "pids": [radar.pid], "stop": "idle",
-                                        "stop_since_uptime_s": None, "exe": str(r.radars.exe)}
+                                        "stop_since_uptime_s": None, "setting_up": [], "exe": str(r.radars.exe)}
     r.amp["current_a"] = ENABLED_A                  # a radar that transmits: enabled current is normal
     r.run(120.0)
     assert r.tool.calls == [] and r.status().data["ok"] is True and radar.poll() is None
@@ -398,7 +361,7 @@ def test_the_tool_never_runs_while_a_stand_in_radar_is_alive(rig):
     assert gone(radar) == -signal.SIGINT
     r.run(4.5)
     assert r.tool.calls == []                       # the radar left the amplifier enabled: 5 s first
-    r.run(2.0)
+    r.run(2.5)
     assert len(r.tool.calls) == 1
     kinds = [e["event"] for e in r.events]
     assert kinds.index("radar_stop") < kinds.index("radar_stopped") < kinds.index("reset_tool")
@@ -504,11 +467,12 @@ def test_settings_that_cannot_work_revert_to_the_defaults_with_a_warning():
     cfg = copy.deepcopy(C.DEFAULTS["watcher"])
     assert W.checked(cfg) == (cfg, [])
     bad = copy.deepcopy(cfg)
-    bad.update(trip_samples=1, temp_trip_c=40.0, voltage_min_v=31.0, loop_interval_s=30.0, clear_hold_s=10.0)
-    bad["reset"].update(timeout_s=1.0, stuck_retry_s=0.0)
+    bad.update(trip_samples=1, temp_trip_c=40.0, voltage_min_v=31.0, loop_interval_s=30.0, clear_hold_s=10.0,
+               radar_setup_s=-1.0)
+    bad["reset"].update(timeout_s=1.0, stuck_retry_s=0.0, blind_delay_s=0.0)
     fixed, warnings = W.checked(bad)
     assert fixed == dict(cfg, clear_hold_s=10.0)    # what can work is kept
-    assert len(warnings) == 6 and all(w.endswith("defaults used") for w in warnings)
+    assert len(warnings) == 8 and all(w.endswith("defaults used") for w in warnings)
     assert any(w.startswith("watcher.reset.timeout_s, watcher.reset.kill_margin_s: must be") for w in warnings)
 
 
@@ -516,7 +480,8 @@ def test_bad_settings_are_published_as_config_warnings(rig):
     r = rig(trip_samples=0)
     assert r.watcher.cfg["trip_samples"] == 3
     r.run(3.0)
-    assert r.status().data["config_warnings"] == ["watcher.trip_samples: must be between 2 and 50: defaults used"]
+    assert r.status().data["config_warnings"] == [
+        "watcher.trip_samples, watcher.trip_window: must be at least 2 readings, and a window no smaller: defaults used"]
 
 
 def test_file_settings_are_names_in_the_state_and_run_directories_or_full_paths(rig, tmp_path):
@@ -613,6 +578,7 @@ watcher:
   idle_enabled_s: 1.0
   stop_grace_s: 0.5
   radar_exit_s: 0.5
+  radar_setup_s: 0.5
   reset:
     command: {tool.path}
     timeout_s: 5.0
@@ -708,3 +674,212 @@ def test_the_process_killed_outright_leaves_a_status_that_goes_stale(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait(10)
+
+
+# ---- the reset tool's results, through the stand-in
+
+def test_a_tool_that_ran_and_did_not_help_three_times_means_stuck_with_one_run_a_minute(rig):
+    r = rig()
+    r.tool.plan(codes=[3])
+    r.run(3.0)
+    r.amp["current_a"] = ENABLED_A
+    r.run(20.0)
+    d = r.status().data
+    assert len(r.tool.calls) == 3
+    assert d["ok"] is False and d["tripped"] is True and d["conditions"]["amp_enabled"]["state"] == "stuck"
+    assert d["reason"].startswith("AMPLIFIER STUCK ENABLED") and "last: ASSUME_ENABLED (exit 3)" in d["reason"]
+    stuck, = r.named("stuck")
+    assert stuck["severity"] == "urgent" and stuck["current_a"] == ENABLED_A
+    r.run(125.0)
+    assert len(r.tool.calls) == 5                   # one a minute
+    r.tool.plan(codes=[0])                          # the next run succeeds and the current falls
+    r.run(62.0)
+    assert len(r.tool.calls) == 6 and r.status().data["ok"] is True
+    assert "no longer stuck enabled" in r.named("clear")[0]["text"]
+
+
+@pytest.mark.parametrize("code, name", [(2, "NOT_FOUND"), (4, "TIMEOUT"), (5, "FAILED"), (6, "BUSY"), (7, "AMBIGUOUS"),
+                                        (8, "STATE_FILE"), (64, "USAGE")])
+def test_a_tool_that_cannot_run_is_never_called_stuck_and_is_urgent_after_thirty_seconds(rig, code, name):
+    r = rig()
+    r.tool.plan(codes=[code])
+    r.run(3.0)
+    r.amp["current_a"] = ENABLED_A
+    r.run(30.0)
+    d = r.status().data
+    assert d["conditions"]["amp_enabled"]["state"] == "resetting" and r.named("blocked") == []
+    r.run(15.0)
+    d = r.status().data
+    assert d["ok"] is False and d["tripped"] is True and d["conditions"]["amp_enabled"]["state"] == "blocked"
+    assert d["conditions"]["amp_enabled"]["tool_ran"] == 0 and r.named("stuck") == []
+    assert d["reason"].startswith("AMPLIFIER ENABLED with no radar process and the reset tool cannot run")
+    assert (d["reset_tool"]["last"]["code"], d["reset_tool"]["last"]["name"]) == (code, name)
+    blocked, = r.named("blocked")
+    assert blocked["severity"] == "urgent" and f"{name} (exit {code})" in blocked["text"]
+    r.tool.plan(codes=[0])
+    r.run(20.0)
+    assert r.status().data["ok"] is True
+
+
+def test_a_tool_that_cannot_be_started_is_reported_as_failed(rig):
+    r = rig(command="/nonexistent/amp_safe")
+    r.run(3.0)
+    assert r.status().data["reset_tool"]["runnable"] is False
+    r.amp["current_a"] = ENABLED_A
+    r.run(45.0)
+    d = r.status().data
+    assert d["conditions"]["amp_enabled"]["state"] == "blocked" and d["reset_tool"]["last"]["name"] == "FAILED"
+    assert "cannot start /nonexistent/amp_safe: No such file or directory" in d["reset_tool"]["last"]["text"]
+
+
+def test_while_another_amp_safe_holds_the_lock_the_watcher_does_not_start_its_own(rig):
+    r = rig()
+    r.run(3.0)
+    holder = os.open(str(r.tool.path), os.O_RDONLY)     # as a running amp_safe holds its own script
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        assert W.lock_held(str(r.tool.path))
+        r.amp["current_a"] = ENABLED_A
+        r.run(20.0)
+        assert r.tool.calls == [] and r.status().data["tripped"] is True
+    finally:
+        os.close(holder)
+    assert not W.lock_held(str(r.tool.path)) and not W.lock_held("/nonexistent/amp_safe")
+    r.run(1.0)
+    assert len(r.tool.calls) == 1
+
+
+# ---- no telemetry, and the pin not known to be safe
+
+def test_without_telemetry_a_record_that_does_not_say_safe_gets_one_run_of_the_tool(rig):
+    r = rig()
+    r.run(3.0)
+    (r.tmp / "state" / "sdr-state").write_text("unknown\namp_safe: sdr_gpio_safe is starting\n")
+    r.feed = False
+    r.run(19.0)
+    assert r.tool.calls == [] and r.status().data["tripped"] is False
+    r.run(3.0)
+    d = r.status().data
+    assert len(r.tool.calls) == 1 and d["conditions"]["pin"]["record_safe"] is False
+    assert d["conditions"]["pin"]["sdr"] == "ready"
+    assert r.named("trip")[0]["condition"] == "pin" and r.named("trip")[0]["severity"] == "urgent"
+    # The stand-in said OK; the real amp_safe would have written "safe" itself.
+    (r.tmp / "state" / "sdr-state").write_text("safe\n")
+    r.run(600.0)
+    d = r.status().data
+    assert len(r.tool.calls) == 1 and d["tripped"] is False and d["ok"] is False        # telemetry is still lost
+
+
+@pytest.mark.parametrize("sdr", ["bootloader", "absent"])
+def test_without_telemetry_the_tool_is_not_run_on_an_sdr_that_was_never_started_or_is_not_there(rig, sdr):
+    r = rig()
+    r.sdr = sdr
+    (r.tmp / "state" / "sdr-state").unlink()        # no record at all: not known safe
+    r.feed = False
+    r.run(600.0)
+    assert r.tool.calls == [] and r.status().data["tripped"] is False
+    assert r.status().data["conditions"]["pin"]["sdr"] == sdr
+
+
+def test_the_record_and_the_sdr_are_read_without_touching_anything(tmp_path):
+    record = tmp_path / "sdr-state"
+    assert not W.record_says_safe(str(record))
+    for text, safe in (("safe\nwhy\n", True), ("safe", True), ("unknown\n", False), ("safely\n", False),
+                       (" safe\n", False), ("", False), ("SAFE\n", False)):
+        record.write_text(text)
+        assert W.record_says_safe(str(record)) is safe, text
+    usb = tmp_path / "usb"
+    assert W.sdr_state(str(usb)) == "absent"
+    for name, vendor, product in (("1-1", "1a86", "USB Serial"), ("2-1", "2500", "WestBridge "), ("usb1", "1d6b", None)):
+        (usb / name).mkdir(parents=True)
+        (usb / name / "idVendor").write_text(vendor + "\n")
+        if product:
+            (usb / name / "product").write_text(product + "\n")
+    assert W.sdr_state(str(usb)) == "bootloader"
+    (usb / "2-1" / "product").write_text("USRP B200\n")
+    assert W.sdr_state(str(usb)) == "ready"
+    assert W.sdr_state() in ("ready", "bootloader", "absent")       # the real one: only looked at
+
+
+# ---- what a restart must not lose
+
+def test_a_restarted_watcher_knows_its_trips_again_and_a_file_from_another_boot_is_ignored(rig):
+    r = rig()
+    r.run(3.0)
+    r.amp["temp_c"] = 57.0
+    r.run(3.0)
+    r.amp["temp_c"] = 53.0
+    r.run(3.0)
+    kept = json.loads((r.tmp / "run" / "watcher-state.json").read_text())
+    assert kept["state"] == {"trips": {"amp_temp": True, "case_temp": False, "voltage": False}, "enabled": "idle",
+                             "signalled": False, "record_unwritable": False}
+    again = Rig(r.tmp, up=r.up)                     # the watcher is killed and started again
+    again.amp = dict(r.amp)
+    again.run(4.0)
+    d = again.status().data
+    assert d["ok"] is False and d["tripped"] is True and d["conditions"]["amp_temp"]["state"] == "trip"
+    assert "restored" in again.named("start")[-1]["text"]
+    # The same file with another boot's ID says nothing about now.
+    kept["boot_id"] = BOOT
+    (r.tmp / "run" / "watcher-state.json").write_text(json.dumps(kept))
+    other = Rig(r.tmp, up=r.up)
+    other.run(3.0)
+    assert other.status().data["ok"] is True
+    for junk in ("", "{", "[1]", '{"state": 5, "uptime_s": 1}'):
+        (r.tmp / "run" / "watcher-state.json").write_text(junk)
+        Rig(r.tmp, up=r.up).run(3.0)
+
+
+def test_the_record_unwritable_flag_survives_a_restart(rig):
+    r = rig()
+    r.tool.plan(codes=[8, 0])
+    r.run(3.0)
+    r.amp["current_a"] = ENABLED_A
+    r.run(7.0)
+    assert json.loads((r.tmp / "run" / "watcher-state.json").read_text())["state"]["record_unwritable"] is True
+    again = Rig(r.tmp, up=r.up)
+    assert again.watcher._record_unwritable is True
+
+
+# ---- which program is the radar
+
+def test_the_radar_binary_comes_from_the_managers_settings_unless_set_explicitly():
+    config = copy.deepcopy(C.DEFAULTS)
+    assert config["watcher"]["radar_exe"] == "manager"
+    config["manager"] = {"orca": {"dir": "/opt/orca", "radar_cwd": "sdr/build", "radar_command": ["./radar", "{config_rel}"]}}
+    assert W.radar_exe(config) == "/opt/orca/sdr/build/radar"
+    config["watcher"]["radar_exe"] = "/somewhere/else/radar"
+    assert W.radar_exe(config) == "/somewhere/else/radar"
+    # Without the manager's settings: the manager's own defaults if that code is there, else the usual place.
+    config = copy.deepcopy(C.DEFAULTS)
+    config.pop("manager", None)
+    assert W.radar_exe(config) == "/home/englacial/orca/sdr/build/radar"
+    config["manager"] = {"orca": {"dir": 5}}
+    assert W.radar_exe(config) == "/home/englacial/orca/sdr/build/radar"
+
+
+def test_the_age_of_a_radar_process_is_taken_from_proc(tmp_path):
+    radars = FakeRadar(tmp_path / "build")
+    proc = radars.start()
+    try:
+        time.sleep(0.3)
+        (pid, age), = RadarProcesses(str(radars.exe)).with_ages(S.boottime_s())
+        assert pid == proc.pid and 0.2 <= age <= 5.0
+    finally:
+        radars.stop_all()
+
+
+def test_a_stand_in_radar_that_is_still_setting_up_is_not_signalled(rig):
+    r = rig()
+    r.radar_age = 3.0
+    radar = r.radars.start()
+    r.run(3.0)
+    r.feed = False
+    r.run(60.0)
+    d = r.status().data
+    assert radar.poll() is None and d["ok"] is False and d["radar"]["setting_up"] == [radar.pid]
+    assert d["counters"]["radar_sigint"] == 0 and [w["warning"] for w in d["warnings"]] == ["radar_setting_up"]
+    r.radar_age = 31.0
+    r.run(1.0)
+    assert gone(radar) == -signal.SIGINT
+    assert r.status().data["conditions"]["pin"]["signalled_by_watcher"] is True

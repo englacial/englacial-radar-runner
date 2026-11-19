@@ -844,7 +844,8 @@ def _(name):
           else "differs from systemd/radar-watcher.service")
     enabled, active = unit_state("radar-watcher.service")
     check("radar-watcher.service", (enabled, active) == ("enabled", "active"), f"{enabled}, {active}",
-          "enabled, active (stopped by hand for bench work? see radar_runner/watcher/README.md)")
+          "enabled, active (setup.sh does not start it: sudo systemctl start radar-watcher; "
+          "stopped by hand for bench work? see radar_runner/watcher/README.md)")
 
 
 @item("SDR GPIO reset tool")
@@ -885,8 +886,12 @@ def _(name):
     check("safety watcher event log", not events.get("error") and not events.get("dropped"),
           f"{events.get('file')}: " + (events.get("error") or f"{events.get('written')} written, {events.get('dropped')} dropped"))
     loop = d.get("loop") or {}
-    check("safety watcher loop runs evenly", loop.get("longest_gap_s", 99) <= 2.0,
-          f"longest gap between rounds since it started: {loop.get('longest_gap_s')} s", "2 s or less")
+    check("safety watcher loop runs evenly", loop.get("recent_longest_gap_s", 99) <= 2.0,
+          f"longest gap between rounds: {loop.get('recent_longest_gap_s')} s lately, {loop.get('longest_gap_s')} s "
+          "since it started", "2 s or less in the last minutes")
+    pin = (d.get("conditions") or {}).get("pin") or {}
+    report(INFO, "amplifier pin record", f"record says safe: {pin.get('record_safe')}; "
+           f"the watcher signalled a radar since: {pin.get('signalled_by_watcher')}")
     override = (d.get("override") or {}).get("no_amp_telemetry")
     report(INFO, "override: run without amplifier telemetry", "SET" if override else "not set")
     counters = d.get("counters") or {}
