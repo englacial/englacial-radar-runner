@@ -1,0 +1,100 @@
+b200: leave the front-panel GPIO pins as inputs at initialization
+
+PROPOSAL ONLY. Not applied, not built, not tested on hardware. See README.md
+in this directory. Against ~/uhd at c87abfbe8 (UHD 4.11.0.0 plus the local
+TR-switch patch).
+
+gpio_atr_3000::make() makes every pin of a bank an output, and the
+constructor clears all level registers, so each initialization drives all
+B2xx front-panel pins low until the application configures them. The pins
+have pull-ups and the DDR property already defaults to "INPUT".
+
+Add an opt-in start_as_inputs argument (default false: no change for any
+other device or bank) that leaves the pins as inputs and releases them
+before the level registers are cleared, and use it for the B2xx front-panel
+bank.
+---
+diff --git a/host/lib/include/uhdlib/usrp/cores/gpio_atr_3000.hpp b/host/lib/include/uhdlib/usrp/cores/gpio_atr_3000.hpp
+--- a/host/lib/include/uhdlib/usrp/cores/gpio_atr_3000.hpp
++++ b/host/lib/include/uhdlib/usrp/cores/gpio_atr_3000.hpp
+@@ -73,8 +73,14 @@
+      *
+      * \param iface register iface to GPIO ATR registers
+      * \param registers Register offsets
++     * \param start_as_inputs leave all pins as inputs instead of making them
++     *        outputs, and release them before the level registers are cleared.
++     *        For pins that drive external hardware: a pin is then never driven
++     *        low by the initialization itself.
+      */
+-    static sptr make(uhd::wb_iface::sptr iface, gpio_atr_offsets registers);
++    static sptr make(uhd::wb_iface::sptr iface,
++        gpio_atr_offsets registers,
++        const bool start_as_inputs = false);
+ 
+     /*!
+      * Select the ATR mode for all bits in the mask
+diff --git a/host/lib/usrp/b200/b200_impl.cpp b/host/lib/usrp/b200/b200_impl.cpp
+--- a/host/lib/usrp/b200/b200_impl.cpp
++++ b/host/lib/usrp/b200/b200_impl.cpp
+@@ -758,8 +758,12 @@
+     ////////////////////////////////////////////////////////////////////
+     // front panel gpio
+     ////////////////////////////////////////////////////////////////////
++    // The front-panel pins start as inputs, as the DDR property below says.
++    // As outputs they would be driven low from here until the application
++    // configures them, on every initialization.
+     _radio_perifs[0].fp_gpio = gpio_atr_3000::make(_radio_perifs[0].ctrl,
+-        gpio_atr_offsets::make_default(TOREG(SR_FP_GPIO), RB32_FP_GPIO));
++        gpio_atr_offsets::make_default(TOREG(SR_FP_GPIO), RB32_FP_GPIO),
++        true /* start_as_inputs */);
+     for (const auto& attr : gpio_attr_map) {
+         switch (attr.first) {
+             case usrp::gpio_atr::GPIO_SRC:
+diff --git a/host/lib/usrp/cores/gpio_atr_3000.cpp b/host/lib/usrp/cores/gpio_atr_3000.cpp
+--- a/host/lib/usrp/cores/gpio_atr_3000.cpp
++++ b/host/lib/usrp/cores/gpio_atr_3000.cpp
+@@ -55,7 +55,9 @@
+ class gpio_atr_3000_impl : public gpio_atr_3000
+ {
+ public:
+-    gpio_atr_3000_impl(wb_iface::sptr iface, const gpio_atr_offsets registers)
++    gpio_atr_3000_impl(wb_iface::sptr iface,
++        const gpio_atr_offsets registers,
++        const bool start_as_inputs = false)
+         : _iface(iface)
+         , _rb_addr(registers.readback)
+         , _atr_idle_reg(registers.idle, _atr_disable_reg)
+@@ -65,6 +67,12 @@
+         , _ddr_reg(registers.ddr)
+         , _atr_disable_reg(registers.disable)
+     {
++        if (start_as_inputs) {
++            // The FPGA keeps its registers between sessions. Release the pins
++            // (DDR = 0) first, so that a pin left as an output by an earlier
++            // session is not driven with the level registers cleared below.
++            _ddr_reg.initialize(*_iface, true);
++        }
+         _atr_idle_reg.initialize(*_iface, true);
+         _atr_rx_reg.initialize(*_iface, true);
+         _atr_tx_reg.initialize(*_iface, true);
+@@ -328,14 +336,17 @@
+     }
+ };
+ 
+-gpio_atr_3000::sptr gpio_atr_3000::make(wb_iface::sptr iface, gpio_atr_offsets registers)
++gpio_atr_3000::sptr gpio_atr_3000::make(
++    wb_iface::sptr iface, gpio_atr_offsets registers, const bool start_as_inputs)
+ {
+     gpio_atr_3000::sptr gpio_iface =
+-        std::make_shared<gpio_atr_3000_impl>(iface, registers);
++        std::make_shared<gpio_atr_3000_impl>(iface, registers, start_as_inputs);
+     if (registers.is_writeonly()) {
+         gpio_iface->set_gpio_ddr(DDR_OUTPUT, MASK_SET_ALL);
+     }
+-    gpio_iface->set_gpio_ddr(DDR_OUTPUT, MASK_SET_ALL);
++    if (not start_as_inputs) {
++        gpio_iface->set_gpio_ddr(DDR_OUTPUT, MASK_SET_ALL);
++    }
+     return gpio_iface;
+ }
+ 
