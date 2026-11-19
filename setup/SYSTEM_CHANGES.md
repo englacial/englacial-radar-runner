@@ -18,7 +18,8 @@ setup/check.py               # one PASS/FAIL line per item below
 The script only writes files that this project owns (copied from
 `setup/files/`, same path as on the system), so reverting a change is deleting
 its file. It never touches network configuration or SSH, never restarts or
-stops the power service or the telemetry service, and never reboots. Its one
+stops the power service, the telemetry service or the radar manager, and never
+reboots. It installs the radar manager's unit but never enables or starts it (section 14). Its one
 Tailscale change is section 5. Its one package change is section 13 (chrony
 and fake-hwclock in place of systemd-timesyncd), which is the last step and the
 only one that needs the internet. It restarts gpsd (section 11) and chrony
@@ -413,6 +414,35 @@ after an OLA reset (ZED-F9P, HPG 1.51, protocol 27.50):
   `sudo systemctl daemon-reload`.
 - **An alternative in hardware:** a clock battery on the Pi 5's J5 connector
   would keep the right time across power-offs and make fake-hwclock a fallback.
+
+### 14. Radar manager: unit installed, `radarctl` linked; not enabled, not started
+
+- **What:** `systemd/radar-manager.service` copied to `/etc/systemd/system/`, and the link
+  `/usr/local/bin/radarctl` -> `bin/radarctl` in the repository. **The unit is not enabled and
+  not started by the script**, and a running manager is never restarted or stopped (a restart
+  stops a running radar). The first start is done by hand with the radar under supervision:
+  `radar_runner/manager/README.md`, "First start with the real radar". After that:
+  `sudo systemctl enable --now radar-manager`.
+- **Why and how it works:** `radar_runner/manager/README.md`. The unit's stop hook
+  (`bin/radar-manager-stop-hook`) runs the make-amplifier-safe tool after the manager has
+  stopped or died, if the record `/var/lib/radar-runner/user/sdr-state` does not say `safe`.
+- **Not applied, printed only: the power service's hooks.** The script prints the two lines for
+  `[hooks]` in `/etc/radar-runner/power.toml` (`stop_radar`: `radarctl stop --interrupt --wait
+  --timeout 4` with a 5 s limit; `amp_safe`: `tools/sdr_gpio_safe/amp_safe --timeout 20
+  --state-file /var/lib/radar-runner/user/sdr-state` with a 22 s limit; both through
+  `setpriv`, so that root never runs a file from the user's checkout). Put them in by hand
+  when the manager has passed its first start, then `sudo systemctl restart radar-power`
+  (on the bench, with nothing at stake: a restart of the power service is itself a change
+  to review). Worst case of the shutdown sequence with these limits: commit at about 10 s,
+  then 5 + 1 s, 22 + 1 s, sync 5 s, record 3 s: the power-off command at about 47 s
+  after the loss, against about 58 s of capacitor at room temperature (not measured cold).
+  The normal case is far shorter: the radar is gone in under a second and the tool takes
+  3.5 s when the SDR has been used since power-up.
+- **Also needed by hand before the first start:** `/etc/radar-runner/radar.yaml` (the ORCA
+  config to run) and the unit's limits (`manager.limits` in `/etc/radar-runner/local.yaml`).
+- **Verify:** `setup/check.py` (section "setup.sh: radar manager"); `radarctl status`.
+- **Revert:** `sudo systemctl disable --now radar-manager; sudo rm /etc/systemd/system/radar-manager.service /usr/local/bin/radarctl && sudo systemctl daemon-reload`.
+  Collections on the data drive and the files in `/var/lib/radar-runner/user/` stay.
 
 ## Deferred to later stages (not done by `setup.sh`)
 

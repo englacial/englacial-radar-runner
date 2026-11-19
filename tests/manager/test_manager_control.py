@@ -296,7 +296,7 @@ def test_defaults_that_the_measurements_on_this_hardware_set():
     # The radar's first start loads firmware and FPGA (14 s) before its own set-up.
     assert m["orca"]["start_timeout_s"] >= 45.0
     assert m["gates"]["sdr"]["bootloader_product"] == "WestBridge" and m["gates"]["sdr"]["min_speed_mbps"] == 5000
-    assert m["gates"]["watcher"] == {"status_file": "", "max_age_s": 5.0, "require_true": ["ok"],
+    assert m["gates"]["watcher"] == {"status_file": "-", "max_age_s": 5.0, "require_true": ["ok"],
                                      "require_false": ["tripped"], "reason_field": "reason"}
     assert m["gates"]["telemetry"]["require_true"] == ["amp.fresh"]
     assert "log_max_mb" not in m["data"]                    # the radar's output is never cut

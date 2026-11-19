@@ -43,7 +43,8 @@ class Manager(Service):
         self._next_tool = 0.0
         self.socket_path = os.path.join(config["paths"]["run_dir"], control.SOCKET_NAME)
         self.event_log = control.EventLog(
-            self.cfg["events"]["file"] or os.path.join(config["paths"]["state_dir"], "manager-events.jsonl"),
+            os.path.join(config["paths"]["state_dir"], "manager-events.jsonl")
+            if self.cfg["events"]["file"] in ("-", "") else self.cfg["events"]["file"],
             self.cfg["events"]["max_mb"] * 1e6)
         self._next_gates = 0.0
         self._next_status = 0.0

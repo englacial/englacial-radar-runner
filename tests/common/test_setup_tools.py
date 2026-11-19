@@ -229,7 +229,11 @@ def test_check_script_runs_and_reports_every_item():
                  "GPS receiver on USB", "GPS receiver known to gpsd, once", "radar-telemetry.service unit file",
                  "sensor log directory on the data drive", "telemetry status file", "chrony package",
                  "fake-hwclock package", "systemd-timesyncd removed", "chrony.service",
-                 "chrony steps the clock at any time", "fake-hwclock units", "fake-hwclock saves"):
+                 "chrony steps the clock at any time", "fake-hwclock units", "fake-hwclock saves",
+                 # stage 4
+                 "radar-manager.service unit file", "radarctl command", "radar manager answers",
+                 "radar is killed if the manager dies", "front panel pins usable by", "real-time priority for the radar",
+                 "make-amplifier-safe tool", "power service hook stop_radar", "power service hook amp_safe"):
         assert name in r.stdout, name
 
 

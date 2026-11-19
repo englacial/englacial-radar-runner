@@ -121,17 +121,17 @@ DEFAULTS = {
         },
 
         "gates": {
-            # Status file of the telemetry service. "" = <paths.run_dir>/telemetry.json
+            # Status file of the telemetry service. "-" = <paths.run_dir>/telemetry.json
             "telemetry": {
-                "status_file": "",
+                "status_file": "-",
                 "max_age_s": 3.0,
                 "require_true": ["amp.fresh"],      # dotted paths that must be true
                 "require_false": [],                # dotted paths that must be false
                 "reason_field": "amp.reason",       # shown when a requirement fails
             },
-            # Status file of the safety watcher (stage 3; format not final). "" = <paths.run_dir>/watcher.json
+            # Status file of the safety watcher: at least ok, tripped and reason. "-" = <paths.run_dir>/watcher.json
             "watcher": {
-                "status_file": "",
+                "status_file": "-",
                 "max_age_s": 5.0,
                 "require_true": ["ok"],
                 "require_false": ["tripped"],
@@ -259,7 +259,7 @@ DEFAULTS = {
         },
 
         "events": {
-            "file": "",                         # "" = <paths.state_dir>/manager-events.jsonl
+            "file": "-",                        # "-" = <paths.state_dir>/manager-events.jsonl
             "max_mb": 5.0,                      # then the file is renamed to .1 and a new one started
         },
     },

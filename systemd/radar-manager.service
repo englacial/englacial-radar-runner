@@ -1,5 +1,6 @@
 # Radar manager: starts and stops the radar (button, radarctl, later GPS motion).
-# Documentation: radar_runner/manager/README.md. NOT INSTALLED YET (stage 4).
+# Documentation: radar_runner/manager/README.md. Installed by setup/setup.sh, which never
+# enables or starts it: the first start is done by hand with the radar under supervision.
 
 [Unit]
 Description=Radar manager (starts and stops the radar; button, LEDs, radarctl)

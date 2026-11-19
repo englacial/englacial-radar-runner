@@ -696,3 +696,109 @@ def test_apt_runs_without_prompts_and_without_needrestart(system):
     text = open(SETUP).read()
     assert "DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1" in text
     assert "autoremove" not in text and "dist-upgrade" not in text and "apt-get upgrade" not in text
+
+
+# ---- the radar manager (stage 4): installed, never enabled or started
+
+MANAGER = "radar-manager.service"
+RADARCTL_LINK = "/usr/local/bin/radarctl"
+RADARCTL_TARGET = "/home/englacial/englacial-radar-runner/bin/radarctl"
+
+
+def test_manager_unit_is_installed_but_not_enabled_or_started(system):
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert filecmp.cmp(os.path.join(REPO, "systemd", MANAGER), system.path(f"/etc/systemd/system/{MANAGER}"),
+                       shallow=False)
+    assert system.mode(f"/etc/systemd/system/{MANAGER}") == 0o644
+    assert not [c for c in system.log if "radar-manager" in c]          # no enable, no start, nothing
+    assert MANAGER not in system.state["enabled"] and MANAGER not in system.state["active"]
+    assert "It is NOT enabled and NOT started by this script" in r.stdout
+    assert "First start with the real radar" in r.stdout
+    assert log_index(system, "systemctl daemon-reload") >= 0            # systemd is told about the new unit
+
+
+def log_index(system, command):
+    return system.log.index(command) if command in system.log else -1
+
+
+def test_radarctl_is_linked_into_usr_local_bin(system):
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert os.readlink(system.path(RADARCTL_LINK)) == RADARCTL_TARGET
+    assert f"CHANGE   link {RADARCTL_LINK} -> {RADARCTL_TARGET}" in r.stdout
+    r = system.run()
+    assert f"ok       {RADARCTL_LINK} points to {RADARCTL_TARGET}" in r.stdout
+    assert "radar-manager.service is in place" in r.stdout
+
+
+def test_radarctl_link_to_another_place_is_corrected_and_a_plain_file_is_refused(system):
+    link = system.path(RADARCTL_LINK)
+    link.parent.mkdir(parents=True)
+    os.symlink("/somewhere/else/radarctl", link)
+    r = system.run()
+    assert r.returncode == 0 and "points to /somewhere/else/radarctl" in r.stdout
+    assert os.readlink(link) == RADARCTL_TARGET
+    link.unlink()
+    link.write_text("#!/bin/sh\n")
+    r = system.run()
+    assert r.returncode == 1 and f"{RADARCTL_LINK} exists and is not a link" in r.stderr
+    assert link.read_text() == "#!/bin/sh\n"
+
+
+def test_manager_step_in_a_dry_run(system):
+    r = system.run("--dry-run")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"WOULD    install /etc/systemd/system/{MANAGER}" in r.stdout
+    assert f"WOULD    link {RADARCTL_LINK} -> {RADARCTL_TARGET}" in r.stdout
+    assert not system.path(RADARCTL_LINK).is_symlink() and not system.path(f"/etc/systemd/system/{MANAGER}").exists()
+
+
+def test_running_manager_is_never_restarted_stopped_or_disabled(system):
+    assert system.run().returncode == 0
+    system.set(enabled=system.state["enabled"] + [MANAGER], active=system.state["active"] + [MANAGER])   # by hand
+    system.path(f"/etc/systemd/system/{MANAGER}").write_text("[Unit]\nDescription=old\n")
+    system.set(log=[])
+    r = system.run()
+    assert r.returncode == 0 and f"replace /etc/systemd/system/{MANAGER}" in r.stdout
+    assert "the running manager keeps the old unit until it is restarted" in r.stdout
+    assert "radar-manager.service is enabled and running (not restarted)" in r.stdout
+    assert system.log == ["systemctl daemon-reload"]
+    assert MANAGER in system.state["enabled"] and MANAGER in system.state["active"]
+
+
+def test_power_service_hooks_are_printed_not_applied(system):
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = " ".join(r.stdout.split())
+    # Printed for the user to put into /etc/radar-runner/power.toml ...
+    assert "The power service's hooks are not changed by this script" in out
+    assert ('stop_radar = ["/usr/bin/setpriv", "--reuid=englacial", "--regid=englacial", "--init-groups", '
+            '"--reset-env", "/usr/bin/python3", "-B", "-E", "-s", '
+            '"/home/englacial/englacial-radar-runner/radar_runner/manager/radarctl.py", '
+            '"stop", "--interrupt", "--wait", "--timeout", "4"]') in out
+    assert "stop_radar_timeout_s = 5.0" in out
+    assert ('amp_safe = ["/usr/bin/setpriv", "--reuid=englacial", "--regid=englacial", "--init-groups", '
+            '"--reset-env", "/home/englacial/englacial-radar-runner/tools/sdr_gpio_safe/amp_safe", '
+            '"--timeout", "20", "--state-file", "/var/lib/radar-runner/user/sdr-state"]') in out
+    assert "amp_safe_timeout_s = 22.0" in out
+    # ... and the installed config is the repository's, with no hook set.
+    config = system.path("/etc/radar-runner/power.toml").read_text()
+    assert "stop_radar = []" in config and "amp_safe = []" in config and "setpriv" not in config
+
+
+def test_printed_hook_limits_are_longer_than_the_commands_own_timeouts(system):
+    import re
+    import tomllib
+    out = system.run().stdout
+    block = out[out.index("stop_radar = ["):out.index("(each hook's limit")]
+    block = block[:block.rindex("\n")]
+    hooks = tomllib.loads(block)
+    for name in ("stop_radar", "amp_safe"):
+        argv = hooks[name]
+        own = float(argv[argv.index("--timeout") + 1])
+        assert hooks[f"{name}_timeout_s"] > own, name
+        assert argv[0] == "/usr/bin/setpriv" and "--reset-env" in argv      # root never runs a user's file directly
+    assert re.search(r"amp_safe\b", hooks["amp_safe"][5])
+    assert os.path.exists(os.path.join(REPO, "tools", "sdr_gpio_safe", "amp_safe"))
+    assert os.path.exists(os.path.join(REPO, "radar_runner", "manager", "radarctl.py"))

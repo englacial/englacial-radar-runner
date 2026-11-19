@@ -1,0 +1,35 @@
+--- a/sdr/main.cpp
++++ b/sdr/main.cpp
+@@ -295,12 +295,24 @@
+   cout << "Reading from config file: " << yaml_filename << endl;
+   cout_mutex.unlock();
+ 
++  // Catch SIGINT from the start. With the default action, a stop during the
++  // device setup below kills the program between UHD's own GPIO initialization
++  // (all front panel pins low) and setupGpio(), with the amp pin at its "on" level
++  signal(SIGINT, &sig_int_handler);
++
+   Sdr sdr(yaml_filename);
+   Chirp chirp(yaml_filename);
+   YAML::Node config = YAML::LoadFile(yaml_filename);
+   sdr.createUsrp();
+   sdr.setupUsrp();
+ 
++  if (stop_signal_called) {
++    cout_mutex.lock();
++    cout << "[RX] stop signal called during device setup -> exiting" << endl;
++    cout_mutex.unlock();
++    return EXIT_SUCCESS;
++  }
++
+   //YAML::Node rf0 = config["RF0"];
+  // YAML::Node rf1 = config["RF1"];
+ 
+@@ -326,7 +338,6 @@
+ 
+   set_thread_priority_safe(1.0, true);
+   
+-  signal(SIGINT, &sig_int_handler);
+ 
+   /*** VERSION INFO ***/
+ 

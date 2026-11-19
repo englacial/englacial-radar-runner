@@ -60,9 +60,9 @@ The decisions are the pure functions `known_safe_after_exit`, `after_exit` and
 import os
 import time
 
-from radar_runner.common.status import boottime_s, read_status, status_path
+from radar_runner.common.status import boottime_s, read_status
 
-from .gates import StatusFileGate, _lookup
+from .gates import StatusFileGate, _lookup, status_file
 
 SAFE, UNKNOWN = "safe", "unknown"
 STATE_FILE = "sdr-state"
@@ -187,8 +187,7 @@ class AmpTelemetry:
         m = config["manager"]
         gate_cfg = m["gates"]["telemetry"]
         self.cfg = m["amp_safe"]
-        self._gate = StatusFileGate("telemetry", gate_cfg["status_file"]
-                                    or status_path("telemetry", config["paths"]["run_dir"]),
+        self._gate = StatusFileGate("telemetry", status_file(gate_cfg, "telemetry", config["paths"]["run_dir"]),
                                     gate_cfg, "amplifier telemetry", read)
         self._read, self._uptime, self._monotonic, self._sleep = read, uptime, monotonic, sleep
 

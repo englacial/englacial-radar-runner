@@ -345,15 +345,20 @@ class AmpSafeGate:
 
 # ----------------------------------------------------------------------- assembly
 
+def status_file(gate_cfg, service, run_dir):
+    """The status file a gate reads: its `status_file` setting, or ("-") <run_dir>/<service>.json."""
+    path = gate_cfg["status_file"]
+    return status_path(service, run_dir) if path in ("-", "") else path
+
+
 def build(config, overrides):
     """The gates for a loaded config (the whole config, with the `manager` section)."""
     m = config["manager"]
     g = m["gates"]
     run_dir = config["paths"]["run_dir"]
     return [
-        TelemetryGate(g["telemetry"]["status_file"] or status_path("telemetry", run_dir), g["telemetry"], overrides),
-        StatusFileGate("watcher", g["watcher"]["status_file"] or status_path("watcher", run_dir), g["watcher"],
-                       "safety watcher"),
+        TelemetryGate(status_file(g["telemetry"], "telemetry", run_dir), g["telemetry"], overrides),
+        StatusFileGate("watcher", status_file(g["watcher"], "watcher", run_dir), g["watcher"], "safety watcher"),
         PowerGate(config["paths"]["power_status_file"], g["power"]["max_age_s"]),
         DataGate(g["data"]),
         SdrGate(g["sdr"]),
