@@ -26,6 +26,7 @@ UPDATE_UNITS = ["apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrad
                 "fwupd-refresh.timer", "rpi-eeprom-update.service"]
 POWER = "radar-power.service"
 TELEMETRY = "radar-telemetry.service"
+WATCHER = "radar-watcher.service"
 GPSD_DROP_IN = "etc/systemd/system/gpsd.service.d/radar-runner.conf"
 TIME_FILES = ["etc/chrony/conf.d/radar-runner.conf", "etc/systemd/system/chrony.service.d/radar-runner.conf",
               "etc/systemd/system/fake-hwclock-save.timer.d/radar-runner.conf"]
@@ -698,6 +699,52 @@ def test_apt_runs_without_prompts_and_without_needrestart(system):
     assert "autoremove" not in text and "dist-upgrade" not in text and "apt-get upgrade" not in text
 
 
+# ---- the safety watcher
+
+def test_watcher_service_is_installed_and_enabled_but_not_started(system):
+    r = system.run("--dry-run")
+    assert r.returncode == 0 and "WOULD    run: systemctl enable radar-watcher.service" in r.stdout
+    assert WATCHER not in system.state["enabled"]
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "systemctl enable radar-watcher.service" in system.log
+    assert not [c for c in system.log if "radar-watcher" in c and ("--now" in c or "start" in c)]
+    assert WATCHER in system.state["enabled"] and WATCHER not in system.state["active"]     # the first start is the user's
+    assert filecmp.cmp(os.path.join(REPO, "systemd", "radar-watcher.service"),
+                       system.path("/etc/systemd/system/radar-watcher.service"), shallow=False)
+    assert system.mode("/etc/systemd/system/radar-watcher.service") == 0o644
+    assert "radar-watcher.service is NOT RUNNING, and this script does not start it" in r.stdout
+    assert "sudo systemctl start radar-watcher" in r.stdout
+    assert "sudo systemctl stop radar-watcher radar-telemetry" in r.stdout      # the two units to stop for bench sessions
+    # Whether the reset tool is built is said either way; it does not stop the step.
+    assert ("the SDR GPIO reset tool is built" in r.stdout) != ("the SDR GPIO reset tool is NOT built" in r.stdout)
+    # After the telemetry service, before the step that needs the internet.
+    log = system.log
+    assert (log.index("systemctl enable --now radar-telemetry.service")
+            < log.index("systemctl enable radar-watcher.service") < log.index(APT_INSTALL))
+    system.set(log=[])
+    r = system.run()                                # again: still not started, and said again
+    assert "radar-watcher.service is enabled (runs from boot)" in r.stdout
+    assert "radar-watcher.service is NOT RUNNING" in r.stdout and not [c for c in system.log if "watcher" in c]
+
+
+def test_running_watcher_is_never_restarted_or_stopped(system):
+    assert system.run().returncode == 0
+    system.set(active=system.state["active"] + [WATCHER])      # the user has started it
+    system.path("/etc/systemd/system/radar-watcher.service").write_text("[Unit]\nDescription=old\n")
+    system.set(log=[])
+    r = system.run()
+    assert r.returncode == 0 and "replace /etc/systemd/system/radar-watcher.service" in r.stdout
+    assert "keeps the old unit until it is restarted: systemctl restart radar-watcher" in r.stdout
+    assert "radar-watcher.service is running (not restarted)" in r.stdout and "NOT RUNNING" not in r.stdout
+    assert system.log == ["systemctl daemon-reload"]
+    system.set(active=[u for u in system.state["active"] if u != WATCHER], masked=system.state["masked"] + [WATCHER],
+               log=[])
+    r = system.run()
+    assert "radar-watcher.service is masked: left as it is" in r.stdout and "NOT RUNNING" not in r.stdout
+    assert not [c for c in system.log if "watcher" in c]
+
+
 # ---- the radar manager (stage 4): installed, never enabled or started
 
 MANAGER = "radar-manager.service"
@@ -810,3 +857,13 @@ def test_printed_hook_limits_are_longer_than_the_commands_own_timeouts(system):
     assert command_at <= 38.0 and command_at + 10.0 <= 48.0
     assert os.path.exists(os.path.join(REPO, "tools", "sdr_gpio_safe", "amp_safe"))
     assert os.path.exists(os.path.join(REPO, "radar_runner", "manager", "radarctl.py"))
+
+
+def test_after_setup_the_watcher_is_enabled_the_manager_is_not_and_neither_is_started(system):
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    state = system.state
+    for unit in (WATCHER, MANAGER):
+        assert system.path(f"/etc/systemd/system/{unit}").is_file() and unit not in state["active"]
+    assert WATCHER in state["enabled"] and MANAGER not in state["enabled"]
+    assert not [c for c in system.log if ("radar-watcher" in c or "radar-manager" in c) and ("start" in c or "--now" in c)]

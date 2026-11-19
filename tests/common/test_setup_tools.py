@@ -230,6 +230,8 @@ def test_check_script_runs_and_reports_every_item():
                  "sensor log directory on the data drive", "telemetry status file", "chrony package",
                  "fake-hwclock package", "systemd-timesyncd removed", "chrony.service",
                  "chrony steps the clock at any time", "fake-hwclock units", "fake-hwclock saves",
+                 # stage 3
+                 "radar-watcher.service unit file", "SDR GPIO reset tool", "safety watcher status file",
                  # stage 4
                  "radar-manager.service unit file", "radarctl command", "radar manager answers",
                  "radar is killed if the manager dies", "front panel pins usable by", "real-time priority for the radar",

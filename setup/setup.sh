@@ -515,6 +515,54 @@ step_telemetry_service() {
     esac
 }
 
+# (l) The safety watcher: the unit is installed and enabled, so that it runs
+# from the next boot. It is NOT started here: its first start is the user's,
+# under supervision, because from then on it may run the SDR GPIO reset tool
+# (which enables the amplifier for half a second) and stops radar processes.
+# It needs no directory of its own (status in /run/radar-runner/user, event log
+# in /var/lib/radar-runner/user). A running watcher is never restarted or stopped.
+step_watcher_service() {
+    step "Safety watcher unit"
+    local unit=/etc/systemd/system/radar-watcher.service enabled active
+    [ "$REPO" = "$UNIT_REPO" ] || [ -n "$DESTDIR" ] ||
+        die "the unit file expects this repository at $UNIT_REPO, but it is at $REPO"
+    [ -n "$DESTDIR" ] || [ -x "$REPO/.venv/bin/python" ] ||
+        die "the Python environment is missing: run setup/build_venv.sh as $SERVICE_USER first"
+    if [ -x "$REPO/tools/sdr_gpio_safe/build/sdr_gpio_safe" ]; then
+        ok "the SDR GPIO reset tool is built (tools/sdr_gpio_safe/build/sdr_gpio_safe)"
+    else
+        note "the SDR GPIO reset tool is NOT built: the watcher will run, but it cannot put an amplifier that was"
+        note "left enabled back into shutdown. Build it as $SERVICE_USER (tools/sdr_gpio_safe/README.md, \"Build\")."
+    fi
+    put_file "$REPO/systemd/radar-watcher.service" "$unit" 0644
+    [ "$CHANGED" -eq 0 ] || RELOAD_NEEDED=1
+    enabled=$(systemctl is-enabled radar-watcher.service 2>/dev/null || true)
+    active=$(systemctl is-active radar-watcher.service 2>/dev/null || true)
+    if [ "$CHANGED" -eq 1 ] && [ "$active" = active ]; then
+        note "the running service keeps the old unit until it is restarted: systemctl restart radar-watcher"
+    fi
+    case "$enabled" in
+        enabled)
+            ok "radar-watcher.service is enabled (runs from boot)" ;;
+        masked)
+            note "radar-watcher.service is masked: left as it is" ;;
+        *)
+            log "           radar-watcher.service is ${enabled:-not enabled}, ${active:-not running}"
+            reload_systemd
+            run systemctl enable radar-watcher.service ;;
+    esac
+    if [ "$active" = active ]; then
+        ok "radar-watcher.service is running (not restarted)"
+    elif [ "$enabled" != masked ]; then
+        note "radar-watcher.service is NOT RUNNING, and this script does not start it. It starts at the next boot;"
+        note "to start it now, with someone watching the amplifier:   sudo systemctl start radar-watcher"
+        note "Once it runs it may run the SDR GPIO reset tool (the amplifier is enabled for about 0.5 s), and it"
+        note "stops every radar process while its status is not ok. BENCH SESSIONS with pa_guard.py, pa_run.py or"
+        note "the HIL harness: stop both units first, or every bench radar is stopped:"
+        note "    sudo systemctl stop radar-watcher radar-telemetry     (radar_runner/watcher/README.md, \"Bench work\")"
+    fi
+}
+
 # (k) The radar manager (stage 4): its unit and the radarctl command.
 # The unit is installed but NEVER enabled or started here: the first start is
 # done by hand with the radar under supervision (radar_runner/manager/README.md,
@@ -754,6 +802,7 @@ step_watchdog
 step_power_service
 step_gpsd
 step_telemetry_service
+step_watcher_service
 step_manager
 [ "$OPT_NVME" -eq 0 ] || optional_nvme_by_label
 [ "$OPT_HOLD" -eq 0 ] || optional_hold_packages

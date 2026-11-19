@@ -84,6 +84,60 @@ telemetry:
     receiver_fix_command: "/usr/bin/python3 -B /home/englacial/englacial-radar-runner/setup/gps_receiver.py --apply --ram"
     receiver_fix_delay_s: 15.0
 
+# Safety watcher: stops the radar and resets the SDR GPIO on unsafe amplifier readings.
+# The rules, and where each number comes from: radar_runner/watcher/README.md
+watcher:
+  loop_interval_s: 0.5        # how often everything is looked at and /run/radar-runner/user/watcher.json rewritten
+                              # (the telemetry service publishes a new reading every 0.5 s)
+  # A process with this executable is a radar process. "manager": the binary that the radar manager
+  # runs (manager.orca: dir/radar_cwd/radar_command), so that the two cannot diverge; or a full path.
+  radar_exe: manager
+  telemetry_status_file: telemetry.json       # the telemetry service's status: a file name in paths.run_dir, or a full path
+  # The next two and reset.state_file: a file name in paths.state_dir, or a full path.
+  override_file: override-no-amp-telemetry    # the user's "run without amplifier telemetry" (radarctl override no-amp-telemetry on)
+  events_file: watcher-events.jsonl           # the event log: trips, clears, actions and their results
+  events_max_mb: 5.0          # then the file is renamed to .1 and a new one started
+  telemetry_lost_s: 3.0       # no usable amplifier reading for this long: not ok (the radar may not run)
+  require_case_temp: true     # a reading without the case temperature (TMP117) is not usable
+  # A limit trips when trip_samples of the last trip_window readings are beyond it and those span
+  # trip_span_s (one damaged reading does nothing, and one good reading in between does not hide a
+  # fault). It clears only after clear_hold_s of readings on the good side of the recover level.
+  trip_samples: 3
+  trip_window: 5
+  trip_span_s: 1.0
+  clear_hold_s: 30.0
+  temp_warn_c: 50.0           # amplifier sensor or case sensor: warning
+  temp_trip_c: 55.0           # stop the radar
+  temp_clear_c: 50.0          # the stop clears below this
+  voltage_min_v: 26.0         # 28 V rail while the amplifier is powered: stop outside these two
+  voltage_max_v: 30.5
+  voltage_recover_margin_v: 0.5   # the stop clears this far inside the two limits (26.5-30.0 V)
+  unpowered_below_v: 20.0     # below this the amplifier is unpowered: no trip and no action, but not ok
+  allow_unpowered: false      # true: an unpowered amplifier is ok (bench work with the 28 V off). PER UNIT
+  enabled_current_a: 0.5      # above this the amplifier is enabled (shutdown 0.156 A, enabled about 2.5 A)
+  idle_enabled_s: 5.0         # enabled for this long with no radar process: run the reset tool
+  reset:
+    command: /home/englacial/englacial-radar-runner/tools/sdr_gpio_safe/amp_safe
+    timeout_s: 30.0           # amp_safe --timeout (a first contact after power-up took 16.7 s)
+    kill_margin_s: 5.0        # amp_safe is given up on this long after its own timeout
+    state_file: sdr-state     # amp_safe --state-file: the record shared with the radar manager
+    retry_prompt_s: 2.0       # wait before the next run after ASSUME_ENABLED (exit 3)
+    retry_s: 5.0              # wait after any other result, while the amplifier stays enabled
+    stuck_after_attempts: 3   # still enabled after this many runs: "stuck enabled", urgent
+    stuck_retry_s: 60.0       # while stuck: one run this often (each run is an enable pulse)
+    blocked_after_s: 30.0     # the tool cannot run at all (BUSY, NOT_FOUND, ...) for this long: urgent
+    blocked_retry_s: 15.0     # ... and then one try this often (such a try is no enable pulse)
+    blind_delay_s: 20.0       # no telemetry and no radar for this long, and the pin not known safe: run the tool
+    blind_retry_s: 300.0      # ... and again this often while that lasts
+  stop_grace_s: 5.0           # not ok for this long with a radar process still alive: SIGINT to it
+                              # (seconds not ok count up, seconds ok count down: flapping does not restart it)
+  radar_setup_s: 65.0         # a radar process younger than this is never signalled: it may be setting up the
+                              # SDR (17 s at a first contact), and dying there leaves the amplifier enabled.
+                              # Longer than manager.orca.start_timeout_s + stop_timeout_s (60 s + 3 s): until
+                              # then the stop is the manager's, which waits for ORCA's start line
+  radar_exit_s: 5.0           # still alive this long after SIGINT: SIGKILL
+  kill_retry_s: 5.0           # still alive: SIGKILL again this often
+
 # Radar manager: starts and stops the radar (button, radarctl, later GPS motion)
 # behind the safety gates. States, gates, faults and files: radar_runner/manager/README.md
 # Values marked PER UNIT depend on the hardware of one unit: set them in

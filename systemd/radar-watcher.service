@@ -1,0 +1,47 @@
+# Radar safety watcher: watches the amplifier readings, stops the radar and
+# resets the SDR GPIO when they are unsafe, and publishes
+# /run/radar-runner/user/watcher.json for the radar manager.
+# Documentation, and how to stop it for bench work: radar_runner/watcher/README.md
+
+[Unit]
+Description=Radar safety watcher (amplifier limits, stuck-enabled recovery)
+Documentation=file:///home/englacial/englacial-radar-runner/radar_runner/watcher/README.md
+# Started once the local file systems are mounted. It needs nothing else and
+# is ordered after nothing else: not the radar manager (which it must work
+# without), not the telemetry service, not the power service, not the data
+# drive, not the network. While the telemetry service is not there its status
+# says so, and the radar may not run.
+After=local-fs.target
+# No start-rate limit: systemd never gives up restarting it.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=englacial
+Group=englacial
+WorkingDirectory=/home/englacial/englacial-radar-runner
+# -B: no __pycache__ in the checkout. -u: unbuffered output.
+ExecStart=/home/englacial/englacial-radar-runner/.venv/bin/python -B -u -m radar_runner.watcher
+Restart=always
+RestartSec=1
+# The loop pings at least once a second. No ping for 15 s: kill it and restart.
+# (Its status file is treated as "not ok" by the manager after 5 s already.)
+WatchdogSec=15
+WatchdogSignal=SIGKILL
+TimeoutStartSec=30
+TimeoutStopSec=10
+# Only the watcher itself is ever signalled by systemd, at a stop, a restart
+# and a watchdog kill alike. The SDR GPIO reset tool that it may have started
+# is left to finish (at most 30 s): killing that tool while it initialises the
+# SDR would leave the amplifier enabled.
+KillMode=process
+# It must keep running when the Pi is busy or short of memory. It uses well
+# under one percent of one core, so the higher priority costs the radar nothing.
+# No real-time class: at two short rounds a second it does not need one, and
+# a real-time process that went wrong could hold a core.
+Nice=-5
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target
