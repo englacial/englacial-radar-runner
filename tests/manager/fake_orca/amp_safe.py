@@ -7,8 +7,10 @@ success; with --state-file it writes "unknown" to that file before it starts and
 "safe" after an OK (first line the word, free text after; temp file, fsync, rename).
 
 Control file key "amp_safe": an exit status (3 = ASSUME_ENABLED, 2 = NOT_FOUND, 6 = BUSY,
-4 = TIMEOUT, ...), "hang" (sleep 60 s after writing "unknown"), or a list of statuses
-used one per call, the last one for every later call (e.g. [2, 2, 0]).
+4 = TIMEOUT, ...), "hang" (sleep 60 s after writing "unknown"), "lock" (another caller holds
+the tool: exit 4 without starting it), or a list of these used one per call, the last one for
+every later call (e.g. [2, 2, 0]). As with the real wrapper, a call that never starts the tool
+(lock, 5 FAILED, 8 STATE_FILE, 64 USAGE) leaves the record alone.
 Appends one line per call to the file named by FAKE_AMP_SAFE_LOG, if set.
 """
 import json
@@ -54,6 +56,12 @@ def record(state, why):
 behaviour = control.get("amp_safe", 0)
 if isinstance(behaviour, list):
     behaviour = behaviour[min(calls, len(behaviour) - 1)] if behaviour else 0
+if behaviour == "lock":
+    print("amp_safe: TIMEOUT (exit 4): another run is still going")
+    sys.exit(4)
+if behaviour in (5, 8, 64):
+    print(f"amp_safe: failing with status {behaviour} before the tool was started")
+    sys.exit(behaviour)
 record("unknown", "amp_safe started")
 if behaviour == "hang":
     time.sleep(60)

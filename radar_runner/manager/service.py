@@ -39,7 +39,7 @@ class Manager(Service):
         self.sdr_state = ampsafe.SdrState(config["paths"]["state_dir"])
         self.amp_telemetry = ampsafe.AmpTelemetry(config)
         self.sdr_gate = gates.SdrGate(self.cfg["gates"]["sdr"])
-        self._enabled_since = None              # since when telemetry has said "enabled" with no radar
+        self.enabled_idle = ""                  # telemetry shows enabled current with no radar: the text
         self._next_tool = 0.0
         self.socket_path = os.path.join(config["paths"]["run_dir"], control.SOCKET_NAME)
         self.event_log = control.EventLog(
@@ -163,24 +163,19 @@ class Manager(Service):
     def _keep_sdr_safe(self, now):
         """With no radar process: mark the SDR safe, or run the tool, as ampsafe.idle_need says.
 
-        This covers a manager that starts with the state unknown or with no
-        record, a tool run that did not succeed (retried every retry_s), and
-        enabled current with no radar. The tool runs on the runner's thread.
+        This covers a manager that starts with the record `unknown` or with no
+        record, and a tool run that did not succeed (tried again every
+        retry_s). The tool runs on the runner's thread. Enabled current while
+        the record says `safe` is only shown: the safety watcher acts on it.
         """
         cfg = self.cfg["amp_safe"]
         if self.logic.phase != L.IDLE or self.logic.closing or self.runner.busy:
-            self._enabled_since = None
+            self.enabled_idle = ""
             return
         # Shutdown current counts only in a reading newer than the last radar or tool run.
-        reading, _ = self.amp_telemetry.now(self.runner.last_activity_uptime)
-        if reading is False:
-            if self._enabled_since is None:
-                self._enabled_since = now
-        else:
-            self._enabled_since = None
-        enabled_for = now - self._enabled_since if self._enabled_since is not None else 0.0
-        action, why = ampsafe.idle_need(self.sdr_state.get(), self._sdr_presence(), reading, enabled_for,
-                                        cfg["idle_enabled_s"])
+        reading, text = self.amp_telemetry.now(self.runner.last_activity_uptime)
+        self.enabled_idle = text if reading is False else ""
+        action, why = ampsafe.idle_need(self.sdr_state.get(), self._sdr_presence(), reading)
         if action == "mark_safe":
             error = self.sdr_state.set(ampsafe.SAFE, why)
             self._record({"event": "sdr_state", "state": ampsafe.SAFE, "why": why, "error": error})
@@ -289,6 +284,8 @@ class Manager(Service):
             "sdr_state": self.sdr_state.get(),              # "safe" or "unknown" (ampsafe.py)
             "sdr_state_why": self.sdr_state.why(),
             "making_amp_safe": bool(getattr(self.runner, "making_safe", False)),
+            # "" or the reading: enabled current with no radar process. The safety watcher acts on it.
+            "amp_enabled_while_idle": self.enabled_idle,
             "panel": self.panel.snapshot(),
             "socket": self.socket_path,
             "events": {"file": self.event_log.path, "written": self.event_log.written,

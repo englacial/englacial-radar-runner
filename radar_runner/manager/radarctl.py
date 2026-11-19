@@ -87,6 +87,9 @@ def format_status(s):
         lines.append("override:   RUNNING WITHOUT AMPLIFIER TELEMETRY IS ALLOWED")
     if s.get("sdr_state") == "unknown":
         lines.append(f"sdr:        amplifier pin NOT known to be safe ({s.get('sdr_state_why')})")
+    if s.get("amp_enabled_while_idle"):
+        lines.append(f"sdr:        AMPLIFIER ENABLED WITH NO RADAR RUNNING ({s['amp_enabled_while_idle']}); "
+                     "the safety watcher acts on it")
     if s.get("making_amp_safe"):
         lines.append("sdr:        the make-amplifier-safe tool is running")
     auto = s.get("auto") or {}

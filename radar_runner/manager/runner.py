@@ -233,7 +233,7 @@ class _Run:
 
 
 class Runner:
-    def __init__(self, config, post, *, wall=time.time, turn_on_check=None, boot_number=coll.boot_number,
+    def __init__(self, config, post, *, wall=time.time, turn_on_check=None, boot_number=coll.boot_count,
                  amp_telemetry=None, uptime=boottime_s):
         self.cfg = config["manager"]
         self.state_dir = config["paths"]["state_dir"]

@@ -5,9 +5,12 @@ from collections import namedtuple
 
 import pytest
 
+from radar_runner.common import config as common_config
 from radar_runner.common import status as S
 from radar_runner.manager import ampsafe, gates as G
 from radar_runner.manager.logic import GateResult
+
+MANAGER = common_config.DEFAULTS["manager"]
 
 
 def names(env):
@@ -293,20 +296,42 @@ def test_amp_safe_gate_refuses_to_run_without_the_command(env):
     assert "is not an executable file" in check(env, "amp_safe").start
 
 
-def test_default_config_is_not_ready_until_the_tool_and_the_radar_config_exist():
-    from radar_runner.manager.config import MANAGER_DEFAULTS
-    assert MANAGER_DEFAULTS["amp_safe"]["command"][0].endswith("tools/sdr_gpio_safe/amp_safe")
-    assert MANAGER_DEFAULTS["amp_safe"]["policy"] == "when_needed"
-    assert MANAGER_DEFAULTS["limits"]["max_tx_gain"] == 43.0        # the conservative default
+def test_amp_safe_gate_checks_the_time_limits(env):
+    # The tool's own --timeout is mandatory, and the manager must not kill the tool before it:
+    # a kill inside the tool's initialisation leaves the amplifier enabled.
+    cfg = env.config["manager"]["amp_safe"]
+    tool = cfg["command"][:2]
+    cfg["command"] = tool
+    assert "needs --timeout N" in check(env, "amp_safe").start
+    cfg["command"] = tool + ["--timeout", "soon"]
+    assert "needs --timeout N" in check(env, "amp_safe").start
+    cfg["command"] = tool + ["--timeout", "30"]
+    cfg["timeout_s"] = 30.0
+    assert check(env, "amp_safe").start == ("manager.amp_safe.timeout_s (30 s) must be longer than the tool's "
+                                            "--timeout (30 s)")
+    cfg["timeout_s"] = 40.0
+    assert check(env, "amp_safe") == GateResult()
+
+
+def test_sdr_identity_as_measured_on_this_hardware(env):
+    # Before the firmware load: 2500:0023 "WestBridge" at 480. After: still 2500:0023, at 5000,
+    # with another (here empty) product text. The product ID does not change.
+    env.sdr(speed=480, product="WestBridge", pid="0023")
+    assert "firmware not loaded yet" in check(env, "sdr").note
+    env.sdr(speed=5000, product="", pid="0023")
+    assert check(env, "sdr") == GateResult(note="USB 4-1, 5000 Mbit/s")
+    env.sdr(speed=480, product="", pid="0023")              # firmware loaded, but on a USB 2 link
+    assert check(env, "sdr").start == "SDR on a USB 2 link (480 Mbit/s at 4-1)"
 
 
 # ------------------------------------------- amp-safe: the three decisions (pure functions)
 
 CLEAN = {"reached_running": True, "killed": False, "exit_status": 0, "failure": ""}
 KILLED = {**CLEAN, "killed": True, "exit_status": -9}
-NO_READING = (None, "no fresh amplifier reading after the exit")
-SHUTDOWN = (True, "amplifier current 0.16 A at 28.0 V")
-ENABLED = (False, "amplifier current 2.50 A at 27.5 V")
+EARLY = {**CLEAN, "reached_running": False, "exit_status": -2, "signalled_before_start": True}
+NO_READING = lambda: (None, "no fresh amplifier reading after the exit")       # noqa: E731
+SHUTDOWN = lambda: (True, "amplifier current 0.16 A at 28.0 V")                # noqa: E731
+ENABLED = lambda: (False, "amplifier current 2.50 A at 27.5 V")                # noqa: E731
 
 
 def never():
@@ -319,7 +344,8 @@ def never():
     ({"exit_status": 1}, "the radar exited with status 1"),
     ({"exit_status": -9}, "the radar exited with status -9"),
     ({"exit_status": None}, "the radar exited with status None"),
-    ({"failure": "the radar reports the SDR on a USB 2 link"}, "failure: the radar reports the SDR on a USB 2 link"),
+    ({"failure": "the SDR is on a USB 2 link"}, "failure: the SDR is on a USB 2 link"),
+    ({"signalled_before_start": True}, "the radar was signalled before its start line, in the middle of the SDR set-up"),
 ])
 def test_what_counts_as_an_unclean_radar_exit(change, why):
     assert ampsafe.unclean({**CLEAN, **change}) == why
@@ -337,98 +363,109 @@ def test_not_known_safe_after_an_unclean_exit_without_telemetry():
 
 
 @pytest.mark.parametrize("facts", [CLEAN, KILLED, {**CLEAN, "reached_running": False}, {**CLEAN, "exit_status": 3}])
-def test_a_fresh_reading_with_the_28_v_present_decides_whatever_the_history(facts):
+def test_a_qualifying_reading_decides_whatever_the_history(facts):
     assert ampsafe.known_safe_after_exit(facts, SHUTDOWN) == (True, "telemetry: amplifier current 0.16 A at 28.0 V")
     known, why = ampsafe.known_safe_after_exit(facts, ENABLED)
     assert not known and "telemetry shows the amplifier enabled" in why
 
 
-def test_decide_when_needed_runs_the_tool_only_when_not_known_safe():
-    assert ampsafe.decide("when_needed", CLEAN, lambda: NO_READING)[:2] == (False, True)
-    assert ampsafe.decide("when_needed", CLEAN, lambda: SHUTDOWN)[:2] == (False, True)
-    assert ampsafe.decide("when_needed", CLEAN, lambda: ENABLED)[:2] == (True, False)
-    assert ampsafe.decide("when_needed", KILLED, lambda: NO_READING)[:2] == (True, False)
-    assert ampsafe.decide("when_needed", KILLED, lambda: SHUTDOWN)[:2] == (False, True)
-    assert ampsafe.decide("when_needed", KILLED, lambda: ENABLED)[:2] == (True, False)
+def test_a_radar_signalled_before_its_start_line_is_never_trusted():
+    # It has no SIGINT handler until then: it died in the middle of the SDR set-up.
+    known, why = ampsafe.known_safe_after_exit(EARLY, never)
+    assert not known and "in the middle of the SDR set-up" in why
 
 
-def test_decide_always_runs_the_tool_and_judges_by_the_history_alone():
-    run, known, why = ampsafe.decide("always", CLEAN, never)
-    assert run and known and why.startswith("policy always; clean radar exit")
-    run, known, why = ampsafe.decide("always", KILLED, never)
-    assert run and not known
-    run, known, why = ampsafe.decide("sometimes", CLEAN, never)
-    assert run and "unknown policy 'sometimes', treated as always" in why
+def test_after_exit_actions():
+    assert ampsafe.after_exit(CLEAN, NO_READING, "")[0] == "safe"
+    assert ampsafe.after_exit(CLEAN, SHUTDOWN, "")[0] == "safe"
+    assert ampsafe.after_exit(CLEAN, ENABLED, "")[0] == "run"
+    assert ampsafe.after_exit(KILLED, NO_READING, "")[0] == "run"
+    assert ampsafe.after_exit(KILLED, SHUTDOWN, "")[0] == "safe"
+    assert ampsafe.after_exit(EARLY, never, "")[0] == "run"
 
 
-@pytest.mark.parametrize("status, known_before, expected", [
-    (0, False, ("safe", True)), (0, True, ("safe", True)),
-    (3, True, ("unknown", False)), (3, False, ("unknown", False)),         # ASSUME_ENABLED: never safe
-    (ampsafe.KILLED_BY_CALLER, True, ("unknown", False)),                   # killed half way
-    (2, True, ("safe", True)), (2, False, ("unknown", False)),              # NOT_FOUND: nothing changed
-    (6, True, ("safe", True)), (6, False, ("unknown", False)),              # BUSY
-    (7, False, ("unknown", False)), (4, False, ("unknown", False)), (5, True, ("safe", True)),
-    (64, False, ("unknown", False)), (None, True, ("safe", True)), (None, False, ("unknown", False)),
-    (99, False, ("unknown", False)),
-])
-def test_the_record_after_a_run_of_the_tool(status, known_before, expected):
-    assert ampsafe.after_tool(status, known_before) == expected
+@pytest.mark.parametrize("facts", [CLEAN, KILLED, EARLY])
+def test_after_exit_on_a_power_loss_checks_nothing_and_writes_nothing(facts):
+    action, why = ampsafe.after_exit(facts, never, "the stop came from the power service")
+    assert action == "leave" and "power loss (the stop came from the power service)" in why
 
 
 def test_exit_codes_of_the_tool_are_named():
     assert ampsafe.EXIT_MEANING == {0: "OK", 2: "NOT_FOUND", 3: "ASSUME_ENABLED", 4: "TIMEOUT", 5: "FAILED",
-                                    6: "BUSY", 7: "AMBIGUOUS", 64: "USAGE"}
+                                    6: "BUSY", 7: "AMBIGUOUS", 8: "STATE_FILE", 64: "USAGE"}
+    assert ampsafe.RETRY_LATER == (2, 6, 4)
     assert ampsafe.describe(6) == "status 6 (BUSY)" and ampsafe.describe(None) == "not started"
+    assert ampsafe.describe(8) == "status 8 (STATE_FILE)"
     assert "killed" in ampsafe.describe(ampsafe.KILLED_BY_CALLER) and "not a status of the tool" in ampsafe.describe(1)
-
-
-IDLE = dict(enabled_for_s=0.0, enabled_limit_s=5.0)
 
 
 def test_idle_sdr_still_in_its_boot_loader_is_safe_without_the_tool():
     # Nothing has initialised it since it was powered: also clears a record left by a hard power cut.
-    assert ampsafe.idle_need("unknown", "bootloader", None, **IDLE) == (
+    assert ampsafe.idle_need("unknown", "bootloader", None) == (
         "mark_safe", "nothing has initialised the SDR since it was powered")
-    assert ampsafe.idle_need("safe", "bootloader", None, **IDLE)[0] == "none"
+    assert ampsafe.idle_need("unknown", "bootloader", True)[0] == "mark_safe"
+    assert ampsafe.idle_need("safe", "bootloader", None)[0] == "none"
 
 
-def test_idle_unknown_state_runs_the_tool_unless_telemetry_decides():
+def test_idle_unknown_state_runs_the_tool_unless_a_reading_decides():
     # Manager start with the record "unknown", or with no record at all, after the SDR has been in use.
-    action, why = ampsafe.idle_need("unknown", "loaded", None, **IDLE)
+    action, why = ampsafe.idle_need("unknown", "loaded", None)
     assert action == "run" and "not known" in why
-    assert ampsafe.idle_need("unknown", "loaded", True, **IDLE) == (
+    assert ampsafe.idle_need("unknown", "loaded", True) == (
         "mark_safe", "telemetry shows shutdown current with no radar process")
-    assert ampsafe.idle_need("safe", "loaded", None, **IDLE)[0] == "none"
-    assert ampsafe.idle_need("safe", "loaded", True, **IDLE)[0] == "none"
+    assert ampsafe.idle_need("unknown", "loaded", False)[0] == "run"
+    assert ampsafe.idle_need("safe", "loaded", None)[0] == "none"
+    assert ampsafe.idle_need("safe", "loaded", True)[0] == "none"
 
 
-def test_idle_enabled_current_runs_the_tool_only_when_it_lasts():
-    # One reading is not enough: every start of the tool or of the radar enables the amplifier briefly.
-    for state in ("safe", "unknown"):
-        assert ampsafe.idle_need(state, "loaded", False, enabled_for_s=4.9, enabled_limit_s=5.0)[0] == "none"
-        action, why = ampsafe.idle_need(state, "loaded", False, enabled_for_s=5.0, enabled_limit_s=5.0)
-        assert action == "run" and "enabled for 5 s with no radar process" in why
+def test_idle_enabled_current_is_never_marked_safe_and_is_left_to_the_watcher():
+    # The safety watcher owns "enabled current with no radar process: run the tool".
+    action, why = ampsafe.idle_need("safe", "loaded", False)
+    assert action == "none" and "left to the safety watcher" in why
+    # Enabled current wins over the boot-loader rule: no "safe" is written while it is seen.
+    assert ampsafe.idle_need("unknown", "bootloader", False)[0] == "none"
+    assert ampsafe.idle_need("safe", "bootloader", False)[0] == "none"
 
 
 def test_idle_without_an_sdr_nothing_is_done():
     for state in ("safe", "unknown"):
         for reading in (None, True, False):
-            assert ampsafe.idle_need(state, "absent", reading, enabled_for_s=60.0, enabled_limit_s=5.0)[0] == "none"
+            assert ampsafe.idle_need(state, "absent", reading)[0] == "none"
 
+
+# ------------------------------------------------- the reading from the telemetry file
 
 def amp_telemetry(env, **kw):
     return ampsafe.AmpTelemetry(env.config, **kw)
 
 
-def publish_amp(env, current, voltage=28.0, age=0.0, fresh=True):
-    up = time.clock_gettime(time.CLOCK_BOOTTIME) - age
-    env.publish("telemetry", {"amp": {"fresh": fresh, "current_a": current, "voltage_v": voltage,
-                                      "sample_uptime_s": up}})
+def now_uptime():
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def publish_amp(env, current, voltage=28.0, age=0.0, fresh=True, gap=0.25):
+    up = now_uptime() - age
+    data = {"amp": {"fresh": fresh, "current_a": current, "voltage_v": voltage, "sample_uptime_s": up}}
+    if gap is not None:
+        data["loop"] = {"last_gap_s": gap, "recent_longest_gap_s": gap}
+    env.publish("telemetry", data)
     return up
 
 
+def test_field_names_match_the_telemetry_service():
+    # As radar_runner/telemetry/service.py publishes them (see also the live-file test in test_manager_live.py).
+    cfg = MANAGER["amp_safe"]
+    assert (cfg["current_field"], cfg["voltage_field"], cfg["sample_uptime_field"], cfg["loop_gap_field"]) == (
+        "amp.current_a", "amp.voltage_v", "amp.sample_uptime_s", "loop.last_gap_s")
+    from radar_runner.telemetry import service as telemetry_service
+    import inspect
+    source = inspect.getsource(telemetry_service)
+    for name in ('"fresh"', '"reason"', '"current_a"', '"voltage_v"', '"sample_uptime_s"', '"last_gap_s"'):
+        assert name in source, name
+
+
 def test_confirm_shutdown_from_the_telemetry_file(env):
-    exit_uptime = time.clock_gettime(time.CLOCK_BOOTTIME) - 1.0
+    exit_uptime = now_uptime() - 1.0
     publish_amp(env, 0.156)
     assert amp_telemetry(env).confirm_shutdown(exit_uptime) == (True, "amplifier current 0.16 A at 28.0 V")
     publish_amp(env, 2.47, 27.5)
@@ -438,17 +475,35 @@ def test_confirm_shutdown_from_the_telemetry_file(env):
 
 
 def test_confirm_needs_a_reading_taken_after_the_exit(env):
-    publish_amp(env, 0.156, age=2.0)                        # taken before the radar exited
-    exit_uptime = time.clock_gettime(time.CLOCK_BOOTTIME)
+    publish_amp(env, 0.156, age=2.0)                        # read before the radar exited
+    exit_uptime = now_uptime()
     state, text = amp_telemetry(env).confirm_shutdown(exit_uptime)
     assert state is None and text == "no fresh amplifier reading after the exit"
-    env.config["manager"]["amp_safe"]["confirm_settle_s"] = 1.0
-    publish_amp(env, 0.156)                                 # newer than the exit, but not by the settle time
+
+
+def test_sample_lag_a_row_read_just_after_the_exit_was_measured_before_it(env):
+    # sample_uptime_s is when the row reached the Pi; the ADC measured it earlier. With the
+    # default 2 s, a row read 1.5 s after the exit does not count, one read 2.1 s after does.
+    env.config["manager"]["amp_safe"].update(confirm_settle_s=2.0, confirm_timeout_s=0.3)
+    exit_uptime = now_uptime() - 1.5
+    publish_amp(env, 0.156)
     assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is None
+    assert amp_telemetry(env).now(exit_uptime)[0] is None
+    assert "not read 2 s after the last run ended" in amp_telemetry(env).now(exit_uptime)[1]
+    exit_uptime = now_uptime() - 2.1
+    publish_amp(env, 0.156)
+    assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is True
+    assert amp_telemetry(env).now(exit_uptime)[0] is True
+
+
+def test_enabled_current_needs_no_settle_time(env):
+    env.config["manager"]["amp_safe"]["confirm_settle_s"] = 2.0
+    publish_amp(env, 2.5)
+    assert amp_telemetry(env).now(now_uptime())[0] is False
 
 
 def test_confirm_waits_for_the_reading(env):
-    exit_uptime = time.clock_gettime(time.CLOCK_BOOTTIME)
+    exit_uptime = now_uptime()
     env.config["manager"]["amp_safe"]["confirm_timeout_s"] = 3.0
     sleeps = []
 
@@ -458,27 +513,37 @@ def test_confirm_waits_for_the_reading(env):
     assert amp_telemetry(env, sleep=sleep).confirm_shutdown(exit_uptime)[0] is True and len(sleeps) == 1
 
 
+def test_a_reading_from_a_stalled_telemetry_loop_is_no_proof_of_shutdown(env):
+    # After a stall the rows that piled up come out together: their times say little.
+    exit_uptime = now_uptime() - 1.0
+    publish_amp(env, 0.156, gap=3.5)
+    state, text = amp_telemetry(env).confirm_shutdown(exit_uptime)
+    assert state is None and "the telemetry loop has just stalled" in text
+    assert amp_telemetry(env).now(exit_uptime)[0] is None
+    publish_amp(env, 0.156, gap=None)                       # a file without the loop field: the same
+    assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is None
+    publish_amp(env, 2.5, gap=3.5)                          # enabled current is believed all the same
+    assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is False
+    publish_amp(env, 0.156, gap=0.26)
+    assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is True
+
+
 def test_confirm_says_nothing_without_the_28_v_rail_or_fresh_telemetry(env):
-    exit_uptime = time.clock_gettime(time.CLOCK_BOOTTIME) - 1.0
+    exit_uptime = now_uptime() - 1.0
     publish_amp(env, 0.0, voltage=0.3)                      # power loss: zero current means nothing
     state, text = amp_telemetry(env).confirm_shutdown(exit_uptime)
     assert state is None and "28 V rail reads 0.3 V" in text
+    assert amp_telemetry(env).rail_absent() is True
     publish_amp(env, 0.16, fresh=False)
     assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is None
-    env.publish("telemetry", {"amp": {"fresh": True, "current_a": None, "voltage_v": 28.0, "sample_uptime_s": 1e12}})
+    assert amp_telemetry(env).rail_absent() is False        # not fresh: says nothing either way
+    env.publish("telemetry", {"amp": {"fresh": True, "current_a": None, "voltage_v": 28.0, "sample_uptime_s": 1e12},
+                              "loop": {"last_gap_s": 0.25}})
     assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is None
     os.unlink(os.path.join(env.run_dir, "telemetry.json"))
     assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is None
-
-
-def test_latest_reading_without_waiting(env):
-    assert amp_telemetry(env).now() == (None, "no fresh amplifier reading")
-    publish_amp(env, 0.156)
-    assert amp_telemetry(env).now() == (True, "amplifier current 0.16 A at 28.0 V")
-    publish_amp(env, 2.6, 27.4)
-    assert amp_telemetry(env).now() == (False, "amplifier current 2.60 A at 27.4 V")
-    publish_amp(env, 0.0, 0.2)
-    assert amp_telemetry(env).now()[0] is None
+    assert amp_telemetry(env).now(exit_uptime) == (None, "no fresh amplifier reading")
+    assert amp_telemetry(env).rail_absent() is False
 
 
 def test_sdr_state_record(env):
@@ -490,7 +555,7 @@ def test_sdr_state_record(env):
     with open(os.path.join(env.state_dir, "sdr-state")) as f:
         lines = f.read().splitlines()
     assert lines[0] == "safe" and lines[1].endswith(" clean radar exit") and "clean radar exit" in state.why()
-    assert os.listdir(env.state_dir) == ["sdr-state"]       # replaced atomically: no temporary file left
+    assert os.listdir(env.state_dir) == ["sdr-state"]       # replaced by rename: no temporary file left
     # Anything that is not exactly "safe" on the first line is unknown.
     for content in ("", "SAFE\n", "safe-ish\n", "unknown\n", "\x00\x00", " safe\nsafe\n"):
         with open(os.path.join(env.state_dir, "sdr-state"), "w") as f:
@@ -499,7 +564,28 @@ def test_sdr_state_record(env):
     assert "no-dir" in ampsafe.SdrState(os.path.join(env.tmp, "no-dir")).set("safe")
 
 
-def stop_hook(env, tool_status):
+def test_sdr_state_is_replaced_never_edited_in_place(env):
+    state = ampsafe.SdrState(env.state_dir)
+    state.set("unknown", "x")
+    before = os.stat(state.path).st_ino
+    state.set("safe", "y")
+    assert os.stat(state.path).st_ino != before             # a new file was renamed over the old one
+
+
+def test_record_written_by_the_real_wrapper_format_is_read(env):
+    # tools/sdr_gpio_safe/amp_safe writes "safe" or "unknown" on the first line and free text after.
+    path = os.path.join(env.state_dir, "sdr-state")
+    with open(path, "w") as f:
+        f.write("safe\namp_safe OK (exit 0, 2.71 s) at 2026-11-19T08:00:00Z\n")
+    assert ampsafe.SdrState(env.state_dir).known_safe
+    with open(path, "w") as f:
+        f.write("unknown\namp_safe: tool starting at 2026-11-19T08:00:00Z\n")
+    assert not ampsafe.SdrState(env.state_dir).known_safe
+
+
+# --------------------------------------------------------------- the stop hook script
+
+def stop_hook(env, tool_status, product=None):
     """Run bin/radar-manager-stop-hook with a stand-in tool. Returns (exit status, calls of the tool)."""
     import subprocess
     from radar_runner.common import config as common_config
@@ -508,8 +594,10 @@ def stop_hook(env, tool_status):
     with open(tool, "w") as f:
         f.write(f'#!/bin/sh\necho "$@" >> {calls}\nexit {tool_status}\n')
     os.chmod(tool, 0o755)
+    if product is not None:
+        env.sdr(speed=480 if product == "WestBridge" else 5000, product=product)
     hook = os.path.join(common_config.REPO, "bin", "radar-manager-stop-hook")
-    result = subprocess.run([hook, os.path.join(env.state_dir, "sdr-state"), tool], timeout=20)
+    result = subprocess.run([hook, os.path.join(env.state_dir, "sdr-state"), tool, env.sysfs], timeout=20)
     try:
         with open(calls) as f:
             return result.returncode, f.read().splitlines()
@@ -517,18 +605,26 @@ def stop_hook(env, tool_status):
         return result.returncode, []
 
 
-def test_stop_hook_of_the_unit_runs_the_tool_only_when_the_state_is_not_safe(env):
+def test_stop_hook_does_nothing_when_the_record_says_safe(env):
+    ampsafe.SdrState(env.state_dir).set("safe", "clean radar exit")
+    assert stop_hook(env, 0) == (0, [])
+
+
+def test_stop_hook_runs_the_tool_with_the_state_file_when_the_record_is_not_safe(env):
     state = ampsafe.SdrState(env.state_dir)
-    state.set("safe", "clean radar exit")
-    assert stop_hook(env, 0) == (0, [])                     # known safe: nothing is done
     state.set("unknown", "radar launched, collection x")    # as a killed manager leaves it
-    assert stop_hook(env, 0) == (0, ["--timeout 14"])
-    assert state.get() == "safe" and "stop hook" in state.why()
+    code, calls = stop_hook(env, 0)
+    assert code == 0 and calls == [f"--timeout 30 --state-file {state.path}"]
+    code, calls = stop_hook(env, 3)                         # the tool's status is passed on
+    assert code == 3 and len(calls) == 2
 
 
-def test_stop_hook_with_no_record_or_a_failing_tool(env):
-    state = ampsafe.SdrState(env.state_dir)
-    assert stop_hook(env, 3) == (3, ["--timeout 14"])       # no record = unknown; the tool's status is passed on
-    assert state.get() == "unknown" and not os.path.exists(state.path)
-    state.set("unknown", "x")
-    assert stop_hook(env, 6)[0] == 6 and state.get() == "unknown"
+def test_stop_hook_with_no_record_runs_the_tool(env):
+    assert stop_hook(env, 6)[0] == 6                        # no record = unknown
+
+
+def test_stop_hook_leaves_an_sdr_in_its_boot_loader_alone(env):
+    # Nothing has initialised it since power-up: a run of the tool would be the first enable.
+    ampsafe.SdrState(env.state_dir).set("unknown", "left by a hard power cut")
+    assert stop_hook(env, 0, product="WestBridge") == (0, [])
+    assert stop_hook(env, 0, product="")[1] != []           # firmware loaded: the tool runs

@@ -13,7 +13,7 @@ import time
 import pytest
 
 from radar_runner.common.status import StatusWriter
-from radar_runner.manager import config as manager_config
+from radar_runner.common import config as manager_config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE_ORCA = os.path.join(HERE, "fake_orca")
@@ -39,7 +39,7 @@ class Env:
         shutil.copy(os.path.join(CONFIGS, "run300_d05_soak.yaml"), self.radar_config)
         self.power_file = os.path.join(self.tmp, "power.json")
 
-        self.config = copy.deepcopy(manager_config.defaults())
+        self.config = copy.deepcopy(manager_config.DEFAULTS)
         self.config["paths"].update(run_dir=self.run_dir, state_dir=self.state_dir,
                                     power_status_file=self.power_file)
         m = self.config["manager"]
@@ -106,11 +106,14 @@ class Env:
         writer = self._writers.setdefault(service, StatusWriter(path))
         assert writer.write(data) == ""
 
-    def all_good(self, amp_current=0.16):
+    def all_good(self, amp_current=0.16, amp_voltage=28.0):
         """Publish good status files for telemetry, watcher and power."""
         up = time.clock_gettime(time.CLOCK_BOOTTIME)
-        self.publish("telemetry", {"state": "ok", "amp": {"fresh": True, "reason": "", "current_a": amp_current,
-                                                         "voltage_v": 28.0, "sample_uptime_s": up}})
+        # The fields of the real telemetry status file that the manager reads.
+        self.publish("telemetry", {"state": "ok",
+                                   "amp": {"fresh": True, "reason": "", "current_a": amp_current,
+                                           "voltage_v": amp_voltage, "sample_uptime_s": up},
+                                   "loop": {"last_gap_s": 0.25, "recent_longest_gap_s": 0.25}})
         self.publish("watcher", {"ok": True, "tripped": False, "reason": ""})
         self.publish("power", {"state": "normal", "radar_stop_requested": False})
 

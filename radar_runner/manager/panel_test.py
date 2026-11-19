@@ -30,7 +30,8 @@ import argparse
 import sys
 import time
 
-from . import config as manager_config
+from radar_runner.common import config as common_config
+
 from . import logic as L
 from .panel import Panel
 
@@ -73,7 +74,7 @@ def main(argv=None):
                         help="which form of breathing to show (default: both, one after the other)")
     args = parser.parse_args(argv)
 
-    config, _ = manager_config.load()
+    config, _ = common_config.load()
     cfg = dict(config["manager"]["panel"])
     pins = (cfg["button_gpio"], cfg["green_gpio"], cfg["yellow_gpio"])
     held = holders(pins)

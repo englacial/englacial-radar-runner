@@ -28,47 +28,11 @@ import os
 import re
 import time
 
+from radar_runner.common.bootcount import boot_count
 from radar_runner.common.status import boottime_s, current_boot_id
 
 NAME_RE = re.compile(r"^b(\d{5,})_s(\d{3,})_")
 META_FILE = "collection.json"
-
-
-# --------------------------------------------------------------------- boot number
-
-def _placeholder_boot_count(state_dir, floor=0, boot_id=None):
-    """PLACEHOLDER, to be deleted at merge: the shared helper is radar_runner.common.bootcount.
-
-    Same file and format (<state_dir>/boot_count.json: {"count", "boot_id"}),
-    without the locking, so the two agree if both are used during the change-over.
-    """
-    boot_id = current_boot_id() if boot_id is None else boot_id
-    path = os.path.join(state_dir, "boot_count.json")
-    count, file_boot = 0, ""
-    try:
-        with open(path, "rb") as f:
-            data = json.loads(f.read(4096))
-        if type(data["count"]) is int and data["count"] >= 0:
-            count, file_boot = data["count"], str(data.get("boot_id", ""))
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    if count and boot_id and file_boot == boot_id:
-        return count, ""
-    new = max(count, floor) + 1
-    try:
-        write_durable(path, json.dumps({"count": new, "boot_id": boot_id}) + "\n")
-    except OSError as e:
-        return new, f"cannot keep the boot counter in {state_dir}: {e.strerror}"
-    return new, ""
-
-
-def boot_number(state_dir, floor=0):
-    """Return (boot counter, problem text). The one place the manager gets its boot number from."""
-    try:
-        from radar_runner.common.bootcount import boot_count    # the shared helper (arrives at merge)
-    except ImportError:
-        return _placeholder_boot_count(state_dir, floor)
-    return boot_count(state_dir, floor=floor)
 
 
 # -------------------------------------------------------------------------- names
@@ -87,7 +51,7 @@ def existing(root):
     return out
 
 
-def create(root, state_dir, wall=time.time, boot_number=boot_number):
+def create(root, state_dir, wall=time.time, boot_number=boot_count):
     """Create the next collection directory. Returns (path, boot, sequence, problem text).
 
     Raises OSError if the directory cannot be created.

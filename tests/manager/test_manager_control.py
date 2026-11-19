@@ -9,7 +9,6 @@ import yaml
 
 from radar_runner.common import config as common_config
 from radar_runner.manager import collection as coll
-from radar_runner.manager import config as manager_config
 from radar_runner.manager import control, radarctl
 
 
@@ -22,7 +21,7 @@ def server(tmp_path):
     def handler(request):
         seen.append(request)
         return {"ok": request.get("cmd") != "bad", "message": f"did {request.get('cmd')}",
-                "status": {"state": "ready", "idle": True, "runs_ended": 0}}
+                "status": {"state": "ready", "idle": True, "radar_gone": True, "runs_ended": 0}}
     srv = control.ControlServer(str(tmp_path / "manager.sock"), handler)
     srv.open()
     srv.seen = seen
@@ -32,7 +31,8 @@ def server(tmp_path):
 
 def test_request_and_reply(server):
     reply = radarctl.request(server.path, {"cmd": "start"})
-    assert reply == {"ok": True, "message": "did start", "status": {"state": "ready", "idle": True, "runs_ended": 0}}
+    assert reply == {"ok": True, "message": "did start",
+                     "status": {"state": "ready", "idle": True, "radar_gone": True, "runs_ended": 0}}
     assert server.seen == [{"cmd": "start"}]
     assert stat.S_IMODE(os.stat(server.path).st_mode) == 0o660
 
@@ -90,7 +90,7 @@ def test_radarctl_exit_codes_and_output(server, capsys):
     assert radarctl.main(["--socket", server.path, "start"]) == 0
     assert capsys.readouterr().out == "did start\n"
     assert radarctl.main(["--socket", server.path, "stop", "--wait"]) == 0
-    assert capsys.readouterr().out == "did stop\nstopped\n"
+    assert capsys.readouterr().out == "did stop\nstopped\n"         # the stand-in says radar_gone at once
     assert radarctl.main(["--socket", server.path, "stop", "--interrupt"]) == 0
     assert radarctl.main(["--socket", server.path, "override", "no-amp-telemetry", "on"]) == 0
     assert radarctl.main(["--socket", server.path, "clear-fault"]) == 0
@@ -208,16 +208,36 @@ def test_collection_names_are_unique_and_ordered_with_a_wrong_clock(tmp_path):
     assert names == sorted(names)                           # the order of recording, whatever the clock said
 
 
-def test_placeholder_boot_counter_counts_boots_not_starts(tmp_path):
-    state = str(tmp_path)
-    assert coll._placeholder_boot_count(state, boot_id="boot-a") == (1, "")
-    assert coll._placeholder_boot_count(state, boot_id="boot-a") == (1, "")     # same boot: same number
-    assert coll._placeholder_boot_count(state, boot_id="boot-b") == (2, "")
-    assert coll._placeholder_boot_count(state, floor=41, boot_id="boot-c") == (42, "")
-    with open(os.path.join(state, "boot_count.json")) as f:
-        assert json.load(f) == {"count": 42, "boot_id": "boot-c"}               # the shared helper's format
-    count, problem = coll._placeholder_boot_count(os.path.join(state, "missing"), boot_id="x")
-    assert count == 1 and "cannot keep the boot counter" in problem
+def test_boot_number_comes_from_the_shared_counter(tmp_path):
+    from radar_runner.common import bootcount
+    assert coll.boot_count is bootcount.boot_count
+    root, state = tmp_path / "root", tmp_path / "state"
+    root.mkdir()
+    state.mkdir()
+    (root / "b00041_s007_20260101T000000Z").mkdir()         # an old drive in a system with a new SD card
+    path, boot, seq, problem = coll.create(str(root), str(state))
+    assert boot == 42 and seq == 1 and problem == ""        # the floor: one more than the highest name
+    assert bootcount.boot_count(str(state)) == (42, "")     # and the telemetry service gets the same number
+    path, boot, seq, _ = coll.create(str(root), str(state))
+    assert (boot, seq) == (42, 2)
+
+
+def test_git_dirty_and_binary_hash(tmp_path):
+    import hashlib
+    import subprocess
+    assert coll.git_dirty(str(tmp_path)) == (None, [])      # not a checkout
+    run = lambda *args: subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True)
+    run("init", "-q")
+    (tmp_path / "main.cpp").write_text("int main() {}\n")
+    run("add", "main.cpp")
+    run("-c", "user.name=t", "-c", "user.email=t@example.org", "commit", "-q", "-m", "x")
+    assert coll.git_dirty(str(tmp_path)) == (False, [])
+    (tmp_path / "untracked.txt").write_text("notes\n")       # untracked files do not count
+    assert coll.git_dirty(str(tmp_path)) == (False, [])
+    (tmp_path / "main.cpp").write_text("int main() { return 1; }\n")
+    assert coll.git_dirty(str(tmp_path)) == (True, ["main.cpp"])
+    assert coll.sha256_file(str(tmp_path / "main.cpp")) == hashlib.sha256(b"int main() { return 1; }\n").hexdigest()
+    assert coll.sha256_file(str(tmp_path / "missing")) == ""
 
 
 def test_metadata_file_is_replaced_atomically(tmp_path):
@@ -248,32 +268,118 @@ def test_git_commit_is_read_without_running_git(tmp_path):
 
 # --------------------------------------------------------------------- config
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SECTION_FILE = os.path.join(common_config.REPO, "docs", "merge", "manager-config-section.yaml")
-
-
-def test_config_section_for_the_merge_matches_the_built_in_defaults():
-    # docs/merge/manager-config-section.yaml is what goes into config/radar-runner.yaml.
-    with open(SECTION_FILE) as f:
-        assert yaml.safe_load(f) == {"manager": manager_config.MANAGER_DEFAULTS}
+def test_manager_section_is_in_the_shared_config_and_its_documented_file():
+    assert "manager" in common_config.DEFAULTS
+    with open(common_config.REPO_FILE) as f:
+        assert yaml.safe_load(f)["manager"] == common_config.DEFAULTS["manager"]
 
 
 def test_manager_settings_are_layered_like_the_shared_ones(tmp_path):
     local = tmp_path / "local.yaml"
     local.write_text("manager:\n  limits:\n    max_tx_gain: 52\n    amp_pin: two\n  panel:\n    breathing: blink\n"
-                     "  amp_safe:\n    policy: when_needed\n  nonsense: 1\n")
-    config, warnings = manager_config.load(local_file=str(local), secrets_file=None)
+                     "  nonsense: 1\n")
+    config, warnings = common_config.load(local_file=str(local), secrets_file=None)
     m = config["manager"]
     assert m["limits"]["max_tx_gain"] == 52.0 and m["panel"]["breathing"] == "blink"
-    assert m["amp_safe"]["policy"] == "when_needed"
     assert m["limits"]["amp_pin"] == 2                      # a value of the wrong type keeps the default
     assert any("manager.limits.amp_pin must be a whole number" in w for w in warnings)
     assert any("unknown setting manager.nonsense" in w for w in warnings)
-    assert config["paths"]["run_dir"] == "/run/radar-runner/user"
 
 
-def test_defaults_do_not_share_state():
-    a, b = manager_config.defaults(), manager_config.defaults()
-    a["manager"]["limits"]["max_tx_gain"] = 99.0
-    assert b["manager"]["limits"]["max_tx_gain"] == 43.0
-    assert manager_config.MANAGER_DEFAULTS["limits"]["max_tx_gain"] == 43.0
+def test_defaults_that_the_measurements_on_this_hardware_set():
+    m = common_config.DEFAULTS["manager"]
+    assert m["limits"]["max_tx_gain"] == 43.0               # the conservative gain cap
+    # The tool: first contact after power-up took 16.7 s; the manager's limit is above the tool's own.
+    assert m["amp_safe"]["command"][0].endswith("tools/sdr_gpio_safe/amp_safe")
+    assert m["amp_safe"]["command"][1:] == ["--timeout", "30"] and m["amp_safe"]["timeout_s"] == 40.0
+    assert "policy" not in m["amp_safe"]
+    # The radar's first start loads firmware and FPGA (14 s) before its own set-up.
+    assert m["orca"]["start_timeout_s"] >= 45.0
+    assert m["gates"]["sdr"]["bootloader_product"] == "WestBridge" and m["gates"]["sdr"]["min_speed_mbps"] == 5000
+    assert m["gates"]["watcher"] == {"status_file": "", "max_age_s": 5.0, "require_true": ["ok"],
+                                     "require_false": ["tripped"], "reason_field": "reason"}
+    assert m["gates"]["telemetry"]["require_true"] == ["amp.fresh"]
+    assert "log_max_mb" not in m["data"]                    # the radar's output is never cut
+
+
+# --------------------------------------------------- slow and broken clients
+
+def test_a_silent_client_does_not_hold_up_another(server):
+    import time
+    silent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    silent.connect(server.path)                             # connects and sends nothing
+    half = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    half.connect(server.path)
+    half.sendall(b'{"cmd": "sta')                           # ... or half a request
+    try:
+        t0 = time.monotonic()
+        assert radarctl.request(server.path, {"cmd": "stop"})["ok"]
+        assert time.monotonic() - t0 < 0.5                  # answered at once, not after their timeouts
+    finally:
+        silent.close()
+        half.close()
+
+
+def test_a_slow_client_is_dropped_after_its_time(server, monkeypatch):
+    import time
+    monkeypatch.setattr(control, "CLIENT_TIMEOUT_S", 0.3)
+    slow = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    slow.settimeout(5)
+    slow.connect(server.path)
+    t0 = time.monotonic()
+    for _ in range(20):                                     # a byte now and then, never a whole request
+        try:
+            slow.sendall(b" ")
+        except OSError:
+            break
+        time.sleep(0.05)
+    data = slow.recv(4096)
+    assert time.monotonic() - t0 < 3.0
+    assert data == b"" or json.loads(data) == {"ok": False, "message": "request not understood"}
+    slow.close()
+    assert server.seen == []
+
+
+def test_more_clients_than_slots_are_turned_away_not_queued(server, monkeypatch):
+    held = []
+    for _ in range(control.MAX_CLIENTS):
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.connect(server.path)
+        held.append(c)
+    import time
+    time.sleep(0.3)                                         # all slots are taken by silent clients
+    with pytest.raises(radarctl.NotRunning):
+        radarctl.request(server.path, {"cmd": "status"}, timeout_s=1.0)
+    for c in held:
+        c.close()
+    time.sleep(0.3)
+    assert radarctl.request(server.path, {"cmd": "status"})["ok"]
+
+
+def test_radarctl_stop_wait_respects_its_timeout(tmp_path, capsys):
+    import time
+    srv = control.ControlServer(str(tmp_path / "m.sock"), lambda r: {
+        "ok": True, "message": "stopping", "status": {"state": "stopping", "radar_gone": False, "runs_ended": 3}})
+    srv.open()
+    try:
+        t0 = time.monotonic()
+        assert radarctl.main(["--socket", srv.path, "stop", "--interrupt", "--wait", "--timeout", "0.6"]) == 1
+        assert 0.5 <= time.monotonic() - t0 < 1.2
+        assert "has not stopped after 0.6 s" in capsys.readouterr().err
+    finally:
+        srv.close()
+
+
+def test_radarctl_stop_wait_sees_a_stop_that_was_followed_by_a_restart(tmp_path):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        ended = 3 if len(calls) == 1 else 4                 # the run ended and a new one has begun
+        return {"ok": True, "message": "stopping", "status": {"radar_gone": False, "runs_ended": ended}}
+    srv = control.ControlServer(str(tmp_path / "m.sock"), handler)
+    srv.open()
+    try:
+        assert radarctl.main(["--socket", srv.path, "stop", "--wait", "--timeout", "5"]) == 0
+    finally:
+        srv.close()

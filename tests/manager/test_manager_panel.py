@@ -7,7 +7,9 @@ import time
 import pytest
 from gpiozero.pins.mock import MockFactory, MockPin, MockPWMPin
 
-from radar_runner.manager.config import MANAGER_DEFAULTS
+from radar_runner.common import config as _shared_config
+
+MANAGER_DEFAULTS = _shared_config.DEFAULTS["manager"]
 from radar_runner.manager.panel import ButtonFilter, NoPanel, Panel
 
 

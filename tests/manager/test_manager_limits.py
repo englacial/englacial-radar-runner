@@ -12,7 +12,9 @@ import os
 import pytest
 
 from radar_runner.manager import limits as L
-from radar_runner.manager.config import MANAGER_DEFAULTS
+from radar_runner.common import config as _shared_config
+
+MANAGER_DEFAULTS = _shared_config.DEFAULTS["manager"]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIMITS = MANAGER_DEFAULTS["limits"]

@@ -41,7 +41,14 @@ Known safe without the tool means one of:
     in both directions, whatever the history says: with one exception, a
     radar that was signalled before its start line (it has no SIGINT handler
     until then, so it died in the middle of the SDR set-up) is never trusted.
-Enabled current always wins: also over the boot-loader rule.
+A reading counts only while the telemetry service's loop runs evenly
+(`loop.last_gap_s` at most `max_loop_gap_s`): after a stall the rows that piled
+up come out together and their times say little.
+
+Enabled current seen with no radar process is the safety watcher's business:
+it owns the rule "amplifier draws enabled current with no radar: run the tool".
+The manager never marks the pin safe while it sees such current, shows it in
+its status, and otherwise leaves it alone.
 
 On a power loss (the stop came from the power service, or the 28 V rail reads
 absent) nothing is checked and nothing is written after the radar exit: the
@@ -118,24 +125,25 @@ def after_exit(facts, read, power_lost):
     return ("safe" if known else "run"), why
 
 
-def idle_need(state, sdr, reading, enabled_for_s, enabled_limit_s):
+def idle_need(state, sdr, reading):
     """With no radar process: what to do about the SDR's state. Returns (action, why).
 
     action: "none", "mark_safe" or "run" (the tool).
-    state            SAFE or UNKNOWN: the record
-    sdr              ABSENT, BOOTLOADER or LOADED
-    reading          True = shutdown current in a reading new enough to count,
-                     False = enabled current, None = no usable reading
-    enabled_for_s    for how long the reading has said "enabled" without a break
+    state     SAFE or UNKNOWN: the record
+    sdr       ABSENT, BOOTLOADER or LOADED
+    reading   True = shutdown current in a reading new enough to count,
+              False = enabled current, None = no usable reading
+
+    The tool runs only if the record is not `safe` and the SDR has been
+    initialised since it was powered. Enabled current while the record says
+    `safe` is left to the safety watcher.
     """
     if sdr == ABSENT:
         return "none", "the SDR is not on USB: nothing can be done or checked"
     if reading is False:
-        # Enabled current wins over everything else, but not on one sample:
-        # every start of the tool and of the radar enables the amplifier briefly.
-        if enabled_for_s >= enabled_limit_s:
-            return "run", f"telemetry shows the amplifier enabled for {enabled_for_s:.0f} s with no radar process"
-        return "none", ""
+        if state != SAFE and sdr == LOADED:
+            return "run", "the state of the SDR is not known and telemetry shows the amplifier enabled"
+        return "none", "enabled current with no radar process: left to the safety watcher"
     if sdr == BOOTLOADER:
         if state != SAFE:
             return "mark_safe", "nothing has initialised the SDR since it was powered"
@@ -181,7 +189,11 @@ class AmpTelemetry:
         self._read, self._uptime, self._monotonic, self._sleep = read, uptime, monotonic, sleep
 
     def _sample(self):
-        """(sample uptime, current, voltage) if the telemetry is fresh and complete, else None."""
+        """(sample uptime, current, voltage, loop even) if the telemetry is fresh and complete, else None.
+
+        `loop even` is False if the telemetry service's loop has just stalled
+        (or does not say): the reading is then no proof of shutdown.
+        """
         if self._gate.problem():
             return None
         r = self._read(self._gate.path, self._gate.cfg["max_age_s"])
@@ -194,33 +206,46 @@ class AmpTelemetry:
             return None
         if not all(type(v) in (int, float) for v in values):
             return None
-        return values
+        try:
+            gap = _lookup(r.data, self.cfg["loop_gap_field"])
+        except KeyError:
+            gap = None
+        even = type(gap) in (int, float) and 0 <= gap <= self.cfg["max_loop_gap_s"]
+        return values + [even]
 
     def rail_absent(self):
         """True if the latest fresh reading shows the 28 V rail off (a power loss)."""
         sample = self._sample()
         return sample is not None and sample[2] < self.cfg["min_voltage_v"]
 
-    def now(self, after_uptime):
-        """The latest reading, without waiting: (True shutdown / False enabled / None unusable, text).
-
-        Shutdown current counts only in a sample read at least `confirm_settle_s`
-        after `after_uptime` (the end of the last radar or tool run): the
-        sample's time is when the Pi read the row, which is later than when
-        the ADC measured it, and an older row may show the state before.
-        """
-        sample = self._sample()
-        if sample is None:
-            return None, "no fresh amplifier reading"
-        uptime, current, voltage = sample
+    def _judge(self, sample):
+        """(True shutdown / False enabled / None says nothing, text) for a sample that is new enough."""
+        _, current, voltage, even = sample
         if voltage < self.cfg["min_voltage_v"]:
             return None, f"28 V rail reads {voltage:.1f} V: the current says nothing"
         text = f"amplifier current {current:.2f} A at {voltage:.1f} V"
         if current >= self.cfg["enabled_current_a"]:
             return False, text
-        if uptime < after_uptime + self.cfg["confirm_settle_s"]:
-            return None, f"{text}, but not read {self.cfg['confirm_settle_s']:g} s after the last run ended"
+        if not even:
+            return None, f"{text}, but the telemetry loop has just stalled"
         return True, text
+
+    def now(self, after_uptime):
+        """The latest reading, without waiting: (True shutdown / False enabled / None unusable, text).
+
+        Shutdown current counts only in a sample read at least `confirm_settle_s`
+        after `after_uptime` (the end of the last radar or tool run). The
+        sample's time is the earliest moment the row can have reached the Pi;
+        the ADC measured it before that, so an older row may show the state
+        before the run ended.
+        """
+        sample = self._sample()
+        if sample is None:
+            return None, "no fresh amplifier reading"
+        state, text = self._judge(sample)
+        if state is True and sample[0] < after_uptime + self.cfg["confirm_settle_s"]:
+            return None, f"{text}, but not read {self.cfg['confirm_settle_s']:g} s after the last run ended"
+        return state, text
 
     def confirm_shutdown(self, exit_uptime):
         """Wait for a reading taken after a radar exit. Returns (True/False/None, text)."""
@@ -229,10 +254,9 @@ class AmpTelemetry:
         while True:
             sample = self._sample()
             if sample is not None and sample[0] >= exit_uptime + cfg["confirm_settle_s"]:
-                _, current, voltage = sample
-                if voltage < cfg["min_voltage_v"]:
-                    return None, f"28 V rail reads {voltage:.1f} V: the current says nothing"
-                return current < cfg["enabled_current_a"], f"amplifier current {current:.2f} A at {voltage:.1f} V"
+                state, text = self._judge(sample)
+                if state is not None or self._monotonic() >= deadline:
+                    return state, text
             if self._monotonic() >= deadline:
                 return None, "no fresh amplifier reading after the exit"
             self._sleep(0.2)

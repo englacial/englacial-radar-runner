@@ -28,6 +28,7 @@ class Sim:
         cfg.setdefault("resume_holdoff_s", 10.0)
         cfg.setdefault("stable_run_s", 300.0)
         cfg.setdefault("manual_timeout_s", 0.0)
+        cfg.setdefault("max_restarts_per_hour", 1000)       # its own tests set it
         self.logic = ManagerLogic(LogicConfig(sources=tuple(sources), **cfg))
         self.t = 0.0
         self.bad = {}           # gate name -> GateResult
@@ -44,7 +45,10 @@ class Sim:
     def take(self):
         """The start/stop actions since the last call, as [(kind, data)]."""
         self._collect()
-        out, self.actions = [(a.kind, a.data) for a in self.actions], []
+        # "urgent" and "power" are shown only when set, so that an ordinary stop reads as before.
+        out = [(a.kind, {k: v for k, v in a.data.items() if not (k in ("urgent", "power") and v is False)})
+               for a in self.actions]
+        self.actions = []
         return out
 
     def kinds(self):
@@ -393,7 +397,8 @@ def test_interrupt_stops_now_and_resumes_after_the_hold_off():
     s = Sim().running()
     s.take()
     assert s.call("interrupt", "power", "power service stop hook") == (True, "stopping")
-    assert s.take() == [("stop", {"kind": "gate", "reason": "power service stop hook"})]
+    assert s.take() == [("stop", {"kind": "gate", "reason": "power service stop hook", "urgent": True,
+                                  "power": True})]
     s.call("ended", OK)
     assert s.logic.snapshot()["run_wanted"]
     s.advance(9)
@@ -546,12 +551,18 @@ def test_stop_does_not_clear_a_fault():
     assert s.state == L.FAULT
 
 
-def test_a_press_in_fault_while_not_ready_clears_the_fault_but_does_not_start():
+def test_a_press_in_fault_while_not_ready_changes_nothing():
     s = faulted()
     s.gates(telemetry="lost")
     assert s.state == L.FAULT                               # fault is shown before "not ready"
-    ok, message = s.call("toggle", L.BUTTON)
-    assert not ok and message.startswith("not ready") and s.state == L.NOT_READY and s.take() == []
+    for request in ("toggle", "start"):
+        ok, message = s.call(request, L.BUTTON)
+        assert not ok and message == ("not ready: telemetry: lost (fault kept: the radar exited with status 1)")
+    assert s.state == L.FAULT and s.take() == []
+    assert s.logic.snapshot()["fault"]["reason"] == "the radar exited with status 1"     # the reason is not lost
+    s.gates()
+    assert s.call("toggle", L.BUTTON) == (True, "starting")           # ready again: the press clears and starts
+    assert s.kinds() == ["start"] and s.logic.fault is None
 
 
 def test_fault_is_left_by_the_next_automatic_trigger_only_after_a_stop_of_the_truck():
@@ -769,7 +780,7 @@ def test_shutdown_stops_the_radar_and_starts_nothing_more():
     s.call("started")
     s.take()
     s.call("shutdown")
-    assert s.take() == [("stop", {"kind": "shutdown", "reason": "the manager is stopping"})]
+    assert s.take() == [("stop", {"kind": "shutdown", "reason": "the manager is stopping", "urgent": True})]
     s.call("ended", OK)
     s.advance(60)
     assert s.take() == []
@@ -805,13 +816,282 @@ def test_snapshot_is_plain_json_in_every_state():
     s.call("ended", failed())
     snap = s.logic.snapshot()
     assert snap["retries"] == {"failed_starts": 1, "max_retries": 3, "retry_in_s": 10.0,
-                               "interruptions": 0, "max_resumes": 2}
+                               "interruptions": 0, "max_resumes": 2, "restarts_last_hour": 0,
+                               "max_restarts_per_hour": 1000}
     assert snap["leds"] == {"ready_yellow": "breathing", "running_green": "off"}
     json.dumps(snap)
 
 
 def test_config_from_the_manager_section():
-    from radar_runner.manager.config import MANAGER_DEFAULTS
-    cfg = LogicConfig.from_config(MANAGER_DEFAULTS)
+    from radar_runner.common.config import DEFAULTS
+    cfg, warnings = LogicConfig.from_config(DEFAULTS["manager"])
+    assert warnings == []
     assert cfg.retry_delays_s == (10.0, 30.0, 90.0) and cfg.max_resumes == 5
+    assert cfg.max_restarts_per_hour == 12 and cfg.stable_run_s == 300.0 and cfg.resume_holdoff_s == 10.0
     assert cfg.sources == (L.BUTTON, L.COMMAND) and cfg.manual_timeout_s == 50400.0
+
+
+def manager_cfg(**run):
+    import copy
+    from radar_runner.common.config import DEFAULTS
+    cfg = copy.deepcopy(DEFAULTS["manager"])
+    cfg["run"].update(run)
+    return cfg
+
+
+@pytest.mark.parametrize("setting, value, text", [
+    ("retry_delays_s", [0, 0, 0], "retry_delays_s must be 1 to 10 delays of at least 5 s"),
+    ("retry_delays_s", [10.0, 1.0], "retry_delays_s must be"),
+    ("retry_delays_s", [], "retry_delays_s must be"),
+    ("retry_delays_s", ["soon"], "retry_delays_s must be"),
+    ("retry_delays_s", [10.0] * 11, "retry_delays_s must be"),
+    ("stable_run_s", 0.0, "stable_run_s must be at least 60 s"),
+    ("stable_run_s", 59.0, "stable_run_s must be at least 60 s"),
+    ("resume_holdoff_s", 0.0, "resume_holdoff_s must be at least 2 s"),
+    ("max_resumes", -1, "max_resumes must be between 0 and 100"),
+    ("max_restarts_per_hour", 0, "max_restarts_per_hour must be between 1 and 120"),
+    ("max_restarts_per_hour", 100000, "max_restarts_per_hour must be between 1 and 120"),
+    ("manual_timeout_s", -5.0, "manual_timeout_s must not be negative"),
+])
+def test_settings_that_would_defeat_the_restart_limits_are_refused(setting, value, text):
+    cfg, warnings = LogicConfig.from_config(manager_cfg(**{setting: value}))
+    assert len(warnings) == 1 and text in warnings[0] and warnings[0].endswith("the default is used")
+    assert cfg == LogicConfig()                             # the defaults, all of them
+
+
+def test_settings_at_their_minimums_are_accepted():
+    cfg, warnings = LogicConfig.from_config(manager_cfg(retry_delays_s=[5.0], stable_run_s=60.0,
+                                                        resume_holdoff_s=2.0, max_restarts_per_hour=1,
+                                                        max_resumes=0, manual_timeout_s=0.0))
+    assert warnings == [] and cfg.retry_delays_s == (5.0,) and cfg.max_restarts_per_hour == 1
+
+
+# --------------------------------------------------------- the restart cap per hour
+
+def test_a_gate_that_drops_every_five_minutes_cannot_restart_the_radar_for_ever():
+    # Each run is "stable" (300 s), so the interruption count is cleared every time: the
+    # per-hour cap is what stops it.
+    s = Sim(max_resumes=2, stable_run_s=300.0, max_restarts_per_hour=6).running()
+    restarts = 0
+    for _ in range(50):
+        s.advance(300)                                      # five minutes of running
+        s.gates(telemetry="lost")
+        s.call("ended", OK)
+        s.gates().advance(10)
+        if s.state == L.FAULT:
+            break
+        restarts += 1
+        s.call("started")
+    assert restarts == 6 and s.state == L.FAULT
+    fault = s.logic.snapshot()["fault"]
+    assert fault["kind"] == "restart_limit" and "6 automatic restarts within an hour (limit 6)" in fault["reason"]
+    assert s.logic.snapshot()["retries"]["restarts_last_hour"] == 6
+
+
+def test_restart_cap_counts_retries_of_failed_starts_too():
+    s = Sim(max_restarts_per_hour=2, retry_delays_s=(10.0, 10.0, 10.0, 10.0)).gates()
+    s.call("start", L.BUTTON)
+    for _ in range(2):
+        s.call("ended", failed())
+        s.advance(10)
+        assert s.state == L.STARTING
+    s.call("ended", failed())
+    s.advance(10)
+    assert s.state == L.FAULT and s.logic.fault["kind"] == "restart_limit"
+
+
+def test_restart_cap_is_not_reset_by_a_new_run_or_a_cleared_fault_only_by_time():
+    s = Sim(max_restarts_per_hour=1).running()
+    s.gates(telemetry="lost")
+    s.call("ended", OK)
+    s.gates().advance(10)                                   # the one allowed restart
+    s.call("started")
+    s.gates(telemetry="lost")
+    s.call("ended", OK)
+    s.gates().advance(10)
+    assert s.logic.fault["kind"] == "restart_limit"
+    assert s.call("toggle", L.BUTTON) == (True, "starting")           # a person may start it again ...
+    s.call("started")
+    s.gates(telemetry="lost")
+    s.call("ended", OK)
+    s.gates().advance(10)
+    assert s.logic.fault["kind"] == "restart_limit"         # ... but the next automatic restart is refused again
+    s.call("clear_fault", L.COMMAND)
+    s.advance(3600)                                         # an hour later the count is empty
+    s.call("start", L.BUTTON)
+    s.call("started")
+    s.gates(telemetry="lost")
+    s.call("ended", OK)
+    s.gates().advance(10)
+    assert s.state == L.STARTING
+
+
+def test_a_first_start_is_not_a_restart():
+    s = Sim(max_restarts_per_hour=1).gates()
+    for _ in range(5):                                      # five manual runs in a row: no restart among them
+        s.call("start", L.BUTTON)
+        s.call("started")
+        s.call("stop", L.BUTTON)
+        s.call("ended", OK)
+    assert s.state == L.READY and s.logic.restarts == []
+
+
+# -------------------------------------------------------------------- urgent stops
+
+POWER_LOSS = GateResult(start="power service: state loss, radar stop requested",
+                        run="power service: state loss, radar stop requested", kind="power_fail")
+
+
+def test_a_stop_for_power_loss_is_urgent_and_marked_as_power():
+    s = Sim().running()
+    s.take()
+    s.gates(power=POWER_LOSS)
+    assert s.take() == [("stop", {"kind": "gate", "reason": "power: power service: state loss, radar stop requested",
+                                  "urgent": True, "power": True})]
+
+
+def test_a_stop_for_another_gate_or_by_hand_is_not_urgent():
+    s = Sim().running()
+    s.take()
+    s.gates(telemetry="lost")
+    assert "urgent" not in s.take()[0][1]
+    t = Sim().running()
+    t.take()
+    t.call("stop", L.BUTTON)
+    assert "urgent" not in t.take()[0][1]
+
+
+def test_a_stop_under_way_becomes_urgent_when_power_is_lost_or_the_manager_exits():
+    for how in ("power gate", "interrupt", "shutdown"):
+        s = Sim().running()
+        s.call("stop", L.BUTTON)
+        assert s.take() == [("stop", {"kind": "manual", "reason": "stop by button"})]
+        if how == "power gate":
+            s.gates(power=POWER_LOSS)
+        elif how == "interrupt":
+            s.call("interrupt", "power", "power service stop hook")
+        else:
+            s.call("shutdown")
+        again = s.take()
+        assert len(again) == 1 and again[0][0] == "stop" and again[0][1]["urgent"] is True, how
+        s.gates(power=POWER_LOSS)
+        assert s.take() == []                               # only once
+        s.call("ended", OK)
+        s.gates().advance(60)
+        assert s.take() == []                               # it was a manual stop: nothing resumes
+
+
+def test_urgency_is_forgotten_with_the_run():
+    s = Sim().running()
+    s.call("interrupt", "power", "hook")
+    s.call("ended", {"requested": True, "failure": "", "amp_safe": None})      # power loss: nothing was checked
+    assert s.logic.fault is None and s.logic.snapshot()["run_wanted"]
+    s.advance(10)
+    assert s.kinds()[-1] == "start"
+    s.call("started")
+    s.take()
+    s.call("stop", L.BUTTON)
+    assert "urgent" not in s.take()[0][1]
+
+
+# --------------------------------------------- a radar that exits unasked with status 0
+
+def test_unasked_exit_with_status_0_of_a_radar_that_runs_until_stopped_is_an_interruption():
+    s = Sim(max_resumes=2).running()
+    s.take()
+    exit0 = {"requested": False, "failure": "", "amp_safe": True,
+             "interrupted": "the radar exited with status 0 without being asked to (num_pulses is -1)"}
+    s.call("ended", exit0)
+    snap = s.logic.snapshot()
+    assert snap["run_wanted"] and snap["detail"] == "resume in 10 s" and s.logic.interruptions == 1
+    assert snap["last_end"].startswith("interrupted: the radar exited with status 0")
+    s.advance(10)
+    assert s.take() == [("start", {"trigger": "button", "attempt": 1, "resume": True})]
+    s.call("ended", exit0)
+    s.advance(10)
+    s.call("ended", exit0)                                  # the third time: the resume limit
+    assert s.state == L.FAULT and s.logic.fault["kind"] == "resume_limit"
+    assert "interrupted 3 times (limit 2)" in s.logic.fault["reason"]
+
+
+def test_a_radar_with_a_pulse_count_still_finishes_by_itself():
+    s = Sim().running()
+    s.call("ended", {"requested": False, "failure": "", "amp_safe": True, "interrupted": ""})
+    assert s.state == L.READY and not s.logic.snapshot()["run_wanted"]
+
+
+# ---------------------------------------------------------------- the amp_unsafe fault
+
+def amp_fault():
+    s = Sim().running()
+    s.call("stop", L.BUTTON)
+    s.call("ended", {"requested": True, "failure": "", "amp_safe": False,
+                     "amp_safe_detail": "tool run 3 times: status 3 (ASSUME_ENABLED)"})
+    assert s.state == L.FAULT and s.logic.fault["kind"] == "amp_unsafe"
+    s.take()
+    return s
+
+
+def test_amp_unsafe_is_not_cleared_by_a_press_a_start_or_the_automatic_source():
+    s = amp_fault()
+    for request in ("toggle", "start"):
+        ok, message = s.call(request, L.BUTTON)
+        assert not ok and "it clears when the amplifier pin is confirmed safe" in message
+    assert s.state == L.FAULT and s.take() == []
+    a = Sim(sources=(L.BUTTON, L.COMMAND, L.AUTO)).gates()
+    a.call("auto", L.STATIONARY)
+    a.call("amp_unsafe", "tool run 3 times: status 3 (ASSUME_ENABLED)")
+    a.call("auto", L.MOVING)
+    a.advance(60)
+    assert a.state == L.FAULT and a.take() == []
+
+
+def test_amp_unsafe_clears_by_itself_when_the_record_says_safe_again_and_the_reason_stays_visible():
+    s = amp_fault()
+    s.call("amp_safe_again", "amp_safe OK (exit 0)")
+    assert s.state == L.READY and s.logic.fault is None and s.take() == []     # cleared, nothing started
+    last = s.logic.snapshot()["last_fault"]
+    assert last["kind"] == "amp_unsafe" and "ASSUME_ENABLED" in last["reason"]
+    assert last["cleared_by"] == "the amplifier pin is known safe again: amp_safe OK (exit 0)"
+    cleared = [e for e in s.events if e["event"] == "fault_cleared"]
+    assert cleared and "ASSUME_ENABLED" in cleared[0]["reason"]
+
+
+def test_amp_safe_again_does_not_clear_other_faults():
+    s = faulted()
+    s.call("amp_safe_again", "x")
+    assert s.state == L.FAULT and s.logic.fault["kind"] == "config"
+
+
+def test_amp_unsafe_is_cleared_by_the_clear_fault_command():
+    s = amp_fault()
+    assert s.call("clear_fault", L.COMMAND) == (True, "fault cleared")
+    assert s.state == L.READY and s.logic.snapshot()["last_fault"]["cleared_by"] == "command"
+
+
+def test_amp_unsafe_with_no_radar_running():
+    s = Sim().gates()
+    s.call("amp_unsafe", "tool run 3 times: status 3 (ASSUME_ENABLED)")
+    assert s.state == L.FAULT and s.logic.fault["kind"] == "amp_unsafe"
+    events = len(s.events)
+    s.call("amp_unsafe", "again")                           # the next failed attempt: not a new fault
+    assert len([e for e in s.events[events:] if e["event"] == "fault"]) == 0
+    r = Sim().running()
+    r.call("amp_unsafe", "x")                               # a radar is running: its end decides
+    assert r.state == L.RUNNING and r.logic.fault is None
+
+
+def test_power_loss_exit_leaves_no_fault_although_nothing_was_checked():
+    s = Sim().running()
+    s.gates(power=POWER_LOSS)
+    s.call("ended", {"requested": True, "failure": "", "amp_safe": None,
+                     "amp_safe_detail": "power loss: nothing checked"})
+    assert s.state == L.POWER_FAIL and s.logic.fault is None
+
+
+def test_last_fault_is_kept_in_the_status_after_any_clearing():
+    s = faulted()
+    s.call("toggle", L.BUTTON)
+    last = s.logic.snapshot()["last_fault"]
+    assert last == {"kind": "config", "reason": "the radar exited with status 1", "cleared_by": "button"}
+    assert s.logic.snapshot()["fault"] is None
