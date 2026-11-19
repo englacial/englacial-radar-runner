@@ -203,7 +203,7 @@ def test_event_log_is_synced_to_the_drive_without_holding_up_the_writer(tmp_path
     deadline = time.monotonic() + 10
     while log.synced < 1 and time.monotonic() < deadline:
         time.sleep(0.05)
-    assert synced and synced[0] == path and log.sync_error == ""
+    assert path in synced and log.sync_error == ""      # (other tests' syncer threads may add theirs)
     for i in range(20):                 # through one rotation: the end of .1 is synced too
         log.write({"event": "x", "i": i, "text": "y" * 50})
     deadline = time.monotonic() + 20
