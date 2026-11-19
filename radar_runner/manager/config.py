@@ -99,7 +99,7 @@ MANAGER_DEFAULTS = {
         "chirp_command": ["/home/englacial/miniforge3/envs/orca/bin/python", "generate_chirp.py", "{config}"],
         "chirp_cwd": "preprocessing",       # relative to dir
         "chirp_timeout_s": 120.0,
-        "build_commands": [["cmake", ".."], ["make"]],
+        "build_commands": [["cmake", ".."], ["make", "radar"]],     # only the radar target, not ORCA's tests
         "build_cwd": "sdr/build",
         "build_timeout_s": 900.0,
         "radar_command": ["./radar", "{config_rel}"],   # {config_rel}: the config, relative to dir

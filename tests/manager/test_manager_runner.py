@@ -470,3 +470,44 @@ def test_derived_config_is_plain_yaml_without_anchors(env, events, runner):
     assert "&" not in text and "*" not in text
     assert yaml.safe_load(text)["CHIRP"]["tx_duration"] == pytest.approx(1.3e-5)
     json.dumps(yaml.safe_load(text))
+
+
+# ------------------------------------------------------------------- robustness
+
+def test_amplifier_is_made_safe_even_if_the_data_drive_has_gone(env, events, runner):
+    import shutil
+    runner.start(REQUEST)
+    events.wait("started")
+    time.sleep(0.2)
+    shutil.rmtree(env.collection_dir())         # as if the drive dropped out mid-run
+    runner.stop("data drive gone")
+    info = events.wait("ended")
+    assert info["amp_safe"] is True and env.amp_safe_calls() == 1       # no log file, but it ran
+    assert not ampsafe.SdrStateFlag(env.state_dir).is_set()
+
+
+def test_an_internal_error_ends_the_run_and_the_runner_lives_on(env, events):
+    calls = []
+
+    def hook(run):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ZeroDivisionError("bug in a hook")
+        return True, ""
+    r = Runner(env.config, events, turn_on_check=hook)
+    r.start(REQUEST)
+    info = events.wait("ended")
+    assert info["kind"] == "internal" and "ZeroDivisionError" in info["failure"] and not info["launched"]
+    r.start(REQUEST)                            # the same thread serves the next start
+    events.wait("started")
+    assert r.shutdown(10.0)
+    assert events.wait("ended", count=2)["failure"] == ""
+
+
+def test_radar_program_missing_after_the_build_is_a_failed_start(env, events, runner):
+    os.unlink(os.path.join(env.orca, "sdr", "build", "radar.py"))
+    env.config["manager"]["orca"]["radar_command"] = ["radar.py", "{config_rel}"]
+    runner.start(REQUEST)
+    info = events.wait("ended")
+    assert info["kind"] == "launch" and "is not there after the build" in info["failure"]
+    assert not info["launched"] and env.amp_safe_calls() == 0

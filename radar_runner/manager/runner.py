@@ -292,10 +292,17 @@ class Runner:
             except Exception as e:      # never lose the thread: it is the radar's parent
                 log.exception("internal error in the runner")
                 run.fail("internal", f"internal error in the runner: {type(e).__name__}: {e}")
-                self._kill(run)
+            try:
+                if run.proc is not None and run.proc.poll() is None:
+                    self._kill(run)     # only after an internal error: no radar may outlive its run
                 if run.launched and run.amp_safe is None:
                     self._make_amp_safe(run)
-            self._finish(run)
+                self._finish(run)
+            except Exception as e:
+                log.exception("internal error while ending the run")
+                run.fail("internal", f"internal error while ending the run: {type(e).__name__}: {e}")
+                if run.launched and run.amp_safe is None:
+                    run.amp_safe, run.amp_safe_detail = False, "not attempted: internal error"
             info = run.info()
             with self._lock:
                 self._current = None
@@ -314,13 +321,20 @@ class Runner:
     def _command(self, run, argv, cwd, timeout_s, label, log_name, interruptible=True):
         """Run a helper command to its end. Returns (ok, text). Output goes to <collection>/<log_name>."""
         try:
-            with open(os.path.join(run.directory, log_name), "ab") as out:
-                out.write(f"--- {label}: {' '.join(argv)}\n".encode())
-                out.flush()
-                proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
-                                        stderr=subprocess.STDOUT, start_new_session=True, env=self._env())
+            out = open(os.path.join(run.directory, log_name), "ab")
+            out.write(f"--- {label}: {' '.join(argv)}\n".encode())
+            out.flush()
+        except (OSError, TypeError):
+            out = None              # the data drive is gone: the command must still run
+        try:
+            proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                                    stdout=out if out is not None else subprocess.DEVNULL,
+                                    stderr=subprocess.STDOUT, start_new_session=True, env=self._env())
         except OSError as e:
             return False, f"{label}: cannot run {argv[0]}: {e.strerror or e}"
+        finally:
+            if out is not None:
+                out.close()
         deadline = time.monotonic() + timeout_s
         while True:
             try:
@@ -437,8 +451,12 @@ class Runner:
             return
 
         # 7. The radar.
-        self._radar(run, self._fill(list(orca_cfg["launch_prefix"]) + list(orca_cfg["radar_command"]),
-                                    run, config_path), os.path.join(orca, orca_cfg["radar_cwd"]))
+        radar_cwd = os.path.join(orca, orca_cfg["radar_cwd"])
+        command = self._fill(orca_cfg["radar_command"], run, config_path)
+        if not command or not os.path.isfile(os.path.join(radar_cwd, command[0])):
+            return run.fail("launch", f"the radar program {command[0] if command else ''} is not there "
+                                      "after the build")
+        self._radar(run, list(orca_cfg["launch_prefix"]) + command, radar_cwd)
 
     def _on_line(self, run, radar_cwd, line, now):
         run.tail.append(line[:300])
@@ -529,8 +547,6 @@ class Runner:
 
         for thread in readers:
             thread.join(5.0)        # the pipes close when the radar is gone
-        self._sync_queue.put(None)
-        syncer.join(30.0)
         if not run.stop.is_set() and not run.failure:
             if run.exit_status != 0:
                 run.fail("exit", f"the radar exited with status {run.exit_status}"
@@ -538,7 +554,9 @@ class Runner:
             elif not run.started.is_set():
                 run.fail("exit", "the radar exited before it started recording")
         log.info("radar exited: status %s%s", run.exit_status, ", KILLED" if run.killed else "")
-        self._make_amp_safe(run)
+        self._make_amp_safe(run)    # first: the amplifier does not wait for the drive
+        self._sync_queue.put(None)
+        syncer.join(30.0)
 
     def _stop_radar(self, run):
         """SIGINT, wait the allowed time, SIGKILL only as the last resort."""
