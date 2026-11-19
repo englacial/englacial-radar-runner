@@ -1,0 +1,6 @@
+#!/bin/sh
+# radarctl: start, stop and inspect the radar. Help: radarctl --help
+# Runs radar_runner/manager/radarctl.py with the system Python (standard library only),
+# from any directory and through a symlink (e.g. /usr/local/bin/radarctl).
+here=$(dirname "$(readlink -f "$0")")
+exec /usr/bin/python3 -B -E -s "$here/../radar_runner/manager/radarctl.py" "$@"

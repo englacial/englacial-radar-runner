@@ -145,6 +145,7 @@ MANAGER_DEFAULTS = {
         "green_gpio": 17,
         "yellow_gpio": 18,
         "breathing": "pwm",                 # "pwm", or "blink" if PWM does not work through the LED's regulator
+        "pwm_hz": 200,                      # PWM frequency of the READY LED
         "kernel_debounce_s": 0.02,          # edges closer together than this never reach the manager
         "press_min_s": 0.1,                 # a press is the button held between these two times ...
         "press_max_s": 5.0,

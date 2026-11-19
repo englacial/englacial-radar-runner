@@ -148,6 +148,7 @@ class ManagerLogic:
         self.auto_label = "gps"
         self.auto_blocked = False
         self.closing = False
+        self.runs_ended = 0         # counts every "ended": lets a waiter see a stop that was followed by a restart
         self.results = None         # name -> GateResult; None until the first evaluation
         self.gates_good_since = None
         self.run_since = None       # start of the current stretch of running
@@ -441,6 +442,7 @@ class ManagerLogic:
             return
         was = self.phase
         self.phase = IDLE
+        self.runs_ended += 1
         self.run_since = None
         cfg = self.cfg
         failure = info.get("failure", "")
@@ -457,6 +459,9 @@ class ManagerLogic:
                                     f"(limit {cfg.max_resumes}); last: {self.stop_reason}")
                 else:
                     self.resume = True
+                    # Never straight back on: `radarctl stop --wait` (the power
+                    # service's hook) must be able to see the radar off.
+                    self.retry_at = t + cfg.resume_holdoff_s
         elif failure and info.get("fatal"):
             self.last_end = f"failed: {failure}"
             self._set_fault(t, info.get("kind") or "start", failure)
@@ -501,7 +506,8 @@ class ManagerLogic:
             detail = "will resume when ready" if self.resume else "will start when ready"
         elif state == STARTING and self.phase == IDLE:
             wait = max(0.0, (self.retry_at or t) - t)
-            detail = f"retry in {wait:.0f} s" if wait else "waiting for the gates to settle"
+            detail = (f"{'resume' if self.resume else 'retry'} in {wait:.0f} s" if wait
+                      else "waiting for the gates to settle")
         else:
             detail = ""
         return {
@@ -515,6 +521,7 @@ class ManagerLogic:
                        "age_s": round(t - self.fault["since"], 1)} if self.fault else None),
             "collection": self.collection if self.phase != IDLE else None,
             "last_end": self.last_end,
+            "runs_ended": self.runs_ended,
             "retries": {"failed_starts": self.failures, "max_retries": len(self.cfg.retry_delays_s),
                         "retry_in_s": (round(max(0.0, self.retry_at - t), 1)
                                        if self.retry_at is not None else None),
