@@ -13,19 +13,29 @@ import pytest
 from tool_helpers import REAL_SOURCES, REAL_TOOL, TOOL_DIR
 
 
-@pytest.fixture(scope="session")
-def fake_tool(tmp_path_factory):
-    """sdr_gpio_safe compiled with the stand-in device: no UHD in it."""
+def build_fake(directory, *flags):
     compiler = shutil.which("g++")
     if compiler is None:
         pytest.skip("no g++")
-    binary = tmp_path_factory.mktemp("sdr_gpio_safe") / "sdr_gpio_safe_fake"
-    subprocess.run([compiler, "-std=c++17", "-O1", "-pthread",
+    binary = directory / "sdr_gpio_safe_fake"
+    subprocess.run([compiler, "-std=c++17", "-O1", "-pthread", *flags,
                     str(TOOL_DIR / "sdr_gpio_safe.cpp"), str(TOOL_DIR / "fake_port.cpp"), "-o", str(binary)],
                    check=True, timeout=300)
     libraries = subprocess.run(["ldd", str(binary)], capture_output=True, text=True).stdout
     assert "uhd" not in libraries and "usb" not in libraries
     return binary
+
+
+@pytest.fixture(scope="session")
+def fake_tool(tmp_path_factory):
+    """sdr_gpio_safe compiled with the stand-in device (no UHD in it) and a short settle time."""
+    return build_fake(tmp_path_factory.mktemp("fast"), "-DSDR_GPIO_SAFE_SETTLE_MS=60")
+
+
+@pytest.fixture(scope="session")
+def fake_tool_as_built(tmp_path_factory):
+    """The same with the settle time of the real build."""
+    return build_fake(tmp_path_factory.mktemp("as_built"))
 
 
 @pytest.fixture(scope="session")
