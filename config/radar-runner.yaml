@@ -26,3 +26,60 @@ status:
 
 logging:
   level: info           # debug, info, warning or error
+
+# Telemetry service: OLA (amplifier sensors, IMU), Pi sensors, UPS readings and
+# GPS position. Logs, status file and how to stop it: radar_runner/telemetry/README.md
+telemetry:
+  loop_interval_s: 0.25       # how often the sources are read
+  status_interval_s: 0.5      # how often /run/radar-runner/user/telemetry.json is rewritten
+  data_root: /mnt/nvme/radar-runner   # sensor logs go to <data_root>/telemetry/b<boot>/
+  data_mount: /mnt/nvme       # must be a mount point for data_root to be used ("-": no check)
+  fallback_dir: /var/lib/radar-runner/user/telemetry-fallback   # on the SD card, while the drive is unusable
+  fallback_max_mb: 1000       # the oldest fallback files are deleted above this
+  flush_interval_s: 1.0       # rows are handed to the kernel this often
+  fsync_interval_s: 30.0      # each file is forced to the drive this often (one file per second, in turn).
+                              # A hard power cut loses at most about 35 s of rows with these two values;
+                              # a normal shutdown loses nothing. TO MEASURE IN STAGE 4 before lowering it:
+                              # what a sync costs while the radar records (see telemetry/csvlog.py)
+  ola:
+    port: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+    baud: 115200
+    log_interval_s: 0.0       # 0: log every row (about 10 per second, 210 MB per 24 h); 1.0: one per second
+    fresh_s: 2.0              # amplifier readings older than this are published as not fresh
+    boot_timeout_s: 25.0      # no header this long after opening the port: drive the menus anyway
+    menu_timeout_s: 15.0      # wait for each menu
+    silent_s: 20.0            # no valid row for this long: reopen the port, which resets the OLA
+    # Every reopening resets the OLA. The waits double with every failure in a row and start short
+    # again only after stable_s of good rows, so that a broken OLA is reset about once an hour.
+    reopen_s: 5.0             # wait before reopening the port; doubles up to reopen_max_s
+    reopen_max_s: 3600.0
+    retry_s: 30.0             # wait before driving the menus again after they failed; doubles up to retry_max_s
+    retry_max_s: 3600.0
+    stable_s: 300.0
+    # Calibration of the ADS1015 readings, from the control board and the bench
+    # (radar-testbench/pa_bringup/pa_run.py). Per-unit values belong in local.yaml.
+    temp_divider: 2.0         # amplifier pin 3 reaches the ADC through a 1:2 divider
+    temp_mv_per_c: 10.0       # amplifier pin 3: 10 mV per degree C
+    current_divider: 2.0      # amplifier pin 2 reaches the ADC through a 1:2 divider
+    current_mv_per_a: 500.0   # amplifier pin 2: 50 mV per 100 mA
+    current_cal: 1.5          # the ADC read 0.66-0.68 of the clamp meter on the supply wire (2026-11-05,
+                              # cause unknown; pa_run.py ADC_CURRENT_CAL). Not re-checked with the 28 V on
+    voltage_ratio: 11.0       # 28 V rail through 100k/10k
+  pi:
+    interval_s: 2.0           # SoC temperature, throttling, load, memory, disk space, drive temperatures, fan
+  ups:
+    interval_s: 1.0           # capacitor voltage and current, from the power service's status file
+    stale_after_s: 3.0        # the power service rewrites its file about once a second
+  gps:
+    host: 127.0.0.1           # gpsd; the service only asks gpsd for data and never sends to the receiver
+    port: 2947
+    interval_s: 1.0           # one position per second (the receiver itself runs at 10 Hz)
+    stale_after_s: 5.0        # no new fix time for this long: stale
+    answer_timeout_s: 10.0    # no answer from gpsd for this long: reconnect
+    reconnect_s: 5.0
+    no_data_error_s: 30.0     # receiver present but no fix time for this long: reported as an error
+    # Each time the OLA starts it turns NMEA output on the receiver's unused UART1 back on, which
+    # overflows the receiver's transmit buffer at 10 Hz. This command turns it off again (in the
+    # receiver's RAM, through gpsd) a little after every OLA start. "" = never run it.
+    receiver_fix_command: "/usr/bin/python3 -B /home/englacial/englacial-radar-runner/setup/gps_receiver.py --apply --ram"
+    receiver_fix_delay_s: 15.0

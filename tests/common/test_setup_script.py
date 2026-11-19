@@ -18,13 +18,18 @@ SETUP = os.path.join(REPO, "setup", "setup.sh")
 FILES = os.path.join(REPO, "setup", "files")
 FAKE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_system_tool.py")
 BASH = shutil.which("bash")
-FAKE_TOOLS = ("systemctl", "systemd-tmpfiles", "busctl", "dpkg-query", "apt-mark", "snap", "tailscale", "id",
-              "findmnt", "lsblk")
-REAL_TOOLS = ("cat", "cmp", "diff", "stat", "install", "mktemp", "sed", "awk", "grep", "cut", "tr", "head",
-              "wc", "sync", "mv", "cp", "chmod", "rm", "dirname", "uname")
+FAKE_TOOLS = ("systemctl", "systemd-tmpfiles", "busctl", "dpkg-query", "apt-mark", "apt-get", "snap", "tailscale",
+              "id", "findmnt", "lsblk", "ps")
+REAL_TOOLS = ("cat", "cmp", "diff", "stat", "install", "ln", "mktemp", "sed", "awk", "grep", "cut", "tr", "head", "tail",
+              "wc", "sync", "mv", "cp", "chmod", "rm", "dirname", "uname", "find", "readlink", "printf")
 UPDATE_UNITS = ["apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrades.service",
                 "fwupd-refresh.timer", "rpi-eeprom-update.service"]
 POWER = "radar-power.service"
+TELEMETRY = "radar-telemetry.service"
+GPSD_DROP_IN = "etc/systemd/system/gpsd.service.d/radar-runner.conf"
+TIME_FILES = ["etc/chrony/conf.d/radar-runner.conf", "etc/systemd/system/chrony.service.d/radar-runner.conf",
+              "etc/systemd/system/fake-hwclock-save.timer.d/radar-runner.conf"]
+APT_INSTALL = "apt-get -y install --no-install-recommends chrony fake-hwclock"
 UUID = "4803c5eb-0612-4afa-a67b-1ad14c085f79"
 FSTAB = ("LABEL=writable\t/\text4\tdefaults\t0\t1\n"
          "LABEL=system-boot\t/boot/firmware\tvfat\tdefaults\t0\t1\n"
@@ -49,9 +54,15 @@ class System:
             os.symlink(shutil.which(tool), self.bin / tool)
         self.path("/etc/needrestart").mkdir(parents=True)             # the needrestart package is installed
         self.path("/etc/needrestart/needrestart.conf").write_text("# stock\n")
+        self.path("/etc/default").mkdir(parents=True)                 # the gpsd package's own settings
+        self.path("/etc/default/gpsd").write_text('DEVICES=""\nGPSD_OPTIONS=""\nUSBAUTO="true"\n')
         self.state_path = tmp_path / "state.json"
-        self.set(units=list(UPDATE_UNITS), enabled=list(UPDATE_UNITS), active=list(UPDATE_UNITS),
-                 masked=[], installed=[], held=[], snap_hold="", tailscale_auto_update=True,
+        # As on the bench Pi before stage 2: gpsd started by the hotplug path (not enabled, no -n),
+        # systemd-timesyncd as the time daemon, the data drive mounted.
+        self.set(units=list(UPDATE_UNITS) + ["gpsd.service"], enabled=list(UPDATE_UNITS),
+                 active=list(UPDATE_UNITS) + ["gpsd.service", "systemd-timesyncd.service"],
+                 masked=[], installed=["gpsd", "systemd-timesyncd"], held=[], gpsd_args="/usr/sbin/gpsd",
+                 snap_hold="", tailscale_auto_update=True,
                  watchdog="0", inhibit_usec=30000000, fail="", log=[],
                  nvme_device="/dev/nvme0n1p1", nvme_uuid=UUID, nvme_label="radar-data",
                  labels=["writable", "system-boot", "radar-data"], fstab_valid=True)
@@ -69,9 +80,10 @@ class System:
         state.update(changes)
         self.state_path.write_text(json.dumps(state))
 
-    def run(self, *args):
+    def run(self, *args, **extra_env):
+        # The OLA's port: a path that does not exist, unless a test puts a file there and opens it.
         env = {"PATH": str(self.bin), "DESTDIR": str(self.root), "FAKE_STATE": str(self.state_path),
-               "HOME": str(self.root)}
+               "HOME": str(self.root), "OLA_PORT": str(self.root / "dev-ola-port"), **extra_env}
         return subprocess.run([BASH, SETUP, *args], env=env, capture_output=True, text=True, timeout=120)
 
     def path(self, name):
@@ -114,9 +126,9 @@ def same_unit_as_repository(system):
 
 
 def test_only_stand_ins_and_harmless_tools_are_reachable(system):
-    for name in ("tailscale", "systemctl", "snap", "apt-mark"):
+    for name in ("tailscale", "systemctl", "snap", "apt-mark", "apt-get"):
         assert os.path.realpath(system.bin / name) == FAKE
-    for name in ("apt-get", "apt", "sudo", "reboot", "poweroff", "ssh", "ip", "netplan"):
+    for name in ("apt", "dpkg", "sudo", "reboot", "poweroff", "ssh", "ip", "netplan", "chown"):
         assert not (system.bin / name).exists()
 
 
@@ -133,7 +145,13 @@ def test_dry_run_changes_nothing(system):
     assert "WOULD    run: snap refresh --hold" in r.stdout
     assert "WOULD    run: tailscale set --auto-update=false" in r.stdout
     assert "WOULD    run: systemctl enable --now radar-power.service" in r.stdout
-    assert "apt-get" not in r.stdout and "chrony" not in r.stdout       # no package is installed or removed
+    assert "WOULD    run: systemctl enable gpsd.service" in r.stdout
+    assert "WOULD    run: systemctl restart gpsd.service" in r.stdout
+    assert "WOULD    run: install -d -m 0755 " in r.stdout and "/mnt/nvme/radar-runner" in r.stdout
+    assert "WOULD    run: systemctl enable --now radar-telemetry.service" in r.stdout
+    assert "apt would remove systemd-timesyncd (replaced by chrony)" in r.stdout
+    assert "WOULD    run: apt-get install --no-install-recommends chrony fake-hwclock" in r.stdout
+    assert system.state["installed"] == ["gpsd", "systemd-timesyncd"]   # the plan was only simulated
 
 
 def test_apply_on_a_fresh_system(system):
@@ -152,7 +170,17 @@ def test_apply_on_a_fresh_system(system):
     assert "snap refresh --hold" in log and system.state["snap_hold"] == "forever"
     assert [c for c in log if c.startswith("tailscale")] == ["tailscale set --auto-update=false"]
     assert log.index("systemctl daemon-reload") < log.index("systemctl enable --now radar-power.service")
-    assert not any(word in c for c in log for word in ("restart", "reboot", "poweroff", "stop", "apt-get"))
+    assert not any(word in c for c in log for word in ("reboot", "poweroff", "stop"))
+    assert [c for c in log if "restart" in c] == ["systemctl restart gpsd.service"]       # nothing of this project
+    assert [c for c in log if c.startswith("apt-get")][-1] == APT_INSTALL and log[-2] == APT_INSTALL     # the last step
+    assert system.path("/mnt/nvme/radar-runner").is_dir()
+    assert filecmp.cmp(os.path.join(REPO, "systemd", "radar-telemetry.service"),
+                       system.path("/etc/systemd/system/radar-telemetry.service"), shallow=False)
+    state = system.state
+    assert {"gpsd.service", TELEMETRY, "chrony.service", "fake-hwclock-save.timer"} <= set(state["enabled"])
+    assert {"gpsd.service", TELEMETRY, "chrony.service", "fake-hwclock-save.timer"} <= set(state["active"])
+    assert "systemd-timesyncd" not in state["installed"] and {"chrony", "fake-hwclock"} <= set(state["installed"])
+    assert " -n /dev/serial/by-id/usb-u-blox" in state["gpsd_args"]
     assert not [p for p in system.tree() if ".radar-setup." in p]                         # no temporary files
     assert "a reboot is needed for:" in r.stdout
     for reason in ("logind: InhibitDelayMaxSec=5", "journald limits"):
@@ -442,6 +470,229 @@ def test_hold_packages(system):
     r = system.run("--hold-packages")
     assert r.returncode == 0, r.stdout + r.stderr
     assert sorted(system.state["held"]) == sorted(wanted)
-    assert "chrony is not installed" in r.stdout
+    assert "chrony is not installed" in r.stdout            # the holds come before the step that installs it
+    r = system.run("--hold-packages")
+    assert {"chrony", "fake-hwclock"} <= set(system.state["held"])
     r = system.run("--hold-packages")
     assert "gpsd is held" in r.stdout and "apt-mark hold" not in r.stdout
+
+
+# ---- gpsd
+
+def test_gpsd_is_enabled_given_its_receiver_and_restarted_once(system):
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    log = system.log
+    assert log.index("systemctl enable gpsd.service") < log.index("systemctl restart gpsd.service")
+    assert filecmp.cmp(os.path.join(FILES, GPSD_DROP_IN), system.path(GPSD_DROP_IN), shallow=False)
+    assert system.path("/etc/default/gpsd").read_text() == 'DEVICES=""\nGPSD_OPTIONS=""\nUSBAUTO="true"\n'   # untouched
+    r = system.run()
+    assert "gpsd.service is enabled (runs from boot)" in r.stdout and "gpsd is running with -n" in r.stdout
+    assert system.log.count("systemctl restart gpsd.service") == 1
+
+
+def test_gpsd_is_tied_to_the_receiver_and_the_hotplug_path_is_off(system):
+    assert system.run().returncode == 0
+    device = r"dev-serial-by\x2did-usb\x2du\x2dblox_AG_\x2d_www.u\x2dblox.com_u\x2dblox_GNSS_receiver\x2dif00.device"
+    assert os.path.islink(system.path(f"/etc/systemd/system/{device}.wants/gpsd.service"))
+    assert "ExecStart=/bin/true" in system.path("/etc/systemd/system/gpsdctl@.service.d/radar-runner.conf").read_text()
+    assert "systemctl enable radar-gps-receiver.service" in system.log
+    assert "radar-gps-receiver.service" in system.state["enabled"]
+    before = len(system.log)
+    r = system.run()                                   # a second run changes nothing
+    assert r.returncode == 0 and "nothing to change" in r.stdout and len(system.log) == before + 1   # the daemon-reload
+
+
+def test_gpsd_running_without_n_is_restarted_even_if_the_file_is_in_place(system):
+    assert system.run().returncode == 0
+    system.set(gpsd_args="/usr/sbin/gpsd", log=[])          # e.g. an earlier run was interrupted before the restart
+    r = system.run()
+    assert r.returncode == 0 and system.log == ["systemctl restart gpsd.service", "systemctl daemon-reload"]
+
+
+def test_gpsd_not_installed_and_hotplug_switched_off_are_reported(system):
+    system.set(installed=["systemd-timesyncd"])
+    r = system.run()
+    assert r.returncode == 0 and "gpsd is not installed: nothing done" in r.stdout
+    assert not system.path(GPSD_DROP_IN).exists() and not [c for c in system.log if "gpsd.service" in c]
+    system.set(installed=system.state["installed"] + ["gpsd"])
+    system.path("/etc/default/gpsd").write_text('USBAUTO="false"\n')
+    r = system.run()
+    assert r.returncode == 0 and "USBAUTO=false: a receiver plugged in after gpsd started will not be" in r.stdout
+    assert system.path("/etc/default/gpsd").read_text() == 'USBAUTO="false"\n'
+
+
+# ---- the telemetry service
+
+def test_telemetry_service_is_installed_enabled_and_started(system):
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "systemctl enable --now radar-telemetry.service" in system.log
+    assert "the bench tools pa_guard.py and pa_run.py cannot run" in r.stdout
+    assert system.mode("/etc/systemd/system/radar-telemetry.service") == 0o644
+    r = system.run()
+    assert "radar-telemetry.service is enabled and running (not restarted)" in r.stdout
+    assert "/mnt/nvme/radar-runner belongs to englacial" in r.stdout
+
+
+def test_running_telemetry_service_is_never_restarted_or_stopped(system):
+    assert system.run().returncode == 0
+    system.path("/etc/systemd/system/radar-telemetry.service").write_text("[Unit]\nDescription=old\n")
+    system.set(log=[])
+    r = system.run()
+    assert r.returncode == 0 and "replace /etc/systemd/system/radar-telemetry.service" in r.stdout
+    assert "keeps the old unit until it is restarted: systemctl restart radar-telemetry" in r.stdout
+    assert system.log == ["systemctl daemon-reload"]
+    # Stopped by hand for bench work: left stopped.
+    system.set(active=[u for u in system.state["active"] if u != TELEMETRY], log=[])
+    r = system.run()
+    assert "radar-telemetry.service is enabled but inactive: left as it is" in r.stdout
+    assert not [c for c in system.log if "telemetry" in c]
+
+
+def test_refuses_to_start_the_telemetry_service_while_another_program_has_the_ola_port(system):
+    port = system.root / "dev-ola-port"
+    port.parent.mkdir(parents=True, exist_ok=True)
+    port.write_text("")
+    with open(port):                        # as a bench pa_guard.py run holds the serial port
+        r = system.run()
+        assert r.returncode == 1
+        assert 'setup: FAILED in step "Telemetry service unit and data directory"' in r.stderr
+        assert f"the OLA's serial port ({port}) is in use by process {os.getpid()} " in r.stderr
+        assert "was not enabled or started" in r.stderr and "run setup again" in r.stderr
+        assert not [c for c in system.log if "radar-telemetry" in c]
+        assert TELEMETRY not in system.state["enabled"] and TELEMETRY not in system.state["active"]
+        assert not [c for c in system.log if c.startswith("apt-get")]       # stopped there
+        r = system.run("--dry-run")                                         # the dry run says so too
+        assert r.returncode == 1 and "is in use by process" in r.stderr
+    r = system.run()                        # the bench run has ended: run again
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "systemctl enable --now radar-telemetry.service" in system.log
+
+
+def test_a_port_held_by_the_running_telemetry_service_itself_is_no_obstacle(system):
+    assert system.run().returncode == 0
+    port = system.root / "dev-ola-port"
+    port.write_text("")
+    with open(port):                        # the service is enabled and running: it is the holder
+        r = system.run()
+    assert r.returncode == 0 and "radar-telemetry.service is enabled and running (not restarted)" in r.stdout
+
+
+def test_data_drive_not_mounted_is_reported_and_the_service_still_installed(system):
+    system.set(nvme_device="")
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "/mnt/nvme is not mounted: /mnt/nvme/radar-runner cannot be made now" in r.stdout
+    assert not system.path("/mnt/nvme/radar-runner").exists()
+    assert TELEMETRY in system.state["active"]
+
+
+# ---- time: chrony and fake-hwclock in place of systemd-timesyncd
+
+def test_time_packages_are_downloaded_first_then_installed(system):
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    apt = [c for c in system.log if c.startswith("apt-get")]
+    assert apt == ["apt-get -y --download-only install --no-install-recommends chrony fake-hwclock",
+                   "apt-get -y --download-only --reinstall install systemd-timesyncd",     # the way back, in the cache
+                   APT_INSTALL]
+    for rel in TIME_FILES:                      # in place before the packages start their services
+        assert filecmp.cmp(os.path.join(FILES, rel), system.path(rel), shallow=False)
+    assert "chrony.service is running" in r.stdout
+    assert "fake-hwclock saves the clock every minute and at shutdown" in r.stdout
+    r = system.run()
+    assert "chrony and fake-hwclock are installed" in r.stdout and "setup: nothing to change." in r.stdout
+    assert [c for c in system.log if c.startswith("apt-get")] == apt
+
+
+@pytest.mark.parametrize("extra, message", [
+    (["Remv tailscale [1.80.0]"], "remove:tailscale"),
+    (["Remv openssh-server [1:9.6p1]"], "remove:openssh-server"),
+    (["Inst libc6 [2.39-0ubuntu8.4] (2.39-0ubuntu8.6 Ubuntu:24.04/noble-updates [arm64])"], "upgrade:libc6"),
+    (["Inst tzdata [2025b-0ubuntu0.24.04.1] (2026e-0ubuntu0.24.04.1 Ubuntu:24.04/noble-security [all])"], "upgrade:tzdata"),
+])
+def test_time_step_refuses_when_apt_would_remove_or_upgrade_anything_else(system, extra, message):
+    system.set(apt_extra_plan=extra)
+    r = system.run()
+    assert r.returncode == 1 and message in r.stderr and "Nothing was changed" in r.stderr
+    assert not [c for c in system.log if c.startswith("apt-get")]           # only the simulation ran
+    assert "systemd-timesyncd" in system.state["installed"] and "systemd-timesyncd.service" in system.state["active"]
+    assert TELEMETRY in system.state["active"]                              # every step before it was done
+
+
+def test_time_step_without_internet_changes_nothing(system):
+    system.set(offline=True)
+    r = system.run()
+    assert r.returncode == 1 and "cannot download chrony fake-hwclock" in r.stderr
+    assert "systemd-timesyncd stays" in r.stderr
+    assert system.state["installed"] == ["gpsd", "systemd-timesyncd"]
+    assert "systemd-timesyncd.service" in system.state["active"]
+    system.set(offline=False)                   # later, with internet: run again
+    r = system.run()
+    assert r.returncode == 0 and "chrony" in system.state["installed"]
+
+
+def test_time_step_when_apt_cannot_plan(system):
+    system.set(apt_broken=True)
+    r = system.run()
+    assert r.returncode == 1 and "apt cannot work out how to install chrony fake-hwclock" in r.stderr
+    assert "Unable to locate package chrony" in r.stderr
+    assert not [c for c in system.log if c.startswith("apt-get")]
+
+
+def test_interrupted_dpkg_is_named_with_the_command_that_finishes_it(system):
+    system.set(dpkg_interrupted=True)
+    r = system.run()
+    assert r.returncode == 1
+    assert "an earlier package installation was interrupted" in r.stderr
+    assert "sudo dpkg --configure -a" in r.stderr and "then run setup again" in r.stderr
+    assert "apt-get update" not in r.stderr                                 # that would not help here
+    assert not [c for c in system.log if c.startswith("apt-get")]
+    system.set(dpkg_interrupted=False)
+    assert system.run().returncode == 0
+
+
+def test_failed_install_puts_systemd_timesyncd_back(system):
+    system.set(apt_install_fails=True)
+    r = system.run()
+    assert r.returncode == 1 and "RECOVER  apt-get install chrony fake-hwclock failed" in r.stdout
+    assert "systemd-timesyncd is installed and running again" in r.stderr
+    assert system.log[-2:] == ["apt-get -y install systemd-timesyncd", "systemctl start systemd-timesyncd.service"]
+    assert "systemd-timesyncd" in system.state["installed"] and "systemd-timesyncd.service" in system.state["active"]
+    assert "chrony" not in system.state["installed"]
+
+
+def test_chrony_that_does_not_start_puts_systemd_timesyncd_back(system):
+    system.set(chrony_wont_start=True)
+    r = system.run()
+    assert r.returncode == 1 and "RECOVER  chrony does not start" in r.stdout
+    assert "systemctl start chrony.service" in system.log                   # tried once
+    assert "systemd-timesyncd.service" in system.state["active"] and "chrony" not in system.state["installed"]
+
+
+def test_no_way_back_is_said_loudly(system):
+    system.set(apt_install_fails=True, timesyncd_gone_for_good=True)
+    r = system.run()
+    assert r.returncode == 1 and "NO TIME DAEMON IS RUNNING" in r.stderr
+    assert r.stderr.index("sudo dpkg --configure -a") < r.stderr.index("sudo apt-get install systemd-timesyncd")
+
+
+def test_changed_time_settings_restart_chrony_and_the_timer(system):
+    assert system.run().returncode == 0
+    system.path(TIME_FILES[0]).write_text("refclock SHM 0\n")
+    system.set(log=[])
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert system.log == ["systemctl daemon-reload", "systemctl restart chrony.service",
+                          "systemctl restart fake-hwclock-save.timer", "systemctl daemon-reload"]
+    assert filecmp.cmp(os.path.join(FILES, TIME_FILES[0]), system.path(TIME_FILES[0]), shallow=False)
+
+
+def test_apt_runs_without_prompts_and_without_needrestart(system):
+    # The stand-in refuses (status 98) unless DEBIAN_FRONTEND=noninteractive and NEEDRESTART_SUSPEND=1 are set.
+    r = system.run()
+    assert r.returncode == 0 and "would have been interactive" not in r.stdout + r.stderr
+    text = open(SETUP).read()
+    assert "DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1" in text
+    assert "autoremove" not in text and "dist-upgrade" not in text and "apt-get upgrade" not in text
