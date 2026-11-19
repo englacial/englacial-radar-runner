@@ -477,6 +477,8 @@ def test_a_stopped_watcher_leaves_a_not_ok_status_and_does_not_kill_a_running_to
     r.watcher.cleanup()
     d = r.status().data
     assert d["ok"] is False and d["reason"] == "the safety watcher is not running" and d["running"] is False
+    assert d["problems"][0] == {"condition": "watcher", "text": "the safety watcher is not running", "trip": False}
+    assert d["tripped"] is True and d["problems"][1]["condition"] == "amp_enabled"     # what it knew last stays visible
     assert proc.poll() is None                      # left to finish: a kill would leave the amplifier enabled
     assert gone(proc) == 0 and r.tool.succeeded
     assert "amp_safe: OK" in (r.tmp / "run" / "watcher-reset-tool.out").read_text()    # its output had somewhere to go

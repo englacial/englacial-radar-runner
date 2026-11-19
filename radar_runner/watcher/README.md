@@ -74,7 +74,7 @@ service publishes a new one every 0.5 s).
 | Amplifier temperature (only with the 28 V present) or case temperature | warning at 50 C; **trip at 55 C**; clears below 50 C for 30 s | not ok, tripped | `pa_run.py` `TEMP_WARN_C`, `TEMP_STOP_C` (thermal design limit 55 C, derating from 60 C). Recover level and hold: chosen here |
 | 28 V rail while powered (20 V or more) | **trip outside 26-30.5 V**; clears inside 26.5-30.0 V for 30 s | not ok, tripped | plan; `pa_run.py` `VOLT_MIN`, `VOLT_STOP`; 30.0 is its `VOLT_MAX` |
 | 28 V rail absent (below 20 V) | no trip, no event beyond one line, no action by itself. The radar may not run (`allow_unpowered: true` changes that, for bench work) | not ok, not tripped | `pa_run.py` `VOLT_POWERED`; the user's rule "no RF into an unpowered amplifier" |
-| 28 V rail below 26 V while the power service reports a power loss | treated as "absent", not as a supply fault: the rail is on its way down | not ok, not tripped | chosen here |
+| 28 V rail below 26 V while the power service reports a power loss | treated as "absent", not as a supply fault: the rail is on its way down. The `not_ok` event is then `info`, not `warning`: a power loss is the normal end of a day | not ok, not tripped | chosen here |
 | No telemetry for more than 3 s | the radar may not run, with the reason from the telemetry service | not ok, not tripped | plan ("a few seconds"); `pa_run.py` `STALE_S` was 2 s on raw rows |
 | No telemetry, override set | not a problem; everything that can still be judged is | ok, warning | plan |
 | Enabled current (above 0.5 A) for 5 s with no radar process | run the reset tool, see below | not ok, tripped | `pa_guard.py` `IDLE_ENABLED_TRIP_S`, `CURRENT_SHUTDOWN_MAX_A` (shutdown 0.156 A, enabled about 2.5 A) |

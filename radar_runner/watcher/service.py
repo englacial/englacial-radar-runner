@@ -230,7 +230,8 @@ class Watcher(Service):
         self._emit({"event": "stop", "severity": L.INFO, "text": "safety watcher stopping"})
         # Say so at once: a stopped watcher must not leave "ok" behind, not even for the 5 s it stays fresh.
         data = self._status(self._uptime(), self._inputs_seen)
-        data.update(ok=False, reason=STOPPED, running=False)
+        data.update(ok=False, reason=STOPPED, running=False,
+                    problems=[{"condition": "watcher", "text": STOPPED, "trip": False}] + data["problems"])
         self.publish(data)
         self.events.close()
 

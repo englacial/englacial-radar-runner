@@ -873,7 +873,8 @@ def _(name):
     warnings = [w.get("text", "?") for w in d.get("warnings") or []]
     check("safety watcher warnings", not warnings, "; ".join(warnings) or "none")
     for problem in d.get("config_warnings") or []:
-        report(FAIL, "safety watcher settings", problem)
+        if "watcher" in problem:        # other sections' problems are not this service's
+            report(FAIL, "safety watcher settings", problem)
     tool = d.get("reset_tool") or {}
     check("reset tool as the watcher will run it", tool.get("runnable") is True, f"{tool.get('command')}: "
           + ("can be run" if tool.get("runnable") is True else "missing or not executable"))

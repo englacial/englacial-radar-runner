@@ -391,7 +391,7 @@ def test_an_unpowered_amplifier_is_not_ok_but_no_trip_and_no_action():
     assert sim.logic.reason == "amplifier 28 V absent: the radar must not transmit into an unpowered amplifier"
     sim.run(600.0)
     assert sim.signals == [] and sim.tool_starts == [] and sim.named("trip") == []
-    assert [e["event"] for e in sim.events] == ["unpowered", "not_ok"] and sim.events[0]["severity"] == "info"
+    assert [(e["event"], e["severity"]) for e in sim.events] == [("unpowered", "info"), ("not_ok", "warning")]
     sim.amp.update(GOOD)                            # the rail is back: ok after the hold
     sim.run(29.0)
     assert not sim.ok
@@ -424,6 +424,8 @@ def test_the_rail_falling_during_a_power_loss_is_not_a_supply_trip():
         sim.run(1.0)
     assert not sim.tripped and sim.named("trip") == [] and not sim.ok
     assert sim.state("voltage") == "unpowered" and sim.signals == [] and sim.tool_starts == []
+    # The normal end of a day: nothing in the event log that asks for attention.
+    assert [(e["event"], e["severity"]) for e in sim.events] == [("unpowered", "info"), ("not_ok", "info")]
     # The same voltages with the power service saying nothing about a loss: a supply fault.
     sim = started()
     sim.amp["voltage_v"] = 23.0

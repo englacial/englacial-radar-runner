@@ -500,14 +500,16 @@ class WatcherLogic:
         if ok != self.ok:
             self._not_ok_since = None if ok else now
         self.ok = ok
-        if self.ready(now) and ok != self._reported_ok:
-            if not ok or self._reported_ok is not None:     # a first "ok" after the start is not news
-                self._event("ok" if ok else "not_ok", INFO if ok else WARNING,
-                            "the radar may run again" if ok else f"the radar may not run: {problems[0][1]}")
-            self._reported_ok = ok
         self.tripped = any(trip for _, _, trip in problems)
         self.reason = problems[0][1] if problems else ""
         self.problems = [{"condition": key, "text": text, "trip": trip} for key, text, trip in problems]
+        if self.ready(now) and ok != self._reported_ok:
+            if not ok or self._reported_ok is not None:     # a first "ok" after the start is not news
+                # Not ok during a power loss is the normal end of a day, not something to alert about.
+                calm = ok or (inp.power_lost and not self.tripped)
+                self._event("ok" if ok else "not_ok", INFO if calm else WARNING,
+                            "the radar may run again" if ok else f"the radar may not run: {self.reason}")
+            self._reported_ok = ok
 
     # ---- a radar process that outlives a not-ok status
 
