@@ -116,6 +116,11 @@ TPV = {"class": "TPV", "device": "/dev/ttyACM0", "mode": 3, "time": "2026-11-19T
        "sep": 33.756}
 SKY = {"class": "SKY", "device": "/dev/ttyACM0", "time": "2026-11-19T01:05:40.600Z", "hdop": 0.96, "pdop": 1.63,
        "vdop": 1.31}
+# As gpsd 3.25 reports this receiver once it has identified it; before that "subtype" is "" and there is no "subtype1".
+DEVICE = {"class": "DEVICE", "path": "/dev/ttyACM0", "driver": "u-blox", "subtype": "SW EXT CORE 1.00 (9e1716),HW 00190000",
+          "subtype1": "ROM BASE 0x118B2060,FWVER=HPG 1.51,PROTVER=27.50,MOD=ZED-F9P,GPS;GLO;GAL;BDS,SBAS;QZSS",
+          "activated": "2026-11-19T20:16:27.373Z", "flags": 1, "native": 1, "bps": 9600, "parity": "N", "stopbits": 1,
+          "cycle": 1.00, "mincycle": 0.02}
 
 
 class FakeGpsd:
@@ -125,6 +130,7 @@ class FakeGpsd:
         self.tpv = dict(TPV)
         self.sky = dict(SKY)
         self.active = 1
+        self.devices = [dict(DEVICE)]
         self.second = 0
         self.advance = True         # the fix time moves on between polls
         self.answer = True
@@ -139,9 +145,11 @@ class FakeGpsd:
         self.sent.append(data)
         if not self.answer:
             return
+        devices = json.dumps({"class": "DEVICES", "devices": self.devices}, separators=(",", ":")).encode() + b"\r\n"
         if data.startswith(b"?WATCH"):
-            self._out += (b'{"class":"DEVICES","devices":[]}\r\n'
-                          b'{"class":"WATCH","enable":true,"json":false,"nmea":false,"raw":0}\r\n')
+            self._out += devices + b'{"class":"WATCH","enable":true,"json":false,"nmea":false,"raw":0}\r\n'
+        elif data.startswith(b"?DEVICES;"):
+            self._out += devices
         elif data.startswith(b"?POLL"):
             if self.advance:
                 self.second += 1

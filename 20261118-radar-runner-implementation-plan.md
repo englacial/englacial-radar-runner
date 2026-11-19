@@ -115,7 +115,7 @@ PPS will be wired to the SDR, not the Pi. The system clock therefore comes from 
 
 ### When to run the GPIO reset tool
 
-Every UHD initialisation on this SDR drives the front-panel pins low as outputs, which enables the amplifier for about half a second with a short RF burst, until the program writes the pin. This is true of ORCA, of every UHD tool and of the reset tool itself. A reset run that fails or is killed after initialisation leaves a previously safe amplifier enabled. So the tool runs only when the pin is not known to be safe.
+With any UHD other than the build adopted on 2026-11-19 (below), every UHD initialisation on this SDR drives the front-panel pins low as outputs, which enables the amplifier for about half a second with a short RF burst, until the program writes the pin. That is true of ORCA, of every UHD tool and of the reset tool itself, and the rules in this section still assume it. A reset run that fails or is killed after initialisation leaves a previously safe amplifier enabled. So the tool runs only when the pin is not known to be safe.
 
 The pin is known to be safe when the last thing that initialised the SDR was one of:
 
@@ -129,7 +129,26 @@ The tool runs in every other case: ORCA killed or crashed, another UHD program u
 
 Measured on 2026-11-19 with the scope on GPIO_0, the 28 V on and the bench guard armed (first run of the tool, first contact after power-up): the pin read high while floating; there were no edges during the firmware load (5.9 s) or the FPGA load (8.2 s); the pin then went low for 480 ms, with the 12 V feed up by about 5.5 A (about 94 W), and went high at the tool's write and stayed high. The tool took 16.7 s in total and reported OK. Time limits for callers must allow for a first contact of that length. A second run with the firmware and FPGA already loaded took 3.5 s in total (1.5 s to initialise, plus the 1.5 s recheck). In that run a triggered capture showed one falling edge with no glitch in the 25 ms before it, the 12 V feed up by about 5.2 A within 1 ms, and no RF burst within the first 95 ms of the low period above the capture's sensitivity (about +17 dBm at the amplifier output). The bursts in the bring-up notes were seen later in the low period and at lower levels with the VVA at 5 V, so this capture neither confirms nor rules them out.
 
-TODO (deferred, user is interested): change the patched UHD so that it does not force the B2xx front-panel pins to outputs at initialisation. This should remove the start-up enable and its RF burst for ORCA, every UHD tool and the reset tool. A draft patch with its risks and test list is in `docs/uhd-proposals/`. It needs a UHD rebuild, a scope on GPIO_0 at start-up and a HIL re-run.
+UHD change, adopted 2026-11-19 (user): the UHD build in use no longer forces the B2xx front-panel pins to outputs at initialisation, so opening the SDR does not enable the amplifier. The patch and its notes are in `docs/uhd-proposals/`.
+
+Tested on 2026-11-19 (bench, VVA 5 V, scope on GPIO_0). The patch is built in `~/uhd-patched-gpio` from `~/uhd-gpio`, on top of the TR-switch fix; `~/uhd-patched` is unchanged. Results with the patched build: the reset tool (warm, GPIO_0 disconnected from the amplifier) and ORCA under the manager (warm with GPIO_0 disconnected, then a cold start with the amplifier connected at tx_gain 60) all initialised with no set-up low and no supply step, where the existing build gave a 480 ms low and about +5.4 A every time. Pulses were unchanged (11.5 us low every 200 us), the pin was steady high after each stop, and the recorded loopback matched the existing build's to 0.1 dB (so the TR-switch fix still works in this build). Still present: a 4 ns glitch on GPIO_0 at the end of the FPGA load on a first contact after power-up; it comes from the FPGA load, not from UHD's GPIO set-up, and the supply current does not respond to it. The patched library has no built-in search path for the conda Boost libraries, so it is selected with `LD_LIBRARY_PATH=/home/englacial/uhd-patched-gpio/lib:/home/englacial/miniforge3/envs/orca/lib` (set as `manager.orca.env` in `/etc/radar-runner/local.yaml` on the bench at the moment). (The library was later rebuilt with the HIL build script, which gives it its own search path; no environment setting is needed now.)
+
+Peak draw on the 12 V supply over a cold start (scope, raw clamp reading): 98.3 W with the earlier build (in the set-up low), 33.7 W with the patched build (ordinary pulsing). Average power is unchanged.
+
+HIL fast tier with the patched build, twice (2026-11-19, fixture `docs/uhd-proposals/hil/loopback_50m_pa_atpower_gpio_uhd.yaml`, ORCA 0b0b051): 10 of 10 passed both times, no guard trip, values in line with the 2026-11-17 runs (T1 loopback -36.0 dBFS, T8 slope 1.006, T10 power change after errors under 0.1 dB). On the scope, none of the 53 radar starts and neither `uhd_usrp_probe` run enabled the amplifier. The three 480 ms enables left in each session are the bench helper `~/radar-testbench/pa_bringup/gpio_hold`, which is still linked against the earlier build.
+
+What the adoption consists of:
+- UHD source `~/uhd-gpio` at c3e2439c5 (UHD 4.11.0 + TR-switch fix + this patch), installed in `~/uhd-patched-gpio`; the commit is pinned in `setup/pins.toml`.
+- The reset tool is built against it (`tools/sdr_gpio_safe/CMakeLists.txt`); the rebuilt tool gave no edge on GPIO_0 in two runs with the amplifier connected.
+- The manager's ORCA build names it in full (`manager.orca.build_commands`) and drops the library and headers found by an earlier configure, so the result does not depend on what an earlier build or a HIL session left in ORCA's build directory. (CMake keeps the UHD library it found first; the HIL harness's own build has the same limit, so a build directory first made against one UHD keeps linking it. On 2026-11-19 the radar binary was linked against the earlier library file and loaded the patched one, which came first in its search path; the two have the same interface.)
+- `setup/check.py` fails if the reset tool or the radar binary loads any other libuhd.
+- The safety rules are unchanged: the pin still counts as unknown before every launch and the tool still reports "assume enabled" if it is cut short. With this build that is pessimistic; with any other libuhd it is still right.
+
+Also moved to this build on 2026-11-19 (user's decision): the bench helpers `gpio_hold` and `gpio_release` and the guard's tool directory in `~/radar-testbench`, and the HIL harness in `~/orca/tests/hil` (standard fixture, `build_uhd.sh` defaults, and the same `-U` flags in its radar build; uncommitted there). The earlier install was moved to `~/uhd-patched.retired-20261119`; no built program references it.
+
+A consequence for any program that drives the pin: it now starts as an input, so the level must be set before the direction. ORCA (ATR levels, then control, then direction) and the reset tool do this and show no edge. The bench helper `gpio_hold` set the direction first and gave a 0.06 to 0.1 ms low with a partial amplifier response (about +0.5 A for 1 to 2 ms) in the first scope check of the rebuilt helper; its order was then changed, and a second check showed no transition on GPIO_0 in two runs.
+
+Open: the 4 ns glitch at the end of the FPGA load on a first contact after power-up is not removed by this patch.
 
 ORCA changes. Each needs the user's approval before work starts.
 
@@ -317,7 +336,7 @@ Things that must not be copied blindly to a second Pi are kept apart from the co
 * The NVMe mount: mounted by filesystem label instead of by UUID, so that any drive with the right label works
 * Settings stored in hardware, not on the card: the Pi's bootloader configuration, the GPS receiver settings and the OLA settings. The last two are applied at every boot anyway; the check script covers the bootloader
 
-Inputs that need internet today are stored so that a rebuild works without it: the stock Ubuntu image, the Python wheels, the UHD source with its patch (or the built copy in `~/uhd-patched`), the SDR's FPGA images, and a list of installed package versions. Only the packages that matter to the radar (kernel, gpsd, chrony) are held at fixed versions.
+Inputs that need internet today are stored so that a rebuild works without it: the stock Ubuntu image, the Python wheels, the UHD source with its patch (or the built copy in `~/uhd-patched-gpio`), the SDR's FPGA images, and a list of installed package versions. Only the packages that matter to the radar (kernel, gpsd, chrony) are held at fixed versions.
 
 The setup script is proven by using it: one card is built from the stock image before shipping and has to pass the check script and the stage tests. If there is no time for that, the clone is the fallback, and the script stays unproven until tested.
 

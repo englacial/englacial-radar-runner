@@ -91,9 +91,19 @@ DEFAULTS = {
             "answer_timeout_s": 10.0,            # no answer from gpsd for this long: reconnect
             "reconnect_s": 5.0,
             "no_data_error_s": 30.0,             # receiver present but no fix time for this long: error
-            # Run a little after every OLA start ("" = never): see setup/gps_receiver.py
+            # Run a little after every OLA start and without a position ("" = never): see setup/gps_receiver.py
             "receiver_fix_command": "/usr/bin/python3 -B /home/englacial/englacial-radar-runner/setup/gps_receiver.py --apply --ram",
             "receiver_fix_delay_s": 15.0,
+            "receiver_fix_timeout_s": 180.0,     # the command is stopped after this (it limits itself to about 100 s); at least 30
+            # gpsd has a receiver but no 2D/3D fix for this long: a warning, and the status says why
+            # (sources.gps.no_position). "gpsd_unidentified" and "no_position_messages" are errors;
+            # "no_fix" (no satellites) is not. 60 s: a cold start under open sky takes about 25 s.
+            "no_position_warn_s": 60.0,
+            # Then the receiver command is run again: after this long without a position, then after
+            # twice the previous wait each time, up to the maximum (2, 6, 14, 30 min, then every
+            # 30 min). Both at least 30.
+            "no_position_retry_s": 120.0,
+            "no_position_retry_max_s": 1800.0,
         },
     },
     # The safety watcher (radar_runner/watcher/README.md, which says where each number comes from).
@@ -230,11 +240,21 @@ DEFAULTS = {
 
         "orca": {
             "dir": "/home/englacial/orca",
-            "env": [],                          # extra environment for the commands below, as "NAME=value"
+            # Extra environment for the commands below, as "NAME=value". ORCA's build reads CONDA_PREFIX.
+            "env": ["CONDA_PREFIX=/home/englacial/miniforge3/envs/orca"],
             "chirp_command": ["/home/englacial/miniforge3/envs/orca/bin/python", "generate_chirp.py", "{config}"],
             "chirp_cwd": "preprocessing",       # relative to dir
             "chirp_timeout_s": 120.0,
-            "build_commands": [["cmake", ".."], ["make", "radar"]],     # only the radar target, not ORCA's tests
+            # Only the radar target, not ORCA's tests. The UHD is named in full, so that a new build
+            # directory and an old one give the same binary: the build that leaves the SDR's
+            # front-panel pins as inputs at initialisation (setup/pins.toml: uhd_prefix), with the
+            # environment that holds Boost and yaml-cpp. The two -U drop the library and headers
+            # that an earlier configure found: without them an old build directory keeps its UHD.
+            "build_commands": [["cmake", "..", "-UUHD_LIBRARIES", "-UUHD_INCLUDE_DIRS",
+                                "-DCMAKE_PREFIX_PATH=/home/englacial/uhd-patched-gpio;/home/englacial/miniforge3/envs/orca",
+                                "-DUHD_DIR=/home/englacial/uhd-patched-gpio/lib/cmake/uhd",
+                                "-DCMAKE_BUILD_RPATH=/home/englacial/uhd-patched-gpio/lib"],
+                               ["make", "radar"]],
             "build_cwd": "sdr/build",
             "build_timeout_s": 900.0,
             "radar_command": ["./radar", "{config_rel}"],   # {config_rel}: the config, relative to dir
@@ -360,7 +380,6 @@ DEFAULTS = {
             "clear_s": 60.0,                    # gone for this long: "cleared"
         },
         "error_rate_warn": 0.05,                # a run with ORCA's error count above this fraction of its pulses
-
         "disk": {
             "free_gb_levels": [200.0, 100.0, 50.0, 25.0],   # data drive: one alert at each; the last one is high priority
             "rearm_fraction": 0.1,              # a level alerts again once the free space was 10 % above it
@@ -378,6 +397,15 @@ DEFAULTS = {
 # (offload: stage 9); they are passed over without a warning and not used.
 RESERVED = ("offload",)
 
+# Text settings for which "" is a value of its own (otherwise empty text is refused).
+_EMPTY_ALLOWED = {"telemetry.gps.receiver_fix_command"}         # "": never run it
+# Lower limits: a smaller value is raised to the limit, with a warning.
+_MINIMUM = {
+    "telemetry.gps.no_position_retry_s": 30.0,          # 0 would run the receiver command back to back
+    "telemetry.gps.no_position_retry_max_s": 30.0,
+    "telemetry.gps.receiver_fix_timeout_s": 30.0,       # shorter would stop every run
+}
+
 _TYPE_NAMES = {bool: "true or false", int: "a whole number", float: "a number", str: "text",
                list: "a list", dict: "a section"}
 
@@ -390,14 +418,14 @@ def _type_name(value):
     return _TYPE_NAMES.get(type(value), type(value).__name__)
 
 
-def _convert(default, value):
+def _convert(default, value, empty_ok=False):
     """Return `value` as the type of `default`, or raise ValueError."""
     kind = type(default)
     if kind is float:
         if type(value) not in (int, float) or not math.isfinite(value):
             raise ValueError
         return float(value)
-    if type(value) is not kind or (kind is str and not value):
+    if type(value) is not kind or (kind is str and not value and not empty_ok):
         raise ValueError
     return value
 
@@ -415,10 +443,14 @@ def _merge(base, layer, where, prefix, warnings):
                 warnings.append(f"{where}: {name} must be a section, not {_type_name(value)}: ignored")
         else:
             try:
-                base[key] = _convert(base[key], value)
+                base[key] = _convert(base[key], value, name in _EMPTY_ALLOWED)
             except ValueError:
                 warnings.append(f"{where}: {name} must be {_type_name(base[key])}, "
                                 f"not {_type_name(value)}: ignored")
+                continue
+            if name in _MINIMUM and base[key] < _MINIMUM[name]:
+                warnings.append(f"{where}: {name} must be at least {_MINIMUM[name]:g}: {_MINIMUM[name]:g} used")
+                base[key] = _MINIMUM[name]
 
 
 def _read_layer(path, optional, secret, warnings):

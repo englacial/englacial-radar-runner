@@ -133,6 +133,34 @@ def git(path, *args):
     return out("git", "-c", f"safe.directory={path}", "-C", path, *args)
 
 
+# The one UHD build that every program here uses: it leaves the SDR's front-panel pins as inputs
+# at initialisation, so opening the SDR does not enable the amplifier (docs/uhd-proposals).
+_uhd = PINS.get("uhd_prefix") or "~/uhd-patched-gpio"
+UHD_PREFIX = os.path.join(HOME, _uhd[2:]) if _uhd.startswith("~/") else _uhd     # the owner's home, also under sudo
+
+
+def loaded_libuhd(binary, extra_env=()):
+    """The libuhd file that `binary` loads when started with `extra_env` ("NAME=value" items) and
+    no LD_LIBRARY_PATH of the caller's; "" if that cannot be told."""
+    env = {k: v for k, v in os.environ.items() if k not in ("LD_LIBRARY_PATH", "LD_PRELOAD")}
+    env.update(str(item).split("=", 1) for item in extra_env if "=" in str(item))
+    try:
+        text = subprocess.run(["ldd", binary], capture_output=True, text=True, timeout=30, env=env,
+                              stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    m = re.search(r"libuhd\.so\S*\s+=>\s+(/\S+)", text)
+    return os.path.realpath(m.group(1)) if m else ""
+
+
+def check_loads_patched_uhd(name, binary, extra_env=()):
+    lib = loaded_libuhd(binary, extra_env)
+    want = os.path.realpath(os.path.join(UHD_PREFIX, "lib"))
+    check(name, os.path.dirname(lib) == want, lib or "no libuhd found by ldd",
+          f"a library in {want}: any other UHD drives the amplifier's enable pin low for about half a second "
+          "each time the SDR is opened")
+
+
 def logind(prop):
     rc, text, err = run("busctl", "get-property", "org.freedesktop.login1", "/org/freedesktop/login1",
                         "org.freedesktop.login1.Manager", prop)
@@ -330,13 +358,13 @@ def _(name):
 
 @item("patched UHD build")
 def _(name):
-    path = os.path.join(HOME, "uhd-patched", "ORCA_UHD_BUILD.yaml")
+    path = os.path.join(UHD_PREFIX, "ORCA_UHD_BUILD.yaml")
     text = read(path)
     if text is None:
         report(FAIL, name, f"{path} missing")
         return
     fields = dict(re.findall(r'^(\w+):\s*"?([^"\n]*)"?\s*$', text, re.M))
-    lib = os.path.join(HOME, "uhd-patched", "lib", "libuhd.so")
+    lib = os.path.join(UHD_PREFIX, "lib", "libuhd.so")
     check(name, os.path.exists(lib) and fields.get("dirty") == "false",
           f"{fields.get('uhd_version')}, built {fields.get('built_utc')}, dirty: {fields.get('dirty')}, "
           f"libuhd.so {'present' if os.path.exists(lib) else 'MISSING'}", "library present, built from a clean tree")
@@ -707,7 +735,7 @@ def _(name):
     check("Ubuntu's gpsdctl hotplug path switched off", "/bin/true" in exec_start and "gpsdctl add" not in exec_start,
           "no-op" if "/bin/true" in exec_start else "still runs gpsdctl add", "no-op (the receiver was opened twice at boot otherwise)")
     enabled, _active = unit_state("radar-gps-receiver.service")
-    check("radar-gps-receiver.service (once-per-boot receiver setting check)", enabled == "enabled", enabled, "enabled")
+    check("radar-gps-receiver.service (receiver check after every start of gpsd)", enabled == "enabled", enabled, "enabled")
 
 
 @item("gpsd hotplug (USBAUTO in /etc/default/gpsd)")
@@ -715,6 +743,34 @@ def _(name):
     found = re.findall(r'^USBAUTO="?(\w+)"?', read("/etc/default/gpsd") or "", re.M)
     check(name, bool(found) and found[-1] == "true", f"USBAUTO={found[-1]}" if found else "not set",
           'USBAUTO="true": a replugged receiver is added by udev and gpsdctl')
+
+
+def gps_identification(devices):
+    """(status, observed) for gpsd's identification of the receiver, from its DEVICES report.
+
+    `subtype` comes from the receiver's version reply. On 2026-11-19, after a power cut, it was
+    empty, the receiver sent gpsd no position message, and gpsd delivered no position for 77
+    minutes (setup/gps_receiver.py has what gpsd does and what is inferred).
+    """
+    if devices is None:
+        return SKIP, "gpsd did not send its list of devices"
+    if not devices:
+        return SKIP, "gpsd has no receiver"
+    missing = [d.get("path") for d in devices
+               if not (d.get("subtype1") or d.get("subtype") not in (None, "", "Unknown"))]
+    if missing:
+        return FAIL, (f"gpsd has not identified {', '.join(map(str, missing))}: no version reply seen "
+                      "(setup/gps_receiver.py --apply --ram asks the receiver for its version)")
+    return PASS, "; ".join(str(d.get("subtype1") or d.get("subtype")) for d in devices)
+
+
+def gps_fix_finding(tpv):
+    """(status, observed) for gpsd's latest fix. gpsd clears the fix at every cycle, so a fix time
+    with mode 0 (or none) means that no position message (NAV-PVT) came from the receiver."""
+    if tpv.get("time") and not tpv.get("mode"):
+        return FAIL, ("fix time but mode 0: the receiver sends gpsd no position message "
+                      "(setup/gps_receiver.py --apply --ram switches NAV-PVT on)")
+    return INFO, {2: "2D fix", 3: "3D fix"}.get(tpv.get("mode"), "no position fix (chrony gets GPS time only with a fix)")
 
 
 @item("GPS receiver")
@@ -738,6 +794,7 @@ def _(name):
                     break
     except OSError as e:
         report(FAIL, name + " known to gpsd", f"cannot ask gpsd: {e}")
+        report(SKIP, name + " identified by gpsd", "cannot ask gpsd")
         return
     paths = [d.get("path") for d in devices or []]
     tpv = (reply.get("tpv") or [{}])[0]
@@ -746,7 +803,10 @@ def _(name):
     check(name + " known to gpsd, once", len(paths) == 1 and reply.get("active") == 1,
           f"{len(paths)} device(s) {paths}, {reply.get('active', 0)} active; fix mode {tpv.get('mode')}, time {tpv.get('time')}",
           "exactly 1 device, active")
-    report(INFO, name + " fix", {2: "2D fix", 3: "3D fix"}.get(tpv.get("mode"), "no position fix (chrony gets GPS time only with a fix)"))
+    status, observed = gps_identification(devices)
+    report(status, name + " identified by gpsd", observed)
+    status, observed = gps_fix_finding(tpv)
+    report(status, name + " fix", observed)
 
 
 @item("GPS receiver settings (asked of the receiver)")
@@ -997,6 +1057,25 @@ def _(name):
     record = read(os.path.join(MANAGER_STATE_DIR, "sdr-state"))
     report(INFO, "SDR amplifier pin record", " ".join(record.split("\n")[:2]) if record else
            "no record yet (treated as unknown)")
+
+
+@item("reset tool loads the patched UHD")
+def _(name):
+    binary = os.path.join(os.path.dirname(AMP_SAFE), "build", "sdr_gpio_safe")
+    if not os.access(binary, os.X_OK):
+        raise Skip("the tool is not built")
+    check_loads_patched_uhd(name, binary)
+
+
+@item("radar binary loads the patched UHD")
+def _(name):
+    orca = manager_settings()["manager"]["orca"]
+    radar = os.path.join(orca["dir"], orca["radar_cwd"], orca["radar_command"][0])
+    if os.path.exists(radar):       # as last built; the manager rebuilds it at every start
+        check_loads_patched_uhd(name, radar, orca["env"])
+    else:
+        report(INFO, name, f"{radar} is not built yet (the manager builds it at the first start; "
+               "run this check again after that)")
 
 
 @item("radar config and its limits")

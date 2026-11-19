@@ -17,6 +17,7 @@ for bench work: README.md in this directory.
 """
 import os
 import shlex
+import signal
 import subprocess
 import time
 
@@ -35,6 +36,18 @@ UPS_COLUMNS = ("status", "capacitor_v", "current_a", "power_present", "state", "
                "radar_stop_requested", "low_voltage")
 CLOCK_STEP_S = 0.5      # a change of wall clock against uptime larger than this is a step
 RECENT_S = 60.0         # "recent" in the loop's own health: the last one to two minutes
+# Exit status of setup/gps_receiver.py
+FIX_STATUS = {0: "receiver identified by gpsd, settings correct", 1: "a setting not correct, or no answer",
+              2: "gpsd has not identified the receiver", 3: "cannot ask gpsd, or gpsd has no receiver",
+              4: "wrong options", -9: "stopped: took too long"}
+RETRY_FLOOR_S = 30.0    # the shortest wait between two runs of the receiver command for want of a position
+_NO_POSITION_TEXT = {
+    "gpsd_unidentified": "gpsd has not identified the receiver (no version reply seen), and then it may have "
+                         "switched the position messages off",
+    "no_position_messages": "fix times arrive but gpsd reports mode 0: the receiver sends gpsd no position "
+                            "message (NAV-PVT off)",
+    "no_data": "no new fix time from the receiver either (its output, or the receiver itself)",
+    "no_fix": "gpsd gets the position message without a fix: most likely no satellites (antenna, sky)"}
 
 
 def _number(text):
@@ -67,6 +80,9 @@ class Telemetry(Service):
         self._ola_was_configured = False    # for the GPS receiver correction after each OLA start
         self._fix_due = None
         self._fix_proc = None
+        self._fix = {"runs": 0, "running": False, "last_status": None, "last_why": "", "started_at": None,
+                     "stopped": False}
+        self._no_position = {"warned": False, "longest_s": 0.0, "retry_at_s": None, "wait_s": None}
         self._clock = {"offset": None, "steps": 0, "last_step_s": None, "last_step_uptime_s": None}
         # How evenly the loop runs. A consumer sees a stall in last_gap_s and recent_longest_gap_s.
         self._loop = {"rounds": 0, "last_gap_s": 0.0, "recent_longest_gap_s": 0.0, "longest_gap_s": 0.0,
@@ -162,36 +178,119 @@ class Telemetry(Service):
             if log_it:
                 self._ola_logged_at = up - age
             self._record("ola", row["columns"] + AMP_VALUES, values, wall - age, up - age, log_it)
-        self._receiver_fix(mono, ola.configured)
+        self._ola_started(mono, ola.configured)
         if rows and rows[-1]["amp"] is not None:
             # Only the newest row of a poll that read the port empty. All that is certain about its
             # age is that it arrived since the poll before: that poll's time is its sample time.
             self._amp = {"uptime": up - ola.window_s, "wall": wall - ola.window_s, "values": rows[-1]["amp"],
                          "row": rows[-1]}
 
-    def _receiver_fix(self, mono, configured):
-        """Correct one GPS receiver setting a little after every OLA start.
+    def _ola_started(self, mono, configured):
+        """Note when the OLA has just been configured: the receiver command is due a little later.
 
         Each time the OLA starts it turns NMEA output on the receiver's unused UART1 back on (in the
         receiver's RAM; seen 2026-11-19). With the OLA's 10 Hz rate that overflows the receiver's
         transmit buffer and gpsd loses messages. setup/gps_receiver.py turns it off again, in RAM
-        only, through gpsd. It runs as a separate short process and is never waited for.
+        only, through gpsd. Only this bookkeeping is in the OLA's step; the command is started in
+        _step_receiver, so that nothing about it can disturb the amplifier readings.
         """
-        command = shlex.split(self.cfg["gps"].get("receiver_fix_command") or "")
-        if self._fix_proc is not None and self._fix_proc.poll() is not None:
-            self.log.info("GPS receiver setting check finished with status %s", self._fix_proc.returncode)
-            self._fix_proc = None
         if configured and not self._ola_was_configured:
             self._fix_due = mono + self.cfg["gps"].get("receiver_fix_delay_s", 15.0)
         self._ola_was_configured = configured
-        if command and self._fix_due is not None and mono >= self._fix_due and self._fix_proc is None:
-            self._fix_due = None
-            try:
-                self._fix_proc = subprocess.Popen(list(command), stdin=subprocess.DEVNULL,
-                                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.log.info("GPS receiver setting check started (the OLA has just started)")
-            except OSError as e:
-                self.log.warning("GPS receiver setting check could not start: %s", e)
+
+    def _step_receiver(self, mono):
+        """Start, reap and, after receiver_fix_timeout_s, stop the receiver command.
+
+        It runs as a separate process in a session of its own (so that a stop also ends what it
+        has started), is never waited for, and writes to this service's journal.
+        """
+        self._reap_fix(mono)
+        if self._fix_due is not None and mono >= self._fix_due and self._fix_proc is None:
+            if self._start_fix(mono, "the OLA has just started"):
+                self._fix_due = None
+        self._watch_position(mono)
+
+    def _reap_fix(self, mono):
+        proc = self._fix_proc
+        if proc is None:
+            return
+        if proc.poll() is None:
+            limit = self.cfg["gps"]["receiver_fix_timeout_s"]
+            if not self._fix["stopped"] and mono - self._fix["started_at"] > limit:
+                self.log.warning("GPS receiver check still running after %.0f s: stopped", limit)
+                self._fix["stopped"] = True
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+            return                  # picked up in a later round, once it has ended
+        status = proc.returncode
+        self.log.info("GPS receiver check finished with status %s (%s)", status,
+                      FIX_STATUS.get(status, "see setup/gps_receiver.py"))
+        self._fix.update(running=False, last_status=status)
+        self._fix_proc = None
+
+    def _start_fix(self, mono, why):
+        """Start the receiver command; False if there is none configured."""
+        text = self.cfg["gps"].get("receiver_fix_command") or ""
+        if not text:
+            return False
+        self._fix.update(runs=self._fix["runs"] + 1, last_why=why)
+        try:
+            self._fix_proc = subprocess.Popen(shlex.split(text), stdin=subprocess.DEVNULL, start_new_session=True)
+            self.log.info("GPS receiver check started (%s)", why)
+            self._fix.update(running=True, stopped=False, started_at=mono, last_status=None)
+        except (OSError, ValueError) as e:     # ValueError: shlex, e.g. an unbalanced quote
+            self.log.warning("GPS receiver check could not start: %s", e)
+        return True
+
+    def _watch_position(self, mono):
+        """Notice gpsd having a receiver without a position, and run the receiver command again.
+
+        On 2026-11-19, after a power cut, gpsd delivered fix times but no position for 77
+        minutes, and nothing noticed: it had not identified the receiver and had the position
+        messages switched off (setup/gps_receiver.py has what gpsd does). The command asks for
+        the receiver's version if gpsd has not identified it, switches the position message on
+        in RAM if it is off, and corrects the UART1 setting; with a receiver that just has no
+        satellites (indoors, under poor sky) it only reads those settings. It is run after
+        no_position_retry_s without a position, then after twice the previous wait each time, up
+        to no_position_retry_max_s.
+        """
+        gps, cfg, state = self.gps, self.cfg["gps"], self._no_position
+        lost = gps.no_position_s(mono)
+        if lost < cfg["stale_after_s"]:      # a position within the last few seconds
+            if state["warned"]:
+                if gps.last_position_at is not None and mono - gps.last_position_at < cfg["stale_after_s"]:
+                    self.log.info("GPS: position again, after %.0f s without", state["longest_s"])
+                else:
+                    why = gps.error or ("gpsd has no receiver" if not gps.receivers else "gpsd reconnected")
+                    self.log.info("GPS: no position for %.0f s, then %s; counted again from now",
+                                  state["longest_s"], why)
+            state.update(warned=False, longest_s=0.0, retry_at_s=None, wait_s=None)
+            return
+        state["longest_s"] = lost
+        if lost >= cfg["no_position_warn_s"] and not state["warned"]:
+            state["warned"] = True
+            self.log.warning("GPS: gpsd has a receiver but no position for %.0f s; %s", lost,
+                             _NO_POSITION_TEXT[self._no_position_cause(mono)])
+        first = max(cfg["no_position_retry_s"], RETRY_FLOOR_S)
+        if state["retry_at_s"] is None:
+            state["retry_at_s"] = state["wait_s"] = first
+        if lost >= state["retry_at_s"] and self._fix_proc is None:
+            if self._start_fix(mono, f"no position for {lost:.0f} s"):
+                state["wait_s"] = max(min(2 * state["wait_s"], cfg["no_position_retry_max_s"]), first)
+                state["retry_at_s"] = lost + state["wait_s"]
+
+    def _no_position_cause(self, mono):
+        """Why gpsd has no position: see _NO_POSITION_TEXT."""
+        gps = self.gps
+        if gps.identified is False:
+            return "gpsd_unidentified"
+        if gps.no_data_s(mono) > self.cfg["gps"]["stale_after_s"]:
+            return "no_data"
+        # gpsd clears the fix at every cycle: mode 1 only comes with a NAV-PVT that has no fix in it.
+        # Taken from the last sample with a new fix time (gps.py: new_fix_mode).
+        return "no_fix" if gps.new_fix_mode == 1 else "no_position_messages"
 
     def _step_gps(self, mono, wall, up):
         sample = self.gps.poll(mono)
@@ -260,6 +359,7 @@ class Telemetry(Service):
         self._watch_clock(wall, up)
         self._guarded("ola", self._step_ola, mono, wall, up)
         self._guarded("gps", self._step_gps, mono, wall, up)
+        self._guarded("gps_receiver", self._step_receiver, mono)
         if self._pi_reader is not None:
             self._guarded("pi_pickup", self._take_pi)
         elif self._due("pi", mono):
@@ -346,12 +446,19 @@ class Telemetry(Service):
         latest = self._latest.get("gps")
         new_fix_age = None if gps.last_new_fix_at is None else mono - gps.last_new_fix_at
         no_data = gps.no_data_s(mono)
+        no_position = gps.no_position_s(mono)
+        cause = self._no_position_cause(mono) if no_position >= cfg["no_position_warn_s"] else ""
         if gps.error:
             health, reason = MISSING, gps.error
         elif latest is None:
             health, reason = MISSING, "no answer from gpsd yet"
         elif not gps.receivers:
             health, reason = MISSING, "gpsd has no receiver"
+        elif cause in ("gpsd_unidentified", "no_position_messages"):
+            # Not a lack of satellites: the receiver is not sending gpsd its position.
+            health = ERROR
+            reason = (f"{_NO_POSITION_TEXT[cause]}: no position for {no_position:.0f} s "
+                      "(setup/gps_receiver.py is run again)")
         elif no_data > cfg["no_data_error_s"]:
             # gpsd has the receiver but nothing usable comes out of it: what a choked output looks like.
             health = ERROR
@@ -363,8 +470,16 @@ class Telemetry(Service):
         else:
             mode = latest["values"][GPS_COLUMNS.index("mode")]
             health, reason = OK, "" if isinstance(mode, int) and mode >= 2 else "no position fix"
+            if reason and cause:
+                reason += f" for {no_position:.0f} s"
+        fix = self._fix
+        receiver_check = {"runs": fix["runs"], "running": fix["running"], "last_status": fix["last_status"],
+                          "last_why": fix["last_why"], "error": self._internal.get("gps_receiver", ""),
+                          "next_retry_at_no_position_s": self._no_position["retry_at_s"]}
         return self._source("gps", health, reason, up, gpsd_connects=gps.connects,
-                            new_fix_age_s=None if new_fix_age is None else round(new_fix_age, 2))
+                            new_fix_age_s=None if new_fix_age is None else round(new_fix_age, 2),
+                            receiver_identified=gps.identified, no_position_s=round(no_position, 1),
+                            no_position=cause, receiver_check=receiver_check)
 
     def _pi_status(self, up):
         latest, age = self._latest.get("pi"), self._age("pi", up)

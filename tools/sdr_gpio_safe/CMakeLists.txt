@@ -12,8 +12,12 @@ endif()
 add_compile_options(-Wall -Wextra -Wno-psabi)
 find_package(Threads REQUIRED)
 
-# Only this UHD is ever used: no search of the system or of any other prefix.
-set(UHD_PREFIX "$ENV{HOME}/uhd-patched" CACHE PATH "Install prefix of the patched UHD build")
+# Only this UHD is ever used: no search of the system or of any other prefix. It is the build
+# that leaves the front-panel pins as inputs at initialisation (docs/uhd-proposals), the same
+# one ORCA runs against (manager.orca.build_commands); setup/check.py compares the two.
+set(UHD_PREFIX "$ENV{HOME}/uhd-patched-gpio" CACHE PATH "Install prefix of the patched UHD build")
+unset(UHD_INCLUDE_DIR CACHE)   # found afresh each time, so that a changed UHD_PREFIX takes effect
+unset(UHD_LIBRARY CACHE)
 find_path(UHD_INCLUDE_DIR uhd/usrp/multi_usrp.hpp PATHS "${UHD_PREFIX}/include" NO_DEFAULT_PATH)
 find_library(UHD_LIBRARY uhd PATHS "${UHD_PREFIX}/lib" NO_DEFAULT_PATH)
 if(NOT UHD_INCLUDE_DIR OR NOT UHD_LIBRARY)

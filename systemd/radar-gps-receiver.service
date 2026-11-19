@@ -1,8 +1,9 @@
-# Corrects one GPS receiver setting a little after every start of gpsd.
+# Checks the GPS receiver a little after every start of gpsd: that gpsd has identified it, that it
+# sends gpsd the position message, and UART1 NMEA output off (corrected in RAM if needed).
 # Documentation: setup/SYSTEM_CHANGES.md, section 11, and setup/gps_receiver.py
 
 [Unit]
-Description=Radar GPS receiver setting check (UART1 NMEA output off)
+Description=Radar GPS receiver check after gpsd starts (identification, NAV-PVT, UART1 NMEA)
 After=gpsd.service
 # Wants, not Requires: a stop or restart of gpsd must not be passed on to this unit.
 Wants=gpsd.service
@@ -12,13 +13,17 @@ Type=oneshot
 User=englacial
 Group=englacial
 WorkingDirectory=/home/englacial/englacial-radar-runner
-# gpsd sets the receiver up during its first seconds, and that is when the setting gets turned
-# back on: wait until it has finished.
+# gpsd sets the receiver up during its first seconds, and that is when the UART1 setting gets
+# turned back on: wait until it has finished.
 ExecStartPre=/bin/sleep 20
 ExecStart=/usr/bin/python3 -B -E -s setup/gps_receiver.py --apply --ram
+# A failure (gpsd has not identified the receiver: exit status 2) is tried again.
 Restart=on-failure
+# Except wrong options: that would fail the same way for ever.
+RestartPreventExitStatus=4
 RestartSec=20
-TimeoutStartSec=150
+# 20 s wait plus at most about 100 s for the script.
+TimeoutStartSec=180
 
 [Install]
 # Started with every start of gpsd (it is a oneshot, so it runs again each time).

@@ -120,7 +120,9 @@ check the USB speed.
 
 ORCA installs its SIGINT handler only after the SDR set-up (firmware and FPGA
 load, tuning). A SIGINT before that kills it in mid set-up, with the SDR's
-pins as UHD's initialisation left them (the amplifier pin low). So:
+pins as UHD's initialisation left them: inputs with the UHD build in use
+(amplifier off), but low (amplifier on) with any other UHD, so the rules
+below assume the worse case. So:
 
 * A stop asked for before `[START]` is held until that line has been seen:
   up to the start timeout (60 s) normally, `orca.urgent_grace_s` (1 s) for an
@@ -344,10 +346,11 @@ Steps:
    `sudo systemctl start radar-manager` (start only; do not enable yet).
 2. `radarctl status`: every gate `ok`, state `ready`, yellow LED on. If the
    SDR record was unknown and telemetry was missing, the reset tool has run
-   once (one 0.5 s enable): the journal says so.
+   once (no enable with the UHD build in use): the journal says so.
 3. `radarctl start`. Watch: yellow breathing during chirp, build and SDR
-   set-up (about 5 s; about 20 s on the first start after power-up), the one
-   0.48 s enable at the UHD initialisation, then green on, amplifier current
+   set-up (about 5 s; about 20 s on the first start after power-up), no
+   enable at the UHD initialisation (a 0.48 s enable there means the radar
+   was built against another UHD), then green on, amplifier current
    as on the bench for this duty, no trip.
 4. `ls` the newest directory under `/mnt/nvme/radar-runner/collections/`:
    `rx_samps.bin.0` growing, `uhd_stdout.log`, `collection.json`.

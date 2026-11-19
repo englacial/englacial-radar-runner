@@ -5,7 +5,7 @@ import os
 import socket
 import threading
 
-from telemetry_fakes import TPV, GpsdServer, make_pi_tree
+from telemetry_fakes import DEVICE, TPV, GpsdServer, make_pi_tree
 
 from radar_runner.common import config as C
 from radar_runner.telemetry import gps as G
@@ -118,7 +118,7 @@ def test_fix_that_stops_moving_is_not_new():
     assert 34 <= b.gps.no_data_s(b.t) <= 36
     b.conn.advance = True
     b.run(2)
-    assert b.gps.no_data_s(b.t) < 1.5 and b.samples[-1]["new_fix"]
+    assert b.gps.no_data_s(b.t) <= 1.5 and b.samples[-1]["new_fix"]     # 1.5: a DEVICES reply came first
 
 
 def test_receiver_without_time_and_receiver_unplugged():
@@ -148,14 +148,41 @@ def test_garbage_from_gpsd_is_ignored():
     assert len(b.gps._buf) < G.MAX_BUFFER
 
 
-def test_the_client_never_sends_anything_but_watch_and_poll_and_starts_no_program():
+def test_the_client_never_sends_anything_but_watch_poll_and_devices_and_starts_no_program():
     b = Bench()
     b.server.prepare = lambda conn: conn.tpv.update(mode=0, time=None)      # a receiver that delivers nothing
     b.run(120)
-    sent = {data for conn in b.server.connections for data in conn.sent}
-    assert sent == {b'?WATCH={"enable":true};\n', b"?POLL;\n"}
+    sent = [data for conn in b.server.connections for data in conn.sent]
+    assert set(sent) == {b'?WATCH={"enable":true};\n', b"?POLL;\n", b"?DEVICES;\n"}
+    assert 10 <= sent.count(b"?DEVICES;\n") <= 12                         # every 10 s while there is no position
     source = open(G.__file__).read()
-    assert "subprocess" not in source and "hexdata" not in source and "?DEVICE" not in source
+    # ?DEVICES; only reads gpsd's state; ?DEVICE= would change the device's settings.
+    assert "subprocess" not in source and "hexdata" not in source and "?DEVICE=" not in source
+
+
+def test_devices_asked_only_without_a_position_or_identification():
+    b = Bench()
+    b.run(60)
+    assert b"?DEVICES;\n" not in b.conn.sent and b.gps.identified is True and b.gps.no_position_s(b.t) < 1.5
+    b.conn.devices[0].update(subtype="", subtype1="")
+    b.conn.tpv.update(mode=0, lat=None, lon=None)   # gpsd has not identified the receiver: time, but no position
+    b.run(25)
+    assert b.samples[-1]["new_fix"] and 24 <= b.gps.no_position_s(b.t) <= 26 and b.gps.no_data_s(b.t) < 1.5
+    assert b.gps.identified is False and 2 <= b.conn.sent.count(b"?DEVICES;\n") <= 3
+    b.conn.devices = [dict(DEVICE)]             # identified, and the positions follow
+    b.conn.tpv.update(mode=3, lat=40.0, lon=-120.0)
+    b.run(12)
+    assert b.gps.identified is True and b.gps.no_position_s(b.t) < 1.5
+    asked = b.conn.sent.count(b"?DEVICES;\n")
+    b.run(30)
+    assert b.conn.sent.count(b"?DEVICES;\n") == asked
+    b.conn.devices = []                             # gpsd reports no device: identification unknown
+    b.conn.tpv.update(mode=1)
+    b.run(12)
+    assert b.gps.identified is None
+    b.conn.eof = True
+    b.run(1)
+    assert b.gps.devices is None and b.gps.no_position_s(b.t) == 0.0
 
 
 def test_real_socket_to_a_local_server():
