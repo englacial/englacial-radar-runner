@@ -82,11 +82,62 @@ def test_a_server_that_trickles_bytes_is_cut_off_at_the_total_timeout(server):
     assert r.kind == ntfy.RETRY and 1.8 <= elapsed < 4.0 and "within 2 s" in r.text, (r, elapsed)
 
 
-def test_the_deadline_leaves_no_alarm_behind(server):
-    import signal
-    send(server.url, timeout=2.0)
-    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
-    assert signal.getsignal(signal.SIGALRM) in (signal.SIG_DFL, None, signal.default_int_handler)
+def raw_server(answer):
+    """A TCP server on 127.0.0.1 that runs `answer(conn)` for every connection; returns its URL."""
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(5)
+
+    def serve():
+        while True:
+            try:
+                conn, _ = s.accept()
+            except OSError:
+                return
+            threading.Thread(target=answer, args=(conn,), daemon=True).start()
+    threading.Thread(target=serve, daemon=True).start()
+    return f"http://127.0.0.1:{s.getsockname()[1]}", s
+
+
+def test_an_error_answer_whose_body_trickles_is_cut_off_at_the_timeout():
+    def trickle(conn):
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4096\r\n\r\n")
+        for _ in range(40):
+            time.sleep(1.0)
+            try:
+                conn.sendall(b"x")
+            except OSError:
+                return
+    url, sock = raw_server(trickle)
+    t = time.monotonic()
+    r = send(url, timeout=3.0)
+    elapsed = time.monotonic() - t
+    sock.close()
+    assert r.kind == ntfy.RETRY and elapsed < 4.5, (r, elapsed)
+
+
+def test_a_connection_cut_in_the_middle_of_the_headers_is_never_taken_as_sent():
+    # Status 200 then the connection shut while the headers come: http.client would read it as a
+    # complete answer. Cancelled sends are never "sent" (the alert would be deleted unsent).
+    def half(conn):
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+        time.sleep(30)
+    url, sock = raw_server(half)
+    r = send(url, timeout=1.5)
+    sock.close()
+    assert r.kind == ntfy.RETRY
+
+
+def test_a_send_is_cancelled_at_once(server):
+    server.mode = "hang"
+    s = ntfy.Send(server.url, "t", TOKEN, ALERT).start()
+    time.sleep(0.5)
+    t = time.monotonic()
+    s.cancel()
+    assert s.done.wait(2.0) and time.monotonic() - t < 1.0 and s.result.kind == ntfy.RETRY
 
 
 def test_redirects_are_not_followed(server):

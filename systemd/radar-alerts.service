@@ -23,13 +23,16 @@ WorkingDirectory=/home/englacial/englacial-radar-runner
 ExecStart=/home/englacial/englacial-radar-runner/.venv/bin/python -B -u -m radar_runner.alerts
 Restart=always
 RestartSec=10
-# The loop pings at least once a second and between sends (each at most
-# alerts.ntfy.timeout_s, 15 s). No ping for 60 s: kill it and restart.
+# The loop pings at least once a second; sends run in threads of their own and
+# never hold it up. No ping for 60 s: kill it and restart.
 WatchdogSec=60
 WatchdogSignal=SIGKILL
 TimeoutStartSec=30
-# A send in progress (at most 15 s) is finished; the state file is then saved.
-TimeoutStopSec=30
+# A stop cuts off a send in progress (it stays queued), saves the state and exits
+# within about a second. The power service forces the power-off 10 s after asking
+# for it (power/config.py last_resort_after_s): this unit must never be what it
+# waits for, so after 5 s systemd kills it.
+TimeoutStopSec=5
 # It must never take anything from the radar or the services that protect it:
 # low processor and disk priority, a memory limit, and first in line for the
 # kernel's out-of-memory killer.

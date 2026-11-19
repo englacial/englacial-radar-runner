@@ -38,7 +38,8 @@ def _read(path):
 
 
 def format_status(s, read):
-    lines = [f"service:    {'running' if read.ok else read.state + (': ' + read.error if read.error else '')}"]
+    running = read.ok and s.get("running") is not False
+    lines = [f"service:    {'running' if running else 'stopped' if read.ok else read.state + (': ' + read.error if read.error else '')}"]
     ntfy, link = s.get("ntfy") or {}, s.get("link") or {}
     lines.append(f"ntfy:       {'configured' if ntfy.get('configured') else 'NOT CONFIGURED: ' + str(ntfy.get('problem'))}")
     lines.append(f"link:       {link.get('state')}" + (f", {link.get('failures_in_a_row')} failures in a row, next try in "
@@ -74,7 +75,7 @@ def cmd_status(paths, args):
         print(json.dumps(read.data, indent=1))
     else:
         print(format_status(read.data, read))
-    return 0 if read.ok else NOT_RUNNING
+    return 0 if read.ok and read.data.get("running") is not False else NOT_RUNNING
 
 
 def cmd_queue(paths, args):
@@ -98,8 +99,17 @@ def cmd_test(paths, args):
     request = {"id": test_id, "priority": args.priority, "text": args.text or ""}
     name = f"{time.time_ns()}-{os.getpid()}.json"
     tmp = os.path.join(paths["inbox"], "." + name + ".tmp")
+    # Not made here: a directory made by another user (sudo alertctl ...) would keep the service out.
+    if os.geteuid() == 0:
+        print("run alertctl test as user englacial, not as root")
+        return 1
+    if not os.path.isdir(paths["inbox"]):
+        print(f"{paths['inbox']} does not exist: the alerts service makes it when it starts (start it first)")
+        return NOT_RUNNING
+    if not os.access(paths["inbox"], os.W_OK):
+        print(f"cannot write to {paths['inbox']}: run as user englacial")
+        return 1
     try:
-        os.makedirs(paths["inbox"], exist_ok=True)
         with open(tmp, "w") as f:
             json.dump(request, f)
             f.flush()
@@ -110,7 +120,7 @@ def cmd_test(paths, args):
         return 1
     read = _read(paths["status"])
     print(f"test alert {test_id} ({args.priority}) is in the inbox")
-    if not read.ok:
+    if not read.ok or read.data.get("running") is False:
         print("the alerts service is not running: the alert is sent when it starts")
         return NOT_RUNNING
     if not args.wait:

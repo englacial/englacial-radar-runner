@@ -127,16 +127,35 @@ def test_backoff_doubles_and_is_bounded_and_429_waits_as_asked(tmp_path, server)
     assert server.attempts - before == 2
 
 
-def test_a_message_the_server_refuses_three_times_is_dropped_and_the_rest_go_on(tmp_path, server):
+def test_when_every_message_is_refused_nothing_is_dropped(tmp_path, server):
+    # A 400 for everything is the settings (a refused topic, a change at the server), not the alerts.
     rig = Rig(tmp_path, server.url)
     server.mode, server.status = "status", 400
     rig.start()
-    rig.tick(30)
-    assert rig.queued() == [] and rig.service.counters["rejected"] == 1 and len(server.refused) == 3
-    server.mode = "ok"
     rig.watcher_event(event="stuck", severity="urgent", text="AMPLIFIER STUCK ENABLED")
+    rig.manager_event(event="fault", kind="start_failures", reason="x")
+    status = rig.tick(400)
+    assert len(rig.queued()) == 3 and status["counters"]["rejected"] == 0
+    assert status["link"]["state"] == "failing" and len(server.refused) <= 60      # once per retry_max_s (8 s)
+    server.mode = "ok"
+    rig.tick(30)
+    assert rig.queued() == [] and len(server.bodies()) == 3
+    assert any("summary" in b["title"] for b in server.bodies())
+
+
+def test_one_message_the_server_refuses_while_others_go_through_is_dropped_after_three_tries(tmp_path, server):
+    rig = Rig(tmp_path, server.url, **{"ntfy.retry_max_s": 10.0})
+    server.refuse = lambda body: "BAD" in body["message"]
+    rig.start()
     rig.tick(3)
-    assert titles(server) == ["test-unit: AMPLIFIER STUCK ENABLED"]
+    rig.manager_event(event="fault", kind="a", reason="BAD")
+    rig.tick(2)
+    for i in range(3):                      # others keep going through in between
+        rig.manager_event(event="fault", kind=f"good{i}", reason="fine")
+        rig.tick(12)
+    status = rig.tick(12)
+    assert status["counters"]["rejected"] == 1 and len(server.refused) == 3 and rig.queued() == []
+    assert [t for t in titles(server) if "good" in t] == [f"test-unit: radar FAULT: good{i}" for i in range(3)]
 
 
 def test_a_restart_between_the_send_and_the_deletion_repeats_that_one_alert_only(tmp_path, server):
@@ -269,7 +288,7 @@ def test_a_restart_of_a_service_without_a_clean_stop_is_reported(tmp_path, serve
     rig.tick()
     rig.manager_event(event="manager_started", pid=1)
     rig.manager_event(event="state", old="not_ready", new="ready")
-    rig.clock.advance(30)
+    rig.tick(30)
     rig.manager_event(event="manager_started", pid=2)       # killed in between: no manager_stopped
     rig.watcher_event(event="start", severity="info", text="safety watcher started")
     rig.watcher_event(event="stop", severity="info", text="safety watcher stopping")
@@ -444,7 +463,7 @@ def test_the_secrets_never_appear_in_what_is_sent_or_kept(tmp_path, server):
     rig.tick(3)
     for r in server.received:
         body = json.dumps(r["body"]["message"]) + r["body"]["title"]
-        assert TOKEN not in body and TOPIC not in body and server.url not in body
+        assert TOKEN not in body        # the token only in the header; topic and server are ntfy's own
     for name in os.listdir(rig.state_dir / "alerts-queue"):
         assert TOKEN not in (rig.state_dir / "alerts-queue" / name).read_text()
 
@@ -481,3 +500,171 @@ def test_long_messages_are_cut_to_what_ntfy_takes(tmp_path, server):
     [body] = [b for b in server.bodies() if "FAULT" in b["title"]]
     assert len(body["message"].encode()) <= 4000
     assert "-- test-unit" in body["message"] and "..." in body["message"]
+
+
+# ---- failure paths found in review
+
+def test_a_manager_log_cut_short_by_a_power_cut_is_not_replayed(tmp_path, server):
+    rig = Rig(tmp_path, server.url)
+    rig.start()
+    rig.tick(2)
+    for i in range(12):                     # weeks of history, all read and sent
+        rig.clock.advance(4000)
+        rig.manager_event(event="fault", kind="start_failures", reason=f"old fault {i}")
+        rig.manager_event(event="fault_cleared", kind="start_failures", by="command")
+        rig.tick(2)
+    synced = os.path.getsize(rig.manager_events)
+    rig.manager_event(event="stop", kind="power", reason="power loss")      # read, never on the drive
+    rig.manager_event(event="manager_stopped", radar_stopped=True)
+    rig.tick(2)
+    rig.stop()
+    os.truncate(rig.manager_events, synced)
+    before = len(server.bodies())
+    rig.reboot(BOOT_B, uptime=20.0)
+    rig.manager_event(event="manager_started", pid=1)
+    rig.tick(5)
+    rig.clock.advance(60)
+    rig.manager_event(event="fault", kind="start_failures", reason="REAL NEW FAULT")
+    status = rig.tick(3)
+    new = [b for b in server.bodies()[before:] if "summary" not in b["title"]]
+    assert [b["message"].split("\n")[0][:60] for b in new] == [
+        "The radar manager is in fault (start_failures): REAL NEW FAULT"[:60]]
+    assert status["events"]["manager"]["lost"] == 1
+
+
+def test_a_sent_alert_that_cannot_be_deleted_is_sent_once(tmp_path, server, monkeypatch):
+    rig = Rig(tmp_path, closed_port())
+    rig.start()
+    rig.tick(2)
+    rig.watcher_event(event="stuck", severity="urgent", text="AMPLIFIER STUCK ENABLED: 2.5 A")
+    rig.tick(3)
+    queue_dir = str(rig.state_dir / "alerts-queue")
+    real_unlink = os.unlink
+
+    def read_only(path, *a, **k):
+        if str(path).startswith(queue_dir):
+            raise OSError(30, "Read-only file system")
+        return real_unlink(path, *a, **k)
+    monkeypatch.setattr(os, "unlink", read_only)
+    rig.service.ntfy["server"] = server.url
+    rig.service.next_send_at = 0
+    status = rig.tick(20)
+    assert sorted(b["title"] for b in server.bodies()) == ["test-unit: AMPLIFIER STUCK ENABLED",
+                                                           "test-unit: boot 42 summary"]
+    assert len(status["sent_not_deleted"]) == 2 and "Read-only" in status["queue"]["error"]
+    monkeypatch.setattr(os, "unlink", real_unlink)          # the card is back
+    status = rig.tick(70)
+    assert status["sent_not_deleted"] == [] and rig.queued() == [] and len(server.bodies()) == 2
+
+
+def test_an_inbox_request_that_cannot_be_deleted_is_not_sent_again_and_again(tmp_path, server, monkeypatch):
+    rig = Rig(tmp_path, server.url)
+    rig.start()
+    rig.tick(2)
+    inbox = rig.state_dir / "alerts-inbox"
+    (inbox / "1.json").write_text(json.dumps({"id": "abc", "priority": "urgent"}))
+    real_unlink = os.unlink
+
+    def denied(path, *a, **k):
+        if str(path).startswith(str(inbox)):
+            raise PermissionError(13, "Permission denied")
+        return real_unlink(path, *a, **k)
+    monkeypatch.setattr(os, "unlink", denied)
+    status = rig.tick(20)
+    assert [b for b in server.bodies() if "test alert" in b["title"]] == []
+    assert "Permission denied" in status["inbox"]["problem"]
+
+
+def test_an_unreadable_queue_file_does_not_hold_up_the_others(tmp_path, server, monkeypatch):
+    rig = Rig(tmp_path, closed_port())
+    rig.start()
+    rig.watcher_event(event="stuck", severity="urgent", text="AMPLIFIER STUCK ENABLED")
+    rig.manager_event(event="fault", kind="a", reason="r")
+    rig.tick(3)
+    first = os.path.join(str(rig.state_dir / "alerts-queue"), "p5-000000000001.json")
+    import builtins
+    real_open = builtins.open
+
+    def eio(path, *a, **k):
+        if str(path) == first:
+            raise OSError(5, "Input/output error")
+        return real_open(path, *a, **k)
+    monkeypatch.setattr(builtins, "open", eio)
+    rig.service.ntfy["server"] = server.url
+    rig.service.next_send_at = 0
+    status = rig.tick(5)
+    assert len(server.bodies()) == 2 and status["unreadable"] == ["p5-000000000001"]
+
+
+def test_a_restart_is_only_judged_from_events_written_in_this_boot(tmp_path, server):
+    rig = Rig(tmp_path, server.url)
+    rig.start()
+    rig.tick(2)
+    rig.clock.up = 37.1                     # the end of the previous boot: no "stop" (a hard cut)
+    rig.watcher_event(event="ok", severity="info", text="the radar may run again")
+    rig.stop()
+    rig.reboot(BOOT_B, uptime=40.0)         # read in the next boot, at about the same uptime
+    rig.watcher_event(event="start", severity="info", text="safety watcher started")
+    rig.tick(3)
+    assert [b["title"] for b in without_summary(server)] == []
+
+
+def test_a_trip_that_ends_in_the_next_boot_still_gets_its_over(tmp_path, server):
+    rig = Rig(tmp_path, server.url)
+    rig.start()
+    rig.tick(2)
+    rig.watcher_event(event="trip", severity="urgent", condition="amp_temp", text="amplifier temperature 56.0 C")
+    rig.tick(2)
+    rig.reboot(BOOT_B, uptime=20.0)
+    rig.watcher_event(event="clear", severity="info", condition="amp_temp", text="below 50 C for 60 s")
+    rig.tick(3)
+    assert "test-unit: safety trip over: amplifier temperature" in titles(server)
+
+
+def test_held_back_text_is_clipped_so_the_state_stays_small(tmp_path, server):
+    rig = Rig(tmp_path, server.url)
+    rig.start()
+    rig.tick(2)
+    for i in range(40):
+        for _ in range(5):
+            rig.manager_event(event="fault", kind=f"k{i}", reason="R" * 60000)
+        rig.tick()
+    assert os.path.getsize(rig.state_dir / "alerts-state.json") < 200_000
+    rig.stop()
+    rig.start()
+    assert rig.service.state_note == ""
+
+
+def test_leftover_temporary_state_files_are_removed(tmp_path, server):
+    rig = Rig(tmp_path, server.url)
+    (rig.state_dir / ".alerts-state.json.4242.tmp").write_text("{")
+    rig.start()
+    assert not (rig.state_dir / ".alerts-state.json.4242.tmp").exists()
+
+
+def test_a_topic_that_is_part_of_the_host_name_does_not_spoil_the_titles(tmp_path, server):
+    rig = Rig(tmp_path, server.url)
+    rig.changes["unit_name"] = "radar-1"
+    rig.start()
+    rig.service.ntfy["topic"] = "radar"
+    rig.service.unit = "radar-1"
+    rig.tick(3)
+    assert server.bodies()[0]["title"] == "radar-1: boot 42 summary"
+
+
+@pytest.mark.parametrize("cause, health, title", [
+    ("gpsd_unidentified", "error", "GPS receiver sends no position (not identified by gpsd)"),
+    ("no_position_messages", "error", "GPS receiver sends no position messages"),
+    ("no_fix", "ok", "GPS: no fix (antenna or sky?)"),
+    ("", "missing", "GPS: no receiver, or gpsd not answering"),
+])
+def test_gps_causes_from_telemetry(tmp_path, server, cause, health, title):
+    rig = Rig(tmp_path, server.url, **{"conditions.gps_s": 30.0})
+    rig.start()
+    rig.telemetry["sources"]["gps"].update(health=health, reason=f"the reason for {cause or health}",
+                                           no_position=cause, receiver_identified=cause != "gpsd_unidentified",
+                                           no_position_s=700.0, receiver_check={"runs": 3})
+    rig.tick(40)
+    [gps] = [b for b in without_summary(server)]
+    assert gps["title"] == f"test-unit: {title}" and gps["priority"] == L.DEFAULT
+    assert f"the reason for {cause or health}" in gps["message"]

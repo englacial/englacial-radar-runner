@@ -35,22 +35,30 @@ class Alert:
 # ---------------------------------------------------------------- what may leave the Pi
 
 REMOVED = "[removed]"
-_NUMBER = r"[-+]?\d+(?:[.,]\d+)?"
+_NUMBER = r"[-+]?\d+(?:\.\d+)?"
+# The second line of defence (positions are never read from named fields): narrow enough that
+# readings, sizes, counts, durations and PIDs pass. Hemisphere letters only in capitals.
 _POSITION_PATTERNS = [
     # Degrees (not degrees Celsius), with minutes and seconds.
     re.compile(r"[-+]?\d+(?:\.\d+)?\s*°(?!\s*[CF]\b)(?:\s*\d+(?:\.\d+)?\s*['′])?(?:\s*\d+(?:\.\d+)?\s*[\"″])?"
                r"\s*[NSEW]?"),
-    # 77.85S 166.67E, 77.85 S, 166.67 E
-    re.compile(r"(?i)\b\d{1,3}(?:\.\d+)?\s?[NS]\b[\s,;/]*\d{1,3}(?:\.\d+)?\s?[EW]\b"),
-    # Two numbers with three or more decimals next to each other: a latitude and a longitude.
-    re.compile(r"[-+]?\d{1,3}\.\d{3,}\s*[,;/ ]\s*[-+]?\d{1,3}\.\d{3,}"),
-    # A number, or two, after a word that names a position or a coordinate.
-    re.compile(r"(?i)(\b(?:gps_)?(?:lat|lats|latitude|lon|lng|gps_long|longitude|positions?|coord|coords|"
-               r"coordinates?|northing|easting|geo)\b\W{0,4})" + _NUMBER + r"(?:\s*[,;/ ]\s*" + _NUMBER + ")?"),
-    # Any number with four or more decimals, and any number with seven or more digits
-    # (the OLA's positions are degrees x 1e7).
-    re.compile(r"[-+]?\d+\.\d{4,}"),
-    re.compile(r"(?<![\w.])[-+]?\d{7,}(?:\.\d+)?(?![\w.])"),
+    # 77.85S 166.67E, 77.85 S, 166.67 E; S 77.85 E 166.67
+    re.compile(r"(?<![\w.])\d{1,3}\.\d+\s?[NS]\b[\s,;/]*\d{1,3}\.\d+\s?[EW]\b"),
+    re.compile(r"\b[NS]\s?\d{1,3}\.\d+[\s,;/]+[EW]\s?\d{1,3}\.\d+"),
+    # One of them alone, with three or more decimals (100 m): 77.846S, S77.846
+    re.compile(r"(?<![\w.])\d{1,3}\.\d{3,}\s?[NSEW]\b"),
+    re.compile(r"\b[NSEW]\s?\d{1,3}\.\d{3,}(?!\d)"),
+    # Two numbers with three or more decimals side by side, one of them with two or three digits
+    # before the point: a latitude and a longitude.
+    re.compile(r"(?<![\w.])[-+]?(?:\d{2,3}\.\d{3,}\s*[,;/ ]\s*[-+]?\d{1,3}|\d{1,3}\.\d{3,}\s*[,;/ ]\s*[-+]?\d{2,3})"
+               r"\.\d{3,}(?!\d)"),
+    # A number, or two, after a word that names a position or a coordinate (lat_deg=, pos=(...), ...).
+    re.compile(r"(?i)((?<![a-z])(?:gps_)?(?:lat|lats|latitude|lon|lng|gps_long|longitude|pos|position|positions|"
+               r"coord|coords|coordinate|coordinates|northing|easting|geo)(?:_[a-z0-9]+)?(?![a-z])\W{0,4}?)"
+               + _NUMBER + r"(?:\s*[,;/ ]\s*" + _NUMBER + ")?"),
+    # A number of degrees with four or more decimals (11 m), and the OLA's degrees x 1e7 (8 to 10 digits).
+    re.compile(r"(?<![\w.])[-+]?[1-9]\d{0,2}\.\d{4,}(?!\d)"),
+    re.compile(r"(?<![\w.])[-+]?\d{8,10}(?:\.\d+)?(?![\w.])"),
 ]
 _SECRET_PATTERNS = [
     re.compile(r"\btk_[A-Za-z0-9]{6,}"),                                   # ntfy access tokens
@@ -164,6 +172,15 @@ def error_rate(event):
     return int(errors.group(1)), int(attempted.group(1))
 
 
+def _count(n):
+    """A count in words: never seven digits in a row, which look like a position to the filter."""
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f} million"
+    if n >= 10_000:
+        return f"{n / 1e3:.0f} thousand"
+    return str(n)
+
+
 def manager_alert(event, previous=None, error_rate_warn=None):
     """The alert for one event of the radar manager's log, or None.
 
@@ -176,7 +193,7 @@ def manager_alert(event, previous=None, error_rate_warn=None):
         counts = error_rate(event)
         if counts and counts[0] / counts[1] > error_rate_warn:
             return Alert("manager.error_rate", DEFAULT, "radar error rate high",
-                         f"The last run had {counts[0]} errors in {counts[1]} pulses "
+                         f"The last run had {_count(counts[0])} errors in {_count(counts[1])} pulses "
                          f"({100 * counts[0] / counts[1]:.1f} %, warning above {100 * error_rate_warn:g} %): "
                          "late commands from a busy Pi? The data is still recorded."
                          + (f" Collection {_text(event, 'collection')}." if _text(event, "collection") else ""))
@@ -200,6 +217,15 @@ def manager_alert(event, previous=None, error_rate_warn=None):
 
 # ---------------------------------------------------------------- conditions from the status files
 
+# The title by telemetry's `sources.gps.no_position` cause, else by its health. Health and reason only,
+# never a reading.
+GPS_TITLES = {"gpsd_unidentified": "GPS receiver sends no position (not identified by gpsd)",
+              "no_position_messages": "GPS receiver sends no position messages",
+              "no_data": "GPS: no data from the receiver",
+              "no_fix": "GPS: no fix (antenna or sky?)",
+              "missing": "GPS: no receiver, or gpsd not answering",
+              "stale": "GPS: no data from the receiver",
+              "error": "GPS receiver not working"}
 POWER_HIGH = ("no_power_monitoring", "boot_loop_guard", "guard_state_unwritable")
 MAX_POWER_WARNINGS = 20     # the power service has seven; more is a damaged file
 MAX_KINDS = 200             # kinds of alert followed by the storm limit
@@ -227,13 +253,12 @@ def _num(value):
     return value if type(value) in (int, float) else None
 
 
-def condition_states(reads, cfg, tracked=(), manager_seen=False):
+def condition_states(reads, cfg, tracked=()):
     """The conditions as the status files show them now: {name: State}.
 
     `reads` maps telemetry, watcher, manager and power to a status_files.StatusRead; `cfg` is the
     `alerts.conditions` section plus `sd_free_gb_min`; `tracked` the names already followed (so
-    that a power warning that has gone away is seen as over); `manager_seen` is true once the
-    manager's status was fresh in this boot (the manager is not always installed).
+    that a power warning that has gone away is seen as over).
     """
     out = {}
     stale = cfg["status_stale_s"]
@@ -256,8 +281,7 @@ def condition_states(reads, cfg, tracked=(), manager_seen=False):
                 "Nothing watches the amplifier; the manager does not start the radar.")
     status_down("power_status", pwr, HIGH, "power service",
                 "A loss of main power will not shut the Pi down cleanly.")
-    if manager_seen:
-        status_down("manager_status", man, DEFAULT, "radar manager", "The radar is not run.")
+    status_down("manager_status", man, DEFAULT, "radar manager", "The radar is not run.")
 
     if wat is not None and wat.ok:
         ok = wat.data.get("ok")
@@ -276,7 +300,8 @@ def condition_states(reads, cfg, tracked=(), manager_seen=False):
         d = tel.data
         gps = _get(d, "sources", "gps") or {}
         problem = gps.get("health") != "ok" or bool(gps.get("reason"))
-        out["gps"] = State(problem, DEFAULT, "GPS: no fix or no receiver",
+        out["gps"] = State(problem, DEFAULT, GPS_TITLES.get(gps.get("no_position"))
+                           or GPS_TITLES.get(gps.get("health")) or "GPS: no fix",
                            f"GPS {gps.get('health')}: {gps.get('reason') or 'no fix'}. The radar still runs; "
                            "its data lacks positions.", cfg["gps_s"])
         logs = d.get("logging") or {}
@@ -404,7 +429,8 @@ class Limiter:
                                             "priority": min(max(count(k.get("priority")), LOW), URGENT),
                                             "title": str(k.get("title") or key), "text": str(k.get("text") or "")}
             self.recent = times(restored.get("recent"))
-            if same_boot and isinstance(restored.get("passed"), dict):
+            # Kept across a reboot: a trip that ends in the next boot still gets its "over".
+            if isinstance(restored.get("passed"), dict):
                 self.passed = {str(k): bool(v) for k, v in restored["passed"].items()}
             self.held_total = count(restored.get("held_total"))
 
@@ -435,12 +461,13 @@ class Limiter:
         if len(k["times"]) >= self.burst or over_global:
             k["held"] += 1
             k["priority"] = max(k["priority"], alert.priority) if k["held"] > 1 else alert.priority
-            k["title"], k["text"] = alert.title, alert.message
+            k["title"], k["text"] = clip(alert.title, 200), clip(alert.message, 500)
             self.held_total += 1
             self.passed[alert.key] = False
             return False
         k["times"].append(now)
-        self.recent.append(now)
+        if alert.priority < URGENT:
+            self.recent.append(now)         # urgent ones neither count nor are held back by the overall limit
         if k["held"]:
             alert.message += f"\n({k['held']} more like this held back before this one.)"
             k["held"] = 0
@@ -458,7 +485,8 @@ class Limiter:
                                  f"{k['held']} more alerts of this kind were held back (storm limit). "
                                  f"The last one: {k['text']}", limited=False))
                 k["times"].append(now)
-                self.recent.append(now)
+                if k["priority"] < URGENT:
+                    self.recent.append(now)
                 k["held"] = 0
                 self.passed[key] = True
         return out

@@ -157,7 +157,23 @@ def test_two_rotations_while_not_followed_are_counted_as_lost(tmp_path):
     append(log, {"n": 2})
     rotate(log)                                 # replaces the .1 that held the position
     append(log, {"n": 3})
-    assert names(t.read()) == [3] and t.lost == 1
+    # The end of the file that held the position (n 1) is gone; the .1 after it was never read.
+    assert names(t.read()) == [2, 3] and t.lost == 1
+
+
+def test_a_log_whose_unsynced_end_was_lost_in_a_power_cut_is_never_read_again_from_the_start(tmp_path):
+    log = tmp_path / "events.jsonl"
+    append(log, {"n": 0, "text": "x" * 80})
+    t = EventTail(str(log))
+    t.begin_at_end()
+    for i in range(1, 13):
+        append(log, {"n": i, "event": "fault"})
+    synced = log.stat().st_size
+    append(log, {"n": 13}, {"n": 14})
+    assert names(t.read()) == list(range(1, 15))
+    os.truncate(log, synced)                    # what the drive has after the cut: the last two are gone
+    append(log, {"n": 15})                      # the next boot's first event
+    assert names(t.read()) == [15] and t.lost == 1
 
 
 def test_a_cut_off_last_line_of_the_rotated_file_is_dropped(tmp_path):

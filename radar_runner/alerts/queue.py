@@ -62,6 +62,7 @@ class DiskQueue:
         self.error = ""
         self.dropped = 0        # pushed out, or refused, because the queue was full
         self.damaged = 0        # files that were not a readable alert
+        self.load_error = ""    # why the last load found no alert in a file that is there
         self.seq = 0
 
     def setup(self):
@@ -123,13 +124,14 @@ class DiskQueue:
     def load(self, name):
         """The alert in one file, or None (a damaged file is then deleted and counted)."""
         path = os.path.join(self.dir, name)
+        self.load_error = ""
         try:
             with open(path, "rb") as f:
                 raw = f.read(MAX_FILE_BYTES + 1)
         except FileNotFoundError:
             return None
         except OSError as e:
-            self.error = f"{path}: {e.strerror or e}"
+            self.load_error = self.error = f"{path}: {e.strerror or e}"
             return None
         try:
             if len(raw) > MAX_FILE_BYTES:
@@ -146,10 +148,16 @@ class DiskQueue:
         return item
 
     def remove(self, name):
+        """True if the file is gone (or was never there)."""
         try:
             os.unlink(os.path.join(self.dir, name))
-            _fsync_dir(self.dir)
         except FileNotFoundError:
-            pass
+            return True
         except OSError as e:
             self.error = f"cannot delete {name}: {e.strerror or e}"
+            return False
+        try:
+            _fsync_dir(self.dir)
+        except OSError:
+            pass
+        return True

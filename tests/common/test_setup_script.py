@@ -878,7 +878,8 @@ ALERTCTL_TARGET = "/home/englacial/englacial-radar-runner/bin/alertctl"
 
 def test_alerts_service_is_installed_enabled_and_started_with_alertctl(system):
     r = system.run("--dry-run")
-    assert r.returncode == 0 and f"WOULD    run: systemctl enable --now {ALERTS}" in r.stdout
+    assert r.returncode == 0 and f"WOULD    run: systemctl enable {ALERTS}" in r.stdout
+    assert f"WOULD    run: systemctl start --no-block {ALERTS}" in r.stdout
     assert f"WOULD    link {ALERTCTL_LINK} -> {ALERTCTL_TARGET}" in r.stdout
     assert not system.path(ALERTCTL_LINK).is_symlink() and ALERTS not in system.state["enabled"]
     r = system.run()
@@ -890,8 +891,8 @@ def test_alerts_service_is_installed_enabled_and_started_with_alertctl(system):
     assert ALERTS in system.state["enabled"] and ALERTS in system.state["active"]
     assert "secrets.yaml is missing: alerts are queued but not sent" in r.stdout
     log = system.log
-    assert (log.index("systemctl enable radar-watcher.service") < log.index(f"systemctl enable --now {ALERTS}")
-            < log.index(APT_INSTALL))                       # before the step that needs the internet
+    assert (log.index("systemctl enable radar-watcher.service") < log.index(f"systemctl enable {ALERTS}")
+            < log.index(f"systemctl start --no-block {ALERTS}") < log.index(APT_INSTALL))   # before the internet step
     system.path("/etc/radar-runner/secrets.yaml").write_text("alerts: {}\n")
     system.set(log=[])
     r = system.run()
@@ -914,10 +915,20 @@ def test_running_alerts_service_is_never_restarted_or_stopped(system):
     assert not [c for c in system.log if "alerts" in c]
 
 
-def test_an_alertctl_that_is_not_a_link_is_left_alone(system):
+def test_an_alertctl_that_is_not_a_link_is_left_alone_and_setup_goes_on(system):
     link = system.path(ALERTCTL_LINK)
     link.parent.mkdir(parents=True)
     link.write_text("#!/bin/sh\n")
     r = system.run()
-    assert r.returncode == 1 and f"{ALERTCTL_LINK} exists and is not a link" in r.stderr
-    assert link.read_text() == "#!/bin/sh\n"
+    assert r.returncode == 0 and f"NOT LINKED: {ALERTCTL_LINK} exists and is not a link" in r.stdout
+    assert link.read_text() == "#!/bin/sh\n" and APT_INSTALL in system.log
+
+
+@pytest.mark.parametrize("flag", ["alerts_wont_enable", "alerts_wont_start"])
+def test_a_failed_enable_or_start_of_the_alerts_service_never_stops_the_setup(system, flag):
+    system.set(**{flag: True})
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "FAILED: systemctl" in r.stdout and "setup goes on" in r.stdout
+    assert APT_INSTALL in system.log                       # the remaining steps ran
+    assert "setup: verify with: setup/check.py" in r.stdout

@@ -620,15 +620,21 @@ EOF
 # (m) The alerts service (stage 5): its unit and the alertctl command. It only
 # reads what the other services publish, so it is enabled and started like the
 # telemetry service; a running one is never restarted or stopped. Its files go
-# in /var/lib/radar-runner/user and /run/radar-runner/user (item 1).
+# in /var/lib/radar-runner/user and /run/radar-runner/user (item 1). It is an
+# observer: nothing in this step stops the setup; a problem is reported and the
+# remaining steps run.
 step_alerts_service() {
     step "Alerts service unit and alertctl"
     local unit=/etc/systemd/system/radar-alerts.service link=/usr/local/bin/alertctl
     local target=$UNIT_REPO/bin/alertctl enabled active have
-    [ "$REPO" = "$UNIT_REPO" ] || [ -n "$DESTDIR" ] ||
-        die "the unit file expects this repository at $UNIT_REPO, but it is at $REPO"
-    [ -n "$DESTDIR" ] || [ -x "$REPO/.venv/bin/python" ] ||
-        die "the Python environment is missing: run setup/build_venv.sh as $SERVICE_USER first"
+    if [ "$REPO" != "$UNIT_REPO" ] && [ -z "$DESTDIR" ]; then
+        note "NOT INSTALLED: the unit file expects this repository at $UNIT_REPO, but it is at $REPO"
+        return 0
+    fi
+    if [ -z "$DESTDIR" ] && [ ! -x "$REPO/.venv/bin/python" ]; then
+        note "NOT INSTALLED: the Python environment is missing: run setup/build_venv.sh as $SERVICE_USER first"
+        return 0
+    fi
     if [ -e "$DESTDIR/etc/radar-runner/secrets.yaml" ]; then
         ok "/etc/radar-runner/secrets.yaml is there (alerts.ntfy: server, topic, token; not read here)"
     else
@@ -642,11 +648,14 @@ step_alerts_service() {
         ok "$link points to $target"
     else
         [ -z "$have" ] || log "           $link points to $have"
-        [ -z "$have" ] && [ -e "$DESTDIR$link" ] && die "$link exists and is not a link: remove it or move it away"
-        change "link $link -> $target"
-        if [ "$DRY_RUN" -eq 0 ]; then
-            install -d -m 0755 "$(dirname "$DESTDIR$link")"
-            ln -sfn "$target" "$DESTDIR$link"
+        if [ -z "$have" ] && [ -e "$DESTDIR$link" ]; then
+            note "NOT LINKED: $link exists and is not a link: remove it or move it away, then run setup again"
+        else
+            change "link $link -> $target"
+            if [ "$DRY_RUN" -eq 0 ]; then
+                install -d -m 0755 "$(dirname "$DESTDIR$link")" && ln -sfn "$target" "$DESTDIR$link" ||
+                    note "FAILED: cannot link $link (setup goes on)"
+            fi
         fi
     fi
     enabled=$(systemctl is-enabled radar-alerts.service 2>/dev/null || true)
@@ -668,7 +677,15 @@ step_alerts_service() {
             log "           radar-alerts.service is ${enabled:-not enabled}, ${active:-not running}"
             note "once started it sends a boot summary to ntfy (at 3 minutes of uptime, or at once if later)"
             reload_systemd
-            run systemctl enable --now radar-alerts.service ;;
+            # Enabled, then started without waiting for it; a failure of either is reported, not fatal.
+            change "run: systemctl enable radar-alerts.service"
+            if [ "$DRY_RUN" -eq 0 ] && ! systemctl enable radar-alerts.service; then
+                note "FAILED: systemctl enable radar-alerts.service (setup goes on; see systemctl status radar-alerts)"
+            fi
+            change "run: systemctl start --no-block radar-alerts.service"
+            if [ "$DRY_RUN" -eq 0 ] && ! systemctl start --no-block radar-alerts.service; then
+                note "FAILED: systemctl start radar-alerts.service (setup goes on; see journalctl -u radar-alerts)"
+            fi ;;
     esac
 }
 

@@ -5,10 +5,14 @@ to <file>.1 and start a new <file>. The position kept here is the file (its
 inode and its first 64 bytes, since a deleted file's inode is soon reused) and
 the offset in it:
 
-* that file at <file>: read on from the offset (from 0 if the file got shorter);
+* that file at <file>: read on from the offset. If it is shorter than the
+  offset (its unsynced end lost in a power cut), go on after the last line
+  already taken that is still in it (fingerprints of the last 50 lines are
+  kept), or from its end; counted in `lost`. Nothing is read twice;
 * that file is now <file>.1: read the rest of <file>.1, then <file> from 0;
-* neither: the file was rotated twice, or replaced, while it was not followed:
-  read <file> from 0 and count it in `lost` (events may have been missed);
+* neither, with a <file>.1: rotated twice while not followed: the end of the
+  old file is gone (`lost`); all of <file>.1, then <file> from 0;
+* neither, no <file>.1: <file> from 0, counted in `lost`;
 * no position yet (the very first start): begin at the end; history is not sent.
 
 Only whole lines are taken: a last line without its newline (being written, or
@@ -17,11 +21,19 @@ by a power cut and then continued by the next writer, or NUL bytes the file
 system left after a cut) is skipped and counted. A line longer than
 `max_line` is skipped. At most `max_read` bytes are read per call.
 """
+import collections
+import hashlib
 import json
 import os
 
 MAX_LINE = 65536
 HEAD = 64
+RECENT_LINES = 50           # fingerprints of the last lines taken, to find the place again after a cut
+RESYNC_MAX = 16 << 20       # a log is at most this large (the writers rotate at 5 MB)
+
+
+def _fingerprint(raw):
+    return hashlib.blake2b(raw, digest_size=8).hexdigest()
 
 
 def _head_of(path):
@@ -46,13 +58,14 @@ class EventTail:
         self.lost = 0
         self.error = ""
         self._skip_rest = False     # inside a line that was too long
+        self.recent = collections.deque(maxlen=RECENT_LINES)
 
     # ---- the position, for the state file
 
     def position(self):
         if not self.started:
             return None
-        return {"inode": self.inode, "offset": self.offset, "head": self.head.hex()}
+        return {"inode": self.inode, "offset": self.offset, "head": self.head.hex(), "recent": list(self.recent)}
 
     def restore(self, pos):
         if isinstance(pos, dict) and type(pos.get("offset")) is int and pos["offset"] >= 0 \
@@ -62,6 +75,8 @@ class EventTail:
             except ValueError:
                 self.head = b""
             self.inode, self.offset, self.started = pos["inode"], pos["offset"], True
+            recent = pos.get("recent") if isinstance(pos.get("recent"), list) else []
+            self.recent.extend(r for r in recent[-RECENT_LINES:] if isinstance(r, str))
 
     def begin_at_end(self):
         try:
@@ -102,9 +117,16 @@ class EventTail:
                 if self.inode is None:
                     self.inode, self.offset, self.head = current.st_ino, 0, b""
                 elif current.st_size < self.offset:
-                    self.offset = 0         # truncated or rewritten in place
+                    # The same file, shorter than what was read: its end did not reach the drive before
+                    # a power cut. The writers never truncate, so this is never read from the start
+                    # again: on from the last line already taken that is still there (the next boot
+                    # may have added lines after it), or from the end if none is.
+                    self.offset = self._resync(current.st_size)
+                    self.lost += 1
                 budget -= self._read_from(self.path, current.st_ino, events, budget)
             else:
+                if self.inode is None:
+                    return events           # waiting for the next <file>; nothing there yet
                 try:
                     old = os.stat(self.path + ".1")
                 except OSError:
@@ -114,6 +136,14 @@ class EventTail:
                     budget -= used
                     if self.offset < old.st_size:
                         return events       # more of .1 next time
+                elif old is not None and (current is None or old.st_ino != current.st_ino):
+                    # Rotated twice while not followed: the end of the file that held the position is
+                    # gone, but .1 came after it and was never read: all of it, then <file>.
+                    self.lost += 1
+                    self.inode, self.offset, self.head, self._skip_rest = old.st_ino, 0, b"", False
+                    budget -= self._read_from(self.path + ".1", old.st_ino, events, budget, final=True)
+                    if self.offset < old.st_size or current is None:
+                        return events       # more of .1 next time (or no <file> yet)
                 elif current is None:
                     return events           # nothing there yet
                 else:
@@ -158,10 +188,21 @@ class EventTail:
         self.offset += consumed
         return consumed
 
+    def _resync(self, size):
+        with open(self.path, "rb") as f:
+            data = f.read(min(size, RESYNC_MAX))
+        known, pos, found = set(self.recent), 0, None
+        for raw in data.split(b"\n")[:-1]:
+            pos += len(raw) + 1
+            if _fingerprint(raw.replace(b"\0", b"").strip()) in known:
+                found = pos
+        return size if found is None else found
+
     def _take(self, raw, events):
         raw = raw.replace(b"\0", b"").strip()
         if not raw:
             return
+        self.recent.append(_fingerprint(raw))
         if len(raw) > self.max_line:
             self.skipped += 1
             return

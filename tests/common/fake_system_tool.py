@@ -65,6 +65,8 @@ if tool == "systemctl":
             os.symlink("/etc/systemd/system/" + args[2], link)
         done(0, record=True)
     if verb == "enable":
+        if unit == "radar-alerts.service" and state.get("alerts_wont_enable"):
+            done(1, record=True)
         state["units"].append(unit)
         state["enabled"].append(unit)
         if "--now" in args:
@@ -84,6 +86,12 @@ if tool == "systemctl":
             done(1, record=True)
         if unit == "systemd-timesyncd.service" and "systemd-timesyncd" not in state["installed"]:
             done(5, record=True)
+        state["active"].append(unit)
+        done(0, record=True)
+    # The alerts service, an observer, is started (never restarted) when it is first enabled.
+    if verb == "start" and unit == "radar-alerts.service" and "--no-block" in args:
+        if state.get("alerts_wont_start"):
+            done(1, record=True)
         state["active"].append(unit)
         done(0, record=True)
     done(1, record=True)        # anything else (stop, restart of another unit, ...) is not expected

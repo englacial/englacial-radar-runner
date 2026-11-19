@@ -57,7 +57,7 @@ The plan's fault table, row by row. "After" is how long a condition must last.
 | Amplifier telemetry missing at start, or lost during a run | `watcher.json` `ok` false, with `reason` | 3 after 5 min | "radar kept off by the safety watcher" | covered |
 | ... and the watcher had to stop or kill a radar itself | `watcher-events`: `radar_stop`, `radar_kill` (warning; urgent when SIGKILL did not help), `signal_failed` (urgent) | 3 / 5 | | covered |
 | No PPS at the SDR | none yet (stage 8) | | | **not available yet** |
-| GPS no fix or receiver missing | `telemetry.json` `sources.gps`: `health` not ok, or a `reason` ("no position fix") | 3 after 10 min | "GPS: no fix or no receiver" (health and reason only, never a reading) | covered |
+| GPS no fix or receiver missing | `telemetry.json` `sources.gps`: `health` not ok, or a `reason`. The title by `no_position`: `gpsd_unidentified` "GPS receiver sends no position (not identified by gpsd)", `no_position_messages` "GPS receiver sends no position messages", `no_fix` "GPS: no fix (antenna or sky?)"; else by `health`: `missing` "GPS: no receiver, or gpsd not answering", `stale` "GPS: no data from the receiver", `error` "GPS receiver not working" | 3 after 10 min | the title and telemetry's reason (never a reading) | covered |
 | NVMe missing or not writable | `telemetry.json` `logging`: `location` not `primary`, or `writer` not `running`; and `manager.json` `not_ready` | 3 after 5 min (10 min) | "sensor logs not on the data drive", "radar not ready: data: ..." | covered |
 | Disk nearly full | `telemetry.json` `sources.pi.values.nvme_free_gb` below 200, 100, 50 GB; below 25 GB | 3; 4 | "data drive below N GB free", once per level (again after 10 % above it; kept across reboots) | covered |
 | ... SD card | `sources.pi.values.sd_free_gb` below 5 GB | 3 after 1 min | "SD card nearly full" | covered |
@@ -68,8 +68,8 @@ The plan's fault table, row by row. "After" is how long a condition must last.
 | High late-command rate | `manager-events`: `ended`, ORCA's last lines in `output_tail`: `[RX] Error count` over `[RX] Total pulses attempted`, above `error_rate_warn` (5 %) | 3 | "radar error rate high" | covered **after each run** only (nothing publishes the rate during a run). That the error count is the late-command count is assumed; the bench runs of 2026-11-19 show 2.0-2.3 % |
 | Output drift | none | | | **not available yet** |
 | Pi hot or throttling | `telemetry.json` `sources.pi`: `throttled_now` not empty, or `values.soc_temp_c` at or above 80 C | 3 after 1 min | "Pi hot or throttling" | covered |
-| Radar manager crashes | `manager-events`: `manager_started` with no `manager_stopped` before it in the same boot; `manager.json` old (once it was seen in this boot) | 3; 3 after 2 min | "radar manager restarted", "radar manager not running" | covered |
-| Safety watcher crashes | `watcher-events`: `start` with no `stop` before it in the same boot; `watcher.json` old or missing | 3; **4** after 2 min | "safety watcher restarted", "safety watcher not running" | covered |
+| Radar manager crashes, or never comes up | `manager-events`: `manager_started` with no `manager_stopped` before it (see "Event logs"); `manager.json` old or missing for 2 min from the start of this service | 3; 3 | "radar manager restarted", "radar manager not running" | covered |
+| Safety watcher crashes | `watcher-events`: `start` with no `stop` before it (see "Event logs"); `watcher.json` old or missing | 3; **4** after 2 min | "safety watcher restarted", "safety watcher not running" | covered |
 | Pi hangs | the next boot summary: "ended without a clean stop" | 3 | (a hang and a power cut cannot be told apart) | covered |
 | No internet | | | alerts wait in the queue | covered |
 | Clock not set | the boot summary and the alert footer say "clock not set" | | | covered |
@@ -100,19 +100,33 @@ Alert text goes to a third party, so:
 
 * Only named fields go into an alert: event `text`, `reason`, `failure`,
   `kind`, `condition`, and the status fields named in the table. GPS readings
-  are never read (only `health` and `reason`).
+  are never read (only `health`, `reason` and the cause `no_position`).
 * Every title and message is then filtered (`logic.scrub`), when it is queued
-  and again just before it is sent: anything that could be a position is
-  replaced by `[removed]`: a number after lat/lon/latitude/longitude/position/
-  coordinates/northing/easting/geo, degrees (not degrees C), 77.85S 166.67E
-  forms, two numbers with three or more decimals side by side, any number with
-  four or more decimals, any number of seven or more digits (the OLA's
-  positions are degrees x 1e7). It removes more than it must; alert texts use
-  one or two decimals.
-* The server, topic and token, ntfy token patterns (`tk_...`), `Bearer ...`,
-  `token=`/`password:` values and `user:password@` in URLs are removed the same
-  way. They are never in the status file, the queue or the log. The topic goes
-  in the JSON body, the token only in the `Authorization` header.
+  and again just before it is sent. This is a second line of defence, narrow
+  enough that readings, sizes, counts, durations, percentages and PIDs pass.
+  Replaced by `[removed]`:
+  * one or two numbers after a word that names a position (`lat`, `lon`,
+    `lng`, `latitude`, `longitude`, `pos`, `position`, `coord(inate)s`,
+    `northing`, `easting`, `geo`, also with a suffix such as `lat_deg`, and
+    `gps_Lat`/`gps_Long`), with their sign;
+  * degrees (not degrees C or F) with minutes and seconds;
+  * a hemisphere letter (capital N, S, E, W) after or before a decimal number:
+    `77.85S 166.67E`, `S 77.85 E 166.67`, or one of them alone with three or
+    more decimals;
+  * two numbers side by side with three or more decimals, one of them with two
+    or three digits before the point;
+  * a number of degrees with four or more decimals (1 to 999 before the point:
+    `0.0290 A` passes), and integers of 8 to 10 digits (the OLA's degrees x 1e7).
+
+  Large counts in this service's own texts are written as "14.4 million".
+* The ntfy token is replaced wherever it appears, and so are token patterns
+  (`tk_...`), `Bearer ...`, `token=`/`password:` values and `user:password@`
+  in URLs. The server and the topic are not replaced: they are where every
+  alert goes, so they tell ntfy's readers nothing (and a topic that is part of
+  the host name would otherwise spoil every title). None of the three is ever
+  in the status file, the queue or the log. The topic goes in the JSON body,
+  the token only in the `Authorization` header; a token that could not go in a
+  header (a space, a newline) is refused before anything is sent.
 
 ## The queue
 
@@ -128,28 +142,62 @@ oldest first; deleted only after ntfy answered 2xx.
   queued, but only if that priority is not higher than its own. An urgent alert
   is never dropped for a lower one; an alert lower than everything queued is
   itself dropped. Counted as `dropped` in the status and the boot summary.
-* **Duplicates:** at most the alert that was being sent when the service died
-  (sent, but not yet deleted), and the alerts raised in the round (one second)
-  in which it died, before its state was saved. Nothing is lost by a restart,
-  a reboot or a power cut.
+* **A file that cannot be read** (an I/O error) is passed over for 10 minutes;
+  the others are sent meanwhile (`unreadable` in the status).
+* **Sent, but the file cannot be deleted** (a card gone read-only): never sent
+  again by this process; deletion is tried again every minute
+  (`sent_not_deleted` in the status, one log line). After a restart with the
+  card still read-only it is sent once more.
+
+What can come twice, and what can be lost:
+
+* **Twice:** the alert that was being sent when the process died, if ntfy had
+  accepted it and the file was not deleted yet; the alerts raised in the round
+  (one second) in which the process died, before the state was saved; a sent
+  alert whose file could not be deleted, once per restart; a send that was
+  given up on (its time limit, or a stop) although the server had taken it.
+* **Lost:** alerts that could not be queued (the card not writable, or the
+  queue full under the rule above); events that never reached the drive before
+  a power cut (both writers sync each line, the manager's from a thread within
+  moments of the write); the end of an event log that was rotated twice while
+  the service was not running (counted in `lost`); a test alert whose inbox
+  file cannot be deleted (not sent; said in the status). A restart, a reboot or
+  a power cut loses nothing that was already queued.
 
 ## Sending
 
 `POST` of a JSON message to the server's root URL (ntfy's "publish as JSON"):
 topic, title, message, priority, tags. HTTPS with the system's certificates;
-plain HTTP only to this host itself (the tests). No proxy, no redirects (a
-redirect would carry the token elsewhere). The whole request is limited to
-`ntfy.timeout_s` (15 s), a server that sends one byte at a time included.
+plain HTTP only to this host itself (the tests). Standard library
+`http.client`: no proxy, no redirects (a redirect would carry the token
+elsewhere).
+
+Each send runs in a thread of its own; the loop never waits on the network for
+more than half a second per round, so the watchdog pings and the status file go
+on. A send is given up on after `ntfy.timeout_s` (15 s) in all, a server that
+sends one byte at a time included: its socket is shut, which ends a connect, a
+TLS handshake or a read at once. A DNS lookup cannot be ended that way: such a
+send runs on in its thread until the lookup gives up, and no new send starts
+while two are left like that. A send that was cut off is never counted as
+sent, unless its whole answer had come before.
 
 | Answer | Then |
 |---|---|
-| 2xx | deleted from the queue; the next one is sent at once (at most `max_per_round`, 5, per second) |
+| 2xx | deleted from the queue; the next one is sent at once (at most `max_per_round`, 5, per round) |
 | no connection, timeout, 5xx, 408, 3xx, 401, 403, 404 | kept; wait `retry_s` (10 s), doubling with each failure in a row up to `retry_max_s` (300 s); the link is back at most 5 minutes after it returns |
 | 429 | as above, and at least the server's `Retry-After` (at most an hour) |
-| 400, 413, 422 | the server refuses this message: tried three times in all, then dropped (`rejected`) |
+| 400, 413, 422 | kept, and not tried again for `retry_max_s`. If no alert has gone through since its first refusal, it is taken as the settings (a refused topic, a change at the server) and handled like a failure above: nothing is dropped for it. Only an alert refused three times while others went through in between is dropped (`rejected`) |
 
 A Pi whose clock is not set yet fails the certificate check ("certificate not
-yet valid ... is the clock set?"): its alerts wait like any others.
+accepted ... is the clock set?"): its alerts wait like any others.
+
+**Stopping** cuts off a send in progress (the alert stays queued), saves the
+state with `clean_stop` and exits without waiting for a thread left in a DNS
+lookup (`os._exit` once the state is saved). Measured: under 0.1 s with a
+server that never answers and with a DNS lookup that hangs (the tests require
+under 2 s). The unit allows 5 s (`TimeoutStopSec`): the power service forces
+the power-off 10 s after asking for it, and this service must never be what it
+waits for.
 
 ## The storm limit
 
@@ -160,9 +208,9 @@ goes out ends with "(N more like this held back before this one.)"; if none
 comes, a note "N more alerts of this kind were held back (storm limit). The
 last one: ..." goes out as soon as the window allows, with the highest priority
 among them. All kinds together: at most `storm.max_per_hour` (30); urgent ones
-do not count towards this and are never held back by it. An "over" alert goes
-out only if the alert it ends went out. The boot summary and test alerts are
-never held back.
+neither count towards this nor are held back by it. An "over" alert goes out
+only if the alert it ends went out, also when it ends in a later boot. The boot
+summary and test alerts are never held back.
 
 A reading that flaps around a limit 300 times gives 3 trips, their 3 "over"
 alerts and, an hour later, one note with the count (a test does exactly this).
@@ -173,7 +221,8 @@ The Pi has no clock battery; its clock can step by years when GPS or NTP sets
 it. **No decision here uses the wall clock.** Ages, delays, the storm limit
 and the backoff all use the time since boot (`CLOCK_BOOTTIME`). What is kept in
 the state file from these is used only within the same boot (kernel boot ID);
-a new boot starts them afresh and keeps only the counts. Status files are
+a new boot starts them afresh and keeps only the counts (and which alerts went
+out, for their "over"). Status files are
 judged by `read_status` (uptime and boot ID). The wall clock appears only as
 text in the alerts, with "clock not set" when telemetry says so.
 
@@ -205,13 +254,27 @@ A day without a summary is itself a sign of trouble.
 ## Event logs
 
 Followed from where the service last was, also across restarts and reboots
-(position in the state file: the file's inode, its first 64 bytes, the offset).
-When a log is renamed to `.1` the rest of `.1` is read first. If it was renamed
-twice while the service was not running, events are missed and the status
-says so (`events.<name>.lost`). The very first start begins at the end: history
-is not sent. Only whole lines are read; a line cut off by a power cut, NUL
-bytes, a line that is not JSON or longer than 64 kB are skipped and counted.
-At most `events.max_read_kb` (256 kB) per file per second.
+(position in the state file: the file's inode, its first 64 bytes, the offset,
+and fingerprints of the last 50 lines taken). The very first start begins at
+the end: history is not sent. Otherwise a log is never read from its start again:
+
+* renamed to `.1`: the rest of `.1`, then the new file;
+* renamed twice while the service was not running: the end of the older file is
+  gone (`events.<name>.lost`), then all of `.1`, then the new file;
+* shorter than what was read (its end lost in a power cut before it reached the
+  drive): on after the last line already taken that is still in it, so the
+  lines the next boot added are read and nothing is read twice (`lost`).
+
+Only whole lines are read; a line cut off by a power cut, NUL bytes, a line
+that is not JSON or longer than 64 kB are skipped and counted. At most
+`events.max_read_kb` (256 kB) per file per round.
+
+"Restarted" (a `start` or `manager_started` after something other than a
+clean stop) is judged only between two events that were both added to the log
+after this process first read it: the logs carry no boot ID, and an event that
+was there already may be from the boot before (a power cut leaves no `stop`).
+A service that crashes while the alerts service is not running is therefore not
+reported as restarted; its status file going stale still is.
 
 ## Failure modes of the service itself
 
@@ -226,7 +289,9 @@ At most `events.max_read_kb` (256 kB) per file per second.
 | The other services' files missing, old, damaged, huge (over 1 MB) or odd | conditions as in the table; nothing raises |
 | Its own state file damaged | started afresh, at the end of the event logs; said in the status (`state_file.note`) |
 | Memory | `MemoryMax=200M`; everything it reads is bounded (status files 1 MB, 256 kB of event log per round, 64 kB per line) |
-| It is stopped | the send in progress is finished, the state saved with `clean_stop`, the status says `running: false` |
+| It is stopped | the send in progress is cut off (it stays queued), the state saved with `clean_stop`, the status says `running: false`; exit within a second |
+| A send never ends (no answer, a DNS lookup that hangs) | given up on after 15 s; the loop goes on meanwhile. The longest gap between two status writes is about a second plus the card's sync time, so `alertctl` and `setup/check.py` (10 s limit) do not take a busy service for a stopped one |
+| A test alert's inbox file cannot be deleted (`sudo alertctl test`) | not sent; `inbox.problem` in the status. `alertctl` refuses to run as root and never creates the inbox |
 
 ## Status file
 
@@ -242,6 +307,9 @@ conditions  the conditions being followed: since_uptime_s, raised, title
 disk_levels_crossed
 events      per log: file, position, lines, skipped, lost, error
 inputs      telemetry, watcher, manager, power: ok | stale | missing | corrupt
+sending     the send on its way: id, for_s; stale_sends: given up on, still in a DNS lookup
+sent_not_deleted, unreadable, refused_kept    queue files kept out of sending
+inbox       dir, problem
 recent      the last 20 alerts: id, title, priority, result
 errors      parts of the round that failed
 running     false in the last status of a service that was stopped
@@ -309,6 +377,25 @@ stand-in server that accepts, refuses, hangs, trickles, redirects and answers
 simulated clock (offline then online, restarts mid-send, positions, storms,
 clock steps, reboots). `test_alerts_process.py`: real processes (kill -9 during
 a send), the write audit, the unit file, `alertctl`.
+
+## First start under systemd
+
+The unit's sandboxing (`ProtectSystem=strict`, `ReadWritePaths`,
+`ProtectHome=read-only`, `PrivateTmp`, `NoNewPrivileges`, `MemoryMax`) has not
+yet run under systemd. Right after the first start:
+
+1. `systemctl status radar-alerts`: active, and its status line updating
+   (`journalctl -u radar-alerts -b` without errors; no watchdog kill).
+2. `alertctl status` from the user's own shell: `service: running`, `link: ok`
+   or `idle`, no `ERROR` lines.
+3. `alertctl test --wait 60`: "sent" (DNS and TLS work inside the sandbox).
+4. At 3 minutes of uptime the boot summary arrives and names the free space on
+   the data drive and the newest collection (the drive is readable).
+5. `ls -l /var/lib/radar-runner/user/alerts-*` belong to `englacial`.
+
+If any of this fails: remove `ProtectSystem`, `ProtectHome`, `ReadWritePaths`
+and `PrivateTmp` from the unit (keep the rest), `sudo systemctl daemon-reload`
+and `sudo systemctl restart radar-alerts`.
 
 ## Bench tests ("Done when")
 

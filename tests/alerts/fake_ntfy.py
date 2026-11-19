@@ -1,7 +1,7 @@
 """A stand-in ntfy server on 127.0.0.1 for the alerts tests. Nothing here talks to any other host.
 
     with FakeNtfy() as server:
-        server.mode = "ok"          # ok | refuse (closed port) | hang | slow | status
+        server.mode = "ok"          # ok | hang | slow | redirect | status (closed_port() for a refusal)
         server.status = 503         # with mode "status"
         ...
         server.received             # [{"body": {...}, "headers": {...}, "raw": bytes}]
@@ -51,6 +51,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             body = json.loads(raw)
         except ValueError:
             body = None
+        if fake.refuse is not None and isinstance(body, dict) and fake.refuse(body):
+            status = 400
         if status == 200:
             fake.received.append({"body": body, "headers": {k.lower(): v for k, v in self.headers.items()},
                                   "raw": raw, "path": self.path})
@@ -85,6 +87,7 @@ class FakeNtfy:
         self.mode = "ok"
         self.status = 200
         self.retry_after = None
+        self.refuse = None          # a function of the body: True answers 400 to that message
         self.received = []
         self.refused = []
         self.attempts = 0

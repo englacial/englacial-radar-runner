@@ -24,6 +24,12 @@ COND = dict(C.DEFAULTS["alerts"]["conditions"], sd_free_gb_min=C.DEFAULTS["alert
     ("37.8418011 -122.2910401", ["37.8418011", "122.2910401"]),
     ("coordinates (-77.846; 166.668)", ["77.846", "166.668"]),
     ("easting 538123 northing 1350211", ["538123", "1350211"]),
+    ("pos=(-77.846, 166.668)", ["77.846", "166.668"]),
+    ("lat_deg=-77.8 lon_deg=166.6", ["77.8", "166.6"]),
+    ("lat:-77.8463 lon:+166.6683", ["-77.8463", "77.8463", "+166.6683", "166.6683", "-[", "+["]),
+    ("S77.846 E166.668", ["77.846", "166.668"]),
+    ("S 77.85 E 166.67", ["77.85", "166.67"]),
+    ("at 77.846S", ["77.846"]),
 ])
 def test_positions_are_removed(text, gone):
     out = L.scrub(text)
@@ -40,18 +46,25 @@ def test_positions_are_removed(text, gone):
     "the radar may not run: amplifier 28 V absent (1.1 V)",
     "Pi SoC 81.5 C, now: throttled",
     "uptime 109 min, boot 5",
+    "30 s, 50 W", "12.50 W", "2.5 s, 3.5 W",
+    "0.0290 A at 27.984 V", "0.156, 0.144 A", "28.04, 27.98 V",
+    "pid 4194303", "1222237 bytes", "a run of 5 s", "possible 3 times",
+    "12.5 %", "2.2 h", "3600 s", "uptime 1234567 s",
+    "The last run had 14.4 million errors in 180.0 million pulses (8.0 %, warning above 5 %)",
+    "2026-11-19T20:00:00Z", "b00005_s001_20261119T185630Z",
+    "location primary", "too long: 30 s",
 ])
 def test_ordinary_alert_text_is_left_as_it_is(text):
     assert L.scrub(text) == text
 
 
 def test_secrets_are_removed():
-    secrets = ["https://ntfy.example.org", "radar-topic-x93", "tk_abcdefghijklmnopqrstuvwxyz123"]
+    secrets = ["tk_abcdefghijklmnopqrstuvwxyz123"]
     text = ("posting to https://ntfy.example.org/radar-topic-x93 with tk_abcdefghijklmnopqrstuvwxyz123; "
             "Authorization: Bearer tk_other1234567 token=hunter22 password: swordfish "
             "https://user:pw@host.example/x")
     out = L.scrub(text, secrets)
-    for piece in ("ntfy.example.org", "radar-topic-x93", "tk_abc", "tk_other", "hunter22", "swordfish", "user:pw"):
+    for piece in ("tk_abc", "tk_other", "hunter22", "swordfish", "user:pw"):
         assert piece not in out, out
     assert "token=" in out and "password: " in out
 
@@ -132,6 +145,10 @@ def test_a_run_with_a_high_error_rate_is_a_warning():
     assert L.manager_alert(ended(13767, 588522), error_rate_warn=0.05) is None          # 2.3 %: the bench baseline
     high = L.manager_alert(ended(60000, 588522), error_rate_warn=0.05)
     assert high.priority == L.DEFAULT and "10.2 %" in high.message and high.key == "manager.error_rate"
+    assert "60 thousand errors in 589 thousand pulses" in high.message and L.scrub(high.message) == high.message
+    long_run = L.manager_alert(ended(14_400_000, 180_000_000), error_rate_warn=0.05)
+    assert "14.4 million errors in 180.0 million pulses" in long_run.message
+    assert L.scrub(long_run.message) == long_run.message
     assert L.manager_alert(ended(60000, 588522)) is None                                # not asked for
     assert L.manager_alert(ended(60000, 588522, failure="killed"), error_rate_warn=0.05).key == "manager.ended"
     for tail in (None, "text", [], ["[RX] Error count: 5"], ["[RX] Error count: 5", "[RX] Total pulses attempted: 0"]):
@@ -218,10 +235,10 @@ def test_service_status_files_and_their_priorities():
     assert all(states[n].delay_s == COND["status_stale_s"] for n in ("watcher_status", "power_status"))
     stopped = StatusRead("stale", {"ok": False, "running": False}, 30.0, "old")
     assert "was stopped" in L.condition_states(reads(watcher=stopped), COND)["watcher_status"].text
-    # The manager only once it has been seen in this boot (it is not always installed).
+    # The manager is always followed, with the same delay as the others (a normal boot raises nothing).
     missing = StatusRead("missing", None, None, "no such file")
-    assert "manager_status" not in L.condition_states(reads(manager=missing), COND)
-    assert L.condition_states(reads(manager=missing), COND, manager_seen=True)["manager_status"].active
+    state = L.condition_states(reads(manager=missing), COND)["manager_status"]
+    assert state.active and state.delay_s == COND["status_stale_s"]
 
 
 def test_power_warnings_each_become_a_condition_and_go_away_with_the_warning():
@@ -370,3 +387,11 @@ def test_odd_input_cannot_grow_the_storm_state_without_bound():
     many = {f"code{i}": "x" for i in range(1000)}
     states = L.condition_states(reads(power=ok({"warnings": many})), COND)
     assert len([n for n in states if n.startswith("power.")]) == L.MAX_POWER_WARNINGS
+
+
+def test_urgent_alerts_do_not_count_towards_the_hourly_limit_of_the_others():
+    lim = L.Limiter(100, 3600.0, 3)
+    for i in range(10):
+        assert lim.admit(1.0, alert(key=f"u{i}", priority=L.URGENT))
+    assert all(lim.admit(2.0, alert(key=f"d{i}", priority=L.DEFAULT)) for i in range(3))
+    assert not lim.admit(3.0, alert(key="d9", priority=L.DEFAULT))

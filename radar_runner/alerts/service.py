@@ -40,6 +40,10 @@ INBOX_PER_ROUND = 10
 SCAN_TIMEOUT_S = 10.0       # the data drive must answer the summary's directory listing within this
 COLLECTION_RE = re.compile(r"^b(\d{5,})_s(\d{3,})_")
 RECENT = 20
+SEND_ROUND_S = 0.5          # the loop waits at most this long per round for sends to finish
+MAX_STALE = 2               # sends given up on but still in a DNS lookup; no new one beyond this
+UNREMOVABLE_RETRY_S = 60.0
+UNREADABLE_RETRY_S = 600.0
 
 
 MESSAGE_MAX_BYTES = 4000    # ntfy turns a longer message into an attachment, or refuses it
@@ -154,7 +158,9 @@ class Alerts(Service):
         self.collections_root = config["manager"]["gates"]["data"]["root"]
         n = cfg["ntfy"]
         self.ntfy = {"server": n["server"], "topic": n["topic"], "token": n["token"]}
-        self.secrets = [v for v in self.ntfy.values() if v != "-"]
+        # Only the token is a secret from ntfy's readers: the server and the topic are where every alert
+        # goes anyway, and replacing the topic everywhere would eat a host name that contains it.
+        self.secrets = [n["token"]] if n["token"] != "-" else []
         self.unit = cfg["unit_name"] if cfg["unit_name"] != "-" else socket.gethostname()
         self.cond_cfg = dict(cfg["conditions"], sd_free_gb_min=cfg["disk"]["sd_free_gb_min"])
         # Set in setup() from the state file.
@@ -162,7 +168,6 @@ class Alerts(Service):
         self.previous = None
         self.summary_sent = False
         self.power_last_shutdown = None
-        self.manager_seen = False
         self.boot = None
         self.boot_alerts = {}
         self.last_events = {}
@@ -172,7 +177,16 @@ class Alerts(Service):
         self.failures = 0
         self.link = {"state": "idle", "last_ok_uptime_s": None, "last_attempt_uptime_s": None,
                      "last_result": "", "last_status": None}
-        self.rejections = {}
+        self.rejections = {}        # name -> {"count", "accepts": sends accepted before its first refusal}
+        self.held = {}              # name -> uptime: refused, not tried again before then
+        self.accepts = 0
+        self.sending = None         # the send on its way: {"send", "name", "item", "since"}
+        self.stale = []             # sends given up on whose thread still runs (a DNS lookup)
+        self.unremovable = set()    # sent, but the file could not be deleted
+        self.unreadable = {}        # name -> uptime of the next try
+        self.inbox_stuck = set()    # inbox files that could not be deleted
+        self.inbox_problem = ""
+        self._removal_retry_at = 0.0
         self.counters = {"queued": 0, "sent": 0, "held_back": 0, "rejected": 0, "events": 0,
                          "voltage_trips_in_power_loss": 0, "inbox": 0}
         self.recent = []
@@ -182,6 +196,7 @@ class Alerts(Service):
         self._state_error = ""
         self._scan = None
         self._reads = {}
+        self._followed = set()      # event logs read once already by this process
 
     # ------------------------------------------------------------------ state
 
@@ -207,7 +222,7 @@ class Alerts(Service):
         data = {
             "version": STATE_VERSION, "boot_id": self.boot_id, "boot": self.boot, "uptime_s": round(now, 1),
             "clean_stop": clean_stop, "summary_sent": self.summary_sent, "previous": self.previous,
-            "power_last_shutdown": self.power_last_shutdown, "manager_seen": self.manager_seen,
+            "power_last_shutdown": self.power_last_shutdown,
             "alerts": self.boot_alerts, "seq": self.queue.seq,
             "tails": {name: {"position": t.position(), "last": self.last_events.get(name)}
                       for name, t in self.tails.items()},
@@ -229,6 +244,14 @@ class Alerts(Service):
     def setup(self):
         now = self._uptime()
         self.queue.setup()
+        # Temporary state files of a run that was cut off in the middle of a save.
+        directory, base = os.path.split(self.state_path)
+        try:
+            for name in os.listdir(directory or "."):
+                if name.startswith(f".{base}.") and name.endswith(".tmp"):
+                    os.unlink(os.path.join(directory, name))
+        except OSError:
+            pass
         try:
             os.makedirs(self.inbox_dir, mode=0o755, exist_ok=True)
         except OSError as e:
@@ -238,7 +261,7 @@ class Alerts(Service):
             self._restore(st)
         except Exception as e:      # a state file that parses but makes no sense: never a reason not to run
             self.state_note = f"state file not usable ({type(e).__name__}): started afresh"
-            self.previous, self.summary_sent, self.manager_seen, self.boot = None, False, False, None
+            self.previous, self.summary_sent, self.boot = None, False, None
             self.boot_alerts, self.last_events = {}, {}
             self._restore(None)
         if self.state_note:
@@ -271,7 +294,6 @@ class Alerts(Service):
                 previous = st.get("previous")
                 self.previous = previous if isinstance(previous, dict) else None
                 self.summary_sent = st.get("summary_sent") is True
-                self.manager_seen = st.get("manager_seen") is True
                 self.boot, self.boot_alerts = boot, counts
             else:
                 up = st.get("uptime_s")
@@ -292,6 +314,11 @@ class Alerts(Service):
     def cleanup(self):
         if self.limiter is None:
             return
+        if self.sending is not None:
+            # The power service forces the power-off 10 s after asking for it: never make it wait.
+            # The alert stays queued and is sent after the next start.
+            self.sending["send"].cancel()
+            self.log.info("stopping: the send of %s was cut off; it stays queued", self.sending["name"])
         now = self._uptime()
         self._save_state(now, clean_stop=True)
         data = self._status(now)
@@ -319,8 +346,6 @@ class Alerts(Service):
         self._reads = {name: status_files.read_status(path, self.config["status"]["stale_after_s"],
                                                       wall=self._wall, uptime=self._uptime, boot_id=self.boot_id)
                        for name, path in self.status_files.items()}
-        if self._reads["manager"].ok:
-            self.manager_seen = True
         if self.boot is None:
             self.boot = self._boot_number()
         alerts = []
@@ -358,7 +383,7 @@ class Alerts(Service):
             names = sorted(n for n in os.listdir(self.inbox_dir) if n.endswith(".json") and not n.startswith("."))
         except FileNotFoundError:
             return out
-        for name in names[:INBOX_PER_ROUND]:
+        for name in [n for n in names if n not in self.inbox_stuck][:INBOX_PER_ROUND]:
             path = os.path.join(self.inbox_dir, name)
             try:
                 with open(path, "rb") as f:
@@ -367,8 +392,15 @@ class Alerts(Service):
                 request = None
             try:
                 os.unlink(path)
-            except OSError:
+            except FileNotFoundError:
                 pass
+            except OSError as e:
+                # Queued only once taken out of the inbox: one that cannot be deleted (a directory made
+                # by root) would otherwise be queued again every round.
+                self.inbox_stuck.add(name)
+                self.inbox_problem = f"cannot delete {path}: {e.strerror or e}; the request is not sent"
+                self.log.error("%s", self.inbox_problem)
+                continue
             if not isinstance(request, dict):
                 continue
             self.counters["inbox"] += 1
@@ -385,9 +417,17 @@ class Alerts(Service):
         out = []
         power_loss = self._power_loss()
         for name, tail in self.tails.items():
+            # The logs carry no boot ID. What was appended after this process first read a log was
+            # written in this boot (the writers of the boot before are gone); what was there already
+            # may be from either. Only between two such events is a start without a clean stop a restart.
+            live = name in self._followed
+            self._followed.add(name)
             for event in tail.read():
                 self.counters["events"] += 1
+                up = event.get("uptime_s")
                 previous = self.last_events.get(name)
+                if not (live and isinstance(previous, dict) and previous.get("boot_id") == self.boot_id):
+                    previous = None
                 try:
                     if name == "watcher":
                         alert = L.watcher_alert(event, previous, power_loss)
@@ -399,14 +439,15 @@ class Alerts(Service):
                 except Exception:
                     self.log.exception("cannot judge an event of %s; skipped", tail.path)
                     alert = None
-                self.last_events[name] = {"event": str(event.get("event")), "uptime_s": event.get("uptime_s")}
+                self.last_events[name] = {"event": str(event.get("event")), "uptime_s": up,
+                                          "boot_id": self.boot_id if live else None}
                 self._dirty = True
                 if alert is not None:
                     out.append((alert, {"time_utc": event.get("time_utc"), "uptime_s": event.get("uptime_s")}))
         return out
 
     def _conditions(self, now):
-        states = L.condition_states(self._reads, self.cond_cfg, self.conditions.entries, self.manager_seen)
+        states = L.condition_states(self._reads, self.cond_cfg, self.conditions.entries)
         before = json.dumps(self.conditions.entries, sort_keys=True)
         out = [(a, None) for a in self.conditions.update(now, states)]
         tel = self._reads["telemetry"]
@@ -573,60 +614,130 @@ class Alerts(Service):
         return problem
 
     def _send(self):
+        """Start, look at and finish sends; never waits on the network for more than SEND_ROUND_S."""
         n = self.cfg["ntfy"]
+        round_end = time.monotonic() + SEND_ROUND_S
+        self._reap()
         for _ in range(max(1, n["max_per_round"])):
-            now = self._uptime()
-            if self._stop.is_set() or now < self.next_send_at:
+            if self.sending is None and not self._start_next():
                 return
-            names = self.queue.names()
-            if not names:
-                if self.link["state"] != "unconfigured":
-                    self.link["state"] = "idle" if self.failures == 0 else self.link["state"]
+            s = self.sending
+            while not s["send"].done.is_set():
+                if self._stop.is_set():
+                    return
+                if time.monotonic() - s["since"] > n["timeout_s"]:
+                    s["send"].cancel()      # ends it at once, unless it is in a DNS lookup
+                    self.stale.append(s)
+                    self.sending = None
+                    self._finished(s, ntfy.Result(ntfy.RETRY, text=f"no complete answer within {n['timeout_s']:g} s"))
+                    return
+                if time.monotonic() >= round_end:
+                    return          # still on its way: looked at again next round
+                s["send"].done.wait(0.05)
+            self.sending = None
+            if not self._finished(s, s["send"].result):
                 return
-            _, _, name = names[0]
+
+    def _start_next(self):
+        if self._stop.is_set() or self._uptime() < self.next_send_at or len(self.stale) >= MAX_STALE:
+            return False
+        now = self._uptime()            # holds and retries count in uptime, like every other wait here
+        for _, _, name in self.queue.names():
+            if name in self.unremovable or self.held.get(name, 0.0) > now or self.unreadable.get(name, 0.0) > now:
+                continue
             item = self.queue.load(name)
             if item is None:
+                if self.queue.load_error:
+                    # One file that cannot be read (EIO) must not hold up the others.
+                    if name not in self.unreadable:
+                        self.log.error("cannot read %s: %s; the others are sent first", name, self.queue.load_error)
+                    self.unreadable[name] = now + UNREADABLE_RETRY_S
                 continue
+            self.unreadable.pop(name, None)
             item["title"] = L.scrub(item["title"], self.secrets)
             item["message"] = L.scrub(item["message"], self.secrets)
-            self.link["last_attempt_uptime_s"] = round(now, 1)
-            result = ntfy.publish(self.ntfy["server"], self.ntfy["topic"], self.ntfy["token"], item, n["timeout_s"])
-            self.notifier.watchdog()
-            now = self._uptime()
-            text = L.scrub(result.text, self.secrets)
-            self.link.update(last_result=text, last_status=result.status)
-            if result.kind == ntfy.SENT:
+            self.link["last_attempt_uptime_s"] = round(self._uptime(), 1)
+            send = ntfy.Send(self.ntfy["server"], self.ntfy["topic"], self.ntfy["token"], item,
+                             min(self.cfg["ntfy"]["timeout_s"], ntfy.READ_TIMEOUT_S)).start()
+            self.sending = {"send": send, "name": name, "item": item, "since": time.monotonic()}
+            return True
+        if self.failures == 0 and self.link["state"] != "unconfigured":
+            self.link["state"] = "idle"
+        return False
+
+    def _reap(self):
+        """Sends given up on that have ended since (a DNS lookup); and files that could not be deleted."""
+        for s in [s for s in self.stale if s["send"].done.is_set()]:
+            self.stale.remove(s)
+            if s["send"].result is not None and s["send"].result.kind == ntfy.SENT:
+                self.log.info("%s went through after all", s["name"])
+                self._sent(s["name"], s["item"])
+        now = self._uptime()
+        if self.unremovable and now >= self._removal_retry_at:
+            self._removal_retry_at = now + UNREMOVABLE_RETRY_S
+            for name in list(self.unremovable):
+                if self.queue.remove(name):
+                    self.unremovable.discard(name)
+            if not self.unremovable:
+                self.log.info("the sent alerts that could not be deleted are deleted now")
+
+    def _sent(self, name, item):
+        self.accepts += 1
+        self.counters["sent"] += 1
+        self.failures = 0
+        self.link.update(state="ok", last_ok_uptime_s=round(self._uptime(), 1))
+        self.rejections.pop(name, None)
+        self.held.pop(name, None)
+        self._remember(name, item, item["priority"], "sent")
+        self.log.info("sent %s: %s", name, item["title"])
+        if not self.queue.remove(name):
+            # Sent, but still in the queue (a card gone read-only): never sent again from here.
+            if not self.unremovable:
+                self.log.error("%s; sent alerts are kept out of sending until they can be deleted", self.queue.error)
+            self.unremovable.add(name)
+            self._removal_retry_at = self._uptime() + UNREMOVABLE_RETRY_S
+
+    def _finished(self, s, result):
+        """Act on the result of one send. True if the next alert may be sent at once."""
+        n = self.cfg["ntfy"]
+        name, item = s["name"], s["item"]
+        now = self._uptime()
+        text = L.scrub(result.text, self.secrets)
+        self.link.update(last_result=text, last_status=result.status)
+        if result.kind == ntfy.SENT:
+            self._sent(name, item)
+            return True
+        if result.kind == ntfy.UNCONFIGURED:
+            self.link["state"] = "unconfigured"
+            self.next_send_at = now + 60.0
+            return False
+        if result.kind == ntfy.REJECTED:
+            r = self.rejections.setdefault(name, {"count": 0, "accepts": self.accepts})
+            r["count"] += 1
+            server_works = self.accepts > r["accepts"]      # another alert went through since its first refusal
+            self.log.error("ntfy refused %s (%d time(s)): %s", name, r["count"], text)
+            if r["count"] >= REJECT_LIMIT and server_works:
                 self.queue.remove(name)
-                self.counters["sent"] += 1
-                self.failures = 0
-                self.link.update(state="ok", last_ok_uptime_s=round(now, 1))
                 self.rejections.pop(name, None)
-                self._remember(name, item, item["priority"], "sent")
-                self.log.info("sent %s: %s", name, item["title"])
-                continue
-            if result.kind == ntfy.UNCONFIGURED:
-                self.link["state"] = "unconfigured"
-                self.next_send_at = now + 60.0
-                return
-            if result.kind == ntfy.REJECTED:
-                self.rejections[name] = self.rejections.get(name, 0) + 1
-                self.log.error("ntfy refused %s (%d of %d): %s", name, self.rejections[name], REJECT_LIMIT, text)
-                if self.rejections[name] >= REJECT_LIMIT:
-                    self.queue.remove(name)
-                    self.rejections.pop(name, None)
-                    self.counters["rejected"] += 1
-                    self._remember(name, item, item["priority"], f"dropped: refused by the server ({text})")
-                    continue
-            self.failures += 1
-            wait = min(n["retry_max_s"], n["retry_s"] * 2 ** min(self.failures - 1, 20))
-            if result.retry_after_s is not None:
-                wait = max(wait, min(result.retry_after_s, 3600.0))
-            self.next_send_at = now + wait
-            if self.link["state"] != "failing":
-                self.log.warning("cannot send to ntfy: %s; alerts stay queued", text)
-            self.link["state"] = "failing"
-            self._remember(name, item, item["priority"], f"waiting: {text}")
-            return
+                self.held.pop(name, None)
+                self.counters["rejected"] += 1
+                self._remember(name, item, item["priority"], f"dropped: refused by the server ({text})")
+                return True
+            self.held[name] = now + n["retry_max_s"]
+            self._remember(name, item, item["priority"], f"refused, kept: {text}")
+            if server_works:
+                return True
+            # Nothing has gone through since: more likely the settings (topic, server) than this alert.
+        self.failures += 1
+        wait = min(n["retry_max_s"], n["retry_s"] * 2 ** min(self.failures - 1, 20))
+        if result.retry_after_s is not None:
+            wait = max(wait, min(result.retry_after_s, 3600.0))
+        self.next_send_at = now + wait
+        if self.link["state"] != "failing":
+            self.log.warning("cannot send to ntfy: %s; alerts stay queued", text)
+        self.link["state"] = "failing"
+        self._remember(name, item, item["priority"], f"waiting: {text}")
+        return False
 
     # ---- status
 
@@ -638,6 +749,13 @@ class Alerts(Service):
             "ntfy": {"configured": not problem, "problem": problem},
             "link": dict(self.link, failures_in_a_row=self.failures,
                          next_attempt_in_s=round(max(self.next_send_at - now, 0.0), 1) if self.failures else None),
+            "sending": ({"id": self.sending["name"][:-5], "for_s": round(time.monotonic() - self.sending["since"], 1)}
+                        if self.sending else None),
+            "stale_sends": len(self.stale),
+            "inbox": {"dir": self.inbox_dir, "problem": self.inbox_problem},
+            "sent_not_deleted": sorted(n[:-5] for n in self.unremovable),
+            "unreadable": sorted(n[:-5] for n in self.unreadable),
+            "refused_kept": {n[:-5]: r["count"] for n, r in self.rejections.items()},
             "queue": {"dir": self.queue.dir, "length": sum(counts.values()),
                       "by_priority": {L.PRIORITY_NAMES.get(p, str(p)): c for p, c in sorted(counts.items(), reverse=True)},
                       "max": self.queue.max_items, "dropped": self.queue.dropped, "damaged": self.queue.damaged,

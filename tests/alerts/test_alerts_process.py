@@ -264,10 +264,18 @@ def test_alertctl_test_goes_through_the_real_path_and_status_shows_it(tmp_path, 
     r = alertctl(tmp_path, local, "status")
     assert r.returncode == 3 and "has not written" in r.stdout
     r = alertctl(tmp_path, local, "test", "--priority", "urgent")
-    assert r.returncode == 3 and "is sent when it starts" in r.stdout
+    assert r.returncode == 3 and "does not exist" in r.stdout      # alertctl never makes the inbox
+    assert not (tmp_path / "state" / "alerts-inbox").exists()
     proc = start(tmp_path, local)
     try:
-        assert server.wait_for(2)           # the summary and the test alert queued before the start
+        wait_status(tmp_path, proc, lambda d: d["summary_sent"])
+        proc.send_signal(signal.SIGTERM)        # stopped: the request waits in the inbox
+        assert proc.wait(10) == 0
+        r = alertctl(tmp_path, local, "test", "--priority", "urgent")
+        assert r.returncode == 3 and "is sent when it starts" in r.stdout
+        assert alertctl(tmp_path, local, "status").returncode == 3
+        proc = start(tmp_path, local)
+        assert server.wait_for(2)           # the summary and the test alert
         r = alertctl(tmp_path, local, "test", "--priority", "high", "--text", "from the test", "--wait", "20")
         assert r.returncode == 0, r.stdout + r.stderr
         assert r.stdout.strip().endswith(": sent")
@@ -277,7 +285,7 @@ def test_alertctl_test_goes_through_the_real_path_and_status_shows_it(tmp_path, 
         assert r.returncode == 0 and "ntfy:       configured" in r.stdout and "queue:      0 waiting" in r.stdout
         assert TOKEN not in r.stdout and TOPIC not in r.stdout
         r = alertctl(tmp_path, local, "status", "--json")
-        assert json.loads(r.stdout)["counters"]["sent"] >= 3
+        assert json.loads(r.stdout)["counters"]["sent"] >= 2         # this process: the two test alerts
         assert "no alerts waiting" in alertctl(tmp_path, local, "queue").stdout
         server.mode, server.status = "status", 503
         r = alertctl(tmp_path, local, "test", "--wait", "3")
@@ -293,3 +301,76 @@ def test_alertctl_never_reads_the_secrets_file():
     with open(os.path.join(REPO, "radar_runner", "alerts", "ctl.py")) as f:
         text = f.read()
     assert "secrets_file=None" in text and "SECRETS_FILE" not in text
+
+
+# ---- a stop never waits for the network (the power service forces the power-off 10 s after asking)
+
+SLOW_DNS = textwrap.dedent("""
+    import socket, sys, time
+    def hung(*args, **kwargs):
+        time.sleep(120)             # a DNS lookup that hangs: getaddrinfo cannot be interrupted
+        raise socket.gaierror(-3, "Temporary failure in name resolution")
+    socket.getaddrinfo = hung
+    sys.argv = ["radar_runner.alerts"] + sys.argv[1:]
+    import runpy
+    runpy.run_module("radar_runner.alerts", run_name="__main__")
+""")
+
+
+def stop_during_send(tmp_path, proc, attempted):
+    deadline = time.monotonic() + 20
+    while not attempted() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert attempted(), proc.stdout.read() if proc.poll() is not None else "no send started"
+    time.sleep(1.0)
+    t = time.monotonic()
+    proc.send_signal(signal.SIGTERM)
+    status = proc.wait(10)
+    took = time.monotonic() - t
+    out = proc.stdout.read()
+    assert status == 0 and "Traceback" not in out, out
+    state = json.loads((tmp_path / "state" / "alerts-state.json").read_text())
+    assert state["clean_stop"] is True
+    assert len(os.listdir(tmp_path / "state" / "alerts-queue")) == 1        # the alert stays queued
+    return took
+
+
+def test_a_stop_during_a_send_to_a_server_that_does_not_answer_takes_under_two_seconds(tmp_path, server):
+    server.mode = "hang"
+    local = write_config(tmp_path, server.url, **{"ntfy": {"server": server.url, "topic": TOPIC, "token": TOKEN,
+                                                           "timeout_s": 25.0}})
+    proc = start(tmp_path, local)
+    try:
+        took = stop_during_send(tmp_path, proc, lambda: server.attempts >= 1)
+        assert took < 2.0, took
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(10)
+
+
+def test_a_stop_during_a_hung_dns_lookup_takes_under_two_seconds(tmp_path):
+    local = write_config(tmp_path, "https://ntfy.invalid", **{"ntfy": {
+        "server": "https://ntfy.invalid", "topic": TOPIC, "token": TOKEN, "timeout_s": 25.0}})
+    env = dict(os.environ, PYTHONPATH=REPO)
+    env.pop("NOTIFY_SOCKET", None)
+    proc = subprocess.Popen([sys.executable, "-B", "-u", "-c", SLOW_DNS, "--local-config", str(local),
+                             "--secrets", str(tmp_path / "no-secrets.yaml")],
+                            cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        def attempted():
+            read = S.read_status(str(tmp_path / "run" / "alerts.json"), 5.0)
+            return read.ok and read.data.get("sending") is not None
+        took = stop_during_send(tmp_path, proc, attempted)
+        assert took < 2.0, took
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(10)
+
+
+def test_the_unit_gives_a_stop_less_time_than_the_power_service_gives_the_power_off():
+    stop = [int(line.split("=")[1]) for line in unit_lines("radar-alerts.service") if line.startswith("TimeoutStopSec=")]
+    with open(os.path.join(REPO, "power", "config.py")) as f:
+        assert "last_resort_after_s: float = 10.0" in f.read()
+    assert stop == [5]
