@@ -138,7 +138,10 @@ list of devices (`?DEVICES;`, which shows whether gpsd has identified the
 receiver). The service itself sends nothing to the receiver. The one program it
 starts is `gps.receiver_fix_command` (`setup/gps_receiver.py --apply --ram`):
 15 s after every OLA start, and when gpsd has a receiver but no position (see
-below). It is never waited for and is stopped after `receiver_fix_timeout_s`.
+below). It is never waited for, runs in a session of its own, writes to this
+service's journal, and is stopped after `receiver_fix_timeout_s`. It is started
+in a step of its own, apart from the OLA's: nothing about it can affect the
+amplifier readings. `""` switches it off.
 
 If gpsd has the receiver but no new fix time comes out of it for 30 s,
 `sources.gps.health` is `error` with the reason; that is what the receiver's
@@ -146,38 +149,44 @@ output overflow of 2026-11-16 looked like.
 
 **No position.** On 2026-11-19, at the first boot after a power cut of several
 minutes, gpsd delivered fix times with mode 0 for 77 minutes while the receiver
-had a 3D fix. gpsd had not identified the receiver (empty `subtype`) and so had
-not switched on its position messages; asking for the receiver's version by
-hand fixed it at once. The cause is inferred from that one occurrence, and a
-cold-boot test on the bench (several minutes without power) is still to be
-done. The service now reports it:
+had a 3D fix: gpsd had not identified the receiver (empty `subtype`) and the
+receiver sent it only NAV-TIMEGPS and NAV-DOP, no position message. Asking for
+the receiver's version by hand fixed it at once. What gpsd does at its start,
+and why that can end in this state, is in `setup/gps_receiver.py`; the way in is
+inferred from that one occurrence, and a cold-boot test on the bench (several
+minutes without power) is still to be done. gpsd clears the fix at every cycle,
+so a fix time with mode 0 means that no position message came, and mode 1 a
+position message without a fix. The service reports:
 
 ```
 sources.gps.no_position_s        for how long gpsd has had a receiver without a 2D/3D fix (a second or
                                  less when all is well)
 sources.gps.receiver_identified  gpsd's last DEVICES report: true, false, or null (no device or not known)
 sources.gps.no_position          "" while no_position_s < no_position_warn_s (60 s), then why:
-                                 "gpsd_unidentified"  gpsd has not identified the receiver: health "error"
-                                 "no_fix"             identified, so most likely no satellites (antenna
-                                                      indoors, poor sky): health stays "ok", the reason
-                                                      says "no position fix for N s"
-                                 "unknown"            gpsd has not said
+                                 "gpsd_unidentified"     gpsd has not identified the receiver: health "error"
+                                 "no_position_messages"  identified, fix times come, mode 0: the receiver
+                                                         sends no NAV-PVT (gpsd's enable lost): "error"
+                                 "no_data"               no new fix time either: "stale", then "error" as above
+                                 "no_fix"                mode 1: most likely no satellites (antenna indoors,
+                                                         poor sky): health stays "ok", the reason says
+                                                         "no position fix for N s"
 sources.gps.receiver_check       runs, running, last_status (setup/gps_receiver.py's exit status),
-                                 last_why, next_retry_at_no_position_s
+                                 last_why, error (an internal error of this step), next_retry_at_no_position_s
 ```
 
 A warning is logged once when `no_position` is set and an info line when the
 position is back. Without a position the receiver command is run again: after
 `no_position_retry_s` (120 s), then after twice the previous wait each time, up
 to `no_position_retry_max_s` (30 min): at 2, 6, 14 and 30 minutes, then every
-30 minutes. With an identified receiver that only reads one setting of the
-receiver (and corrects it if needed), so it is harmless indoors.
+30 minutes; never more often than every 30 s. With an identified receiver that
+has no satellites it only reads two settings of the receiver, so it is harmless
+indoors.
 
 To look at the receiver's side by hand:
 
 ```
 setup/check.py --receiver     # reads CFG-UART1OUTPROT-NMEA and the transmit-buffer error flags; sets nothing
-setup/gps_receiver.py         # whether gpsd has identified the receiver, and the same setting; sets nothing
+setup/gps_receiver.py         # identification, NAV-PVT and UART1 NMEA in RAM; sets nothing
 ```
 
 Background: `setup/SYSTEM_CHANGES.md`, section 11.

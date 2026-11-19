@@ -106,6 +106,23 @@ def test_other_types(tmp_path):
     assert config == defaults and len(warnings) == 1
 
 
+def test_empty_receiver_command_switches_it_off(tmp_path):
+    config, warnings = load(tmp_path, repo="", local="telemetry: {gps: {receiver_fix_command: ''}}")
+    assert config["telemetry"]["gps"]["receiver_fix_command"] == "" and warnings == []
+    config, warnings = load(tmp_path, repo="", local="paths: {run_dir: ''}")      # elsewhere "" is still refused
+    assert config["paths"] == C.DEFAULTS["paths"] and len(warnings) == 1
+
+
+def test_receiver_command_intervals_have_a_floor(tmp_path):
+    config, warnings = load(tmp_path, repo="", local="telemetry: {gps: {no_position_retry_s: 0, "
+                                                     "no_position_retry_max_s: 5, receiver_fix_timeout_s: 1, "
+                                                     "no_position_warn_s: 0}}")
+    gps = config["telemetry"]["gps"]
+    assert (gps["no_position_retry_s"], gps["no_position_retry_max_s"], gps["receiver_fix_timeout_s"]) == (30.0, 30.0, 30.0)
+    assert gps["no_position_warn_s"] == 0.0 and len(warnings) == 3
+    assert warnings[0].endswith("telemetry.gps.no_position_retry_s must be at least 30: 30 used")
+
+
 def test_a_bad_value_in_a_later_layer_keeps_the_earlier_layer(tmp_path):
     config, warnings = load(tmp_path, repo="status: {stale_after_s: 9}", local="status: {stale_after_s: soon}")
     assert config["status"]["stale_after_s"] == 9.0 and len(warnings) == 1

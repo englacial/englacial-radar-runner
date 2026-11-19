@@ -172,7 +172,7 @@ def test_all_sources_are_published_and_logged(bench):
     assert data["logging"]["location"] == "primary" and data["logging"]["rows_dropped"] == 0
     assert data["clock"] == {"steps": 0, "last_step_s": None, "last_step_uptime_s": None, "synced": 1}
     assert data["loop"]["rounds"] == 120 and data["loop"]["longest_gap_s"] == 0.25      # every round on time
-    assert set(data["loop"]["slowest_step_s"]) == {"ola", "gps", "pi", "ups", "status_file"}
+    assert set(data["loop"]["slowest_step_s"]) == {"ola", "gps", "gps_receiver", "pi", "ups", "status_file"}
     # The published file, read the way every other service reads it.
     read = bench.status_file()
     assert read.ok and read.data["amp"]["fresh"] is True
@@ -602,27 +602,31 @@ def test_receiver_correction_runs_once_after_each_ola_start(tmp_path):
     cfg["receiver_fix_command"] = f"/bin/sh -c 'echo x >> {marker}'"
     cfg["receiver_fix_delay_s"] = 2.0
     svc = bench.service
-    svc._receiver_fix(0.0, False)
-    svc._receiver_fix(1.0, True)             # the OLA has just been configured
-    svc._receiver_fix(2.0, True)
-    assert not marker.exists()               # not before the delay
-    svc._receiver_fix(3.5, True)
+
+    def at(t, configured):
+        svc._ola_started(t, configured)     # in the OLA's step: bookkeeping only
+        svc._step_receiver(t)               # in its own step: the command itself
+    at(0.0, False)
+    at(1.0, True)                           # the OLA has just been configured
+    at(2.0, True)
+    assert not marker.exists()              # not before the delay
+    at(3.5, True)
     svc._fix_proc.wait(timeout=5)
     for t in (4.0, 5.0, 60.0):
-        svc._receiver_fix(t, True)           # still configured: not again
+        at(t, True)                         # still configured: not again
     assert marker.read_text() == "x\n"
-    svc._receiver_fix(61.0, False)           # the OLA resets ...
-    svc._receiver_fix(62.0, True)            # ... and is configured again
-    svc._receiver_fix(65.0, True)
+    at(61.0, False)                         # the OLA resets ...
+    at(62.0, True)                          # ... and is configured again
+    at(65.0, True)
     svc._fix_proc.wait(timeout=5)
     assert marker.read_text() == "x\nx\n"
 
 
 def retry_bench(tmp_path, command, **kw):
     """A started bench whose receiver command is `command`, with short no-position waits."""
-    settings = dict(gps__no_position_warn_s=10.0, gps__no_position_retry_s=20.0, gps__no_position_retry_max_s=80.0)
+    settings = dict(gps__no_position_warn_s=10.0, gps__no_position_retry_s=30.0, gps__no_position_retry_max_s=120.0)
     bench = Bench(tmp_path, gps__receiver_fix_command=command, **dict(settings, **kw))
-    bench.keep_streaming(700)
+    bench.keep_streaming(900)
     started(bench, 40)                       # the OLA start's run of the command is over by now
     wait_for_command(bench)
     assert bench.service._fix["last_why"] == "the OLA has just started"
@@ -654,7 +658,7 @@ def test_gpsd_without_identification_is_reported_and_the_command_retried_with_gr
     gps = bench.snap()["sources"]["gps"]
     assert gps["health"] == "ok" and gps["receiver_identified"] is True and gps["no_position"] == ""
     assert gps["receiver_check"] == {"runs": 1, "running": False, "last_status": 2, "last_why": "the OLA has just started",
-                                     "next_retry_at_no_position_s": None}
+                                     "error": "", "next_retry_at_no_position_s": None}
     # What 2026-11-19 looked like: gpsd has the receiver, fix times come, but mode 0 and no position.
     conn = bench.gpsd.connections[-1]
     conn.devices[0].update(subtype="", subtype1="")
@@ -667,16 +671,16 @@ def test_gpsd_without_identification_is_reported_and_the_command_retried_with_gr
     data = bench.snap()
     gps = data["sources"]["gps"]
     assert gps["health"] == "error" and gps["no_position"] == "gpsd_unidentified" and "gps: error" in data["problems"]
-    assert "gpsd has not identified the receiver: no position for 1" in gps["reason"]
+    assert "gpsd has not identified the receiver (no version reply seen)" in gps["reason"]
+    assert "no position for 1" in gps["reason"]
     assert caplog.text.count("GPS: gpsd has a receiver but no position for") == 1
-    assert "gpsd has not identified the receiver, so it has not switched on the position messages" in caplog.text
-    # Retried at 20 s without a position, then after 40, 80, 80 s (the maximum).
-    starts = run_watching_starts(bench, 225)
-    assert starts == [f"no position for {s} s" for s in (20, 60, 140, 220)]
+    # Retried at 30 s without a position, then after 60, 120, 120 s (the maximum).
+    starts = run_watching_starts(bench, 335)
+    assert starts == [f"no position for {s} s" for s in (30, 90, 210, 330)]
     assert marker.read_text() == "x\n" * 5
     check = bench.snap()["sources"]["gps"]["receiver_check"]
-    assert check["runs"] == 5 and check["last_status"] == 2 and check["last_why"].startswith("no position for 2")
-    assert 290 <= check["next_retry_at_no_position_s"] <= 310
+    assert check["runs"] == 5 and check["last_status"] == 2 and check["last_why"] == "no position for 330 s"
+    assert check["next_retry_at_no_position_s"] == pytest.approx(450, abs=2)
     assert "GPS receiver check finished with status 2 (gpsd has not identified the receiver)" in caplog.text
     assert caplog.text.count("GPS: gpsd has a receiver but no position for") == 1      # warned once
     # gpsd identifies the receiver and the positions follow.
@@ -687,38 +691,122 @@ def test_gpsd_without_identification_is_reported_and_the_command_retried_with_gr
     gps = data["sources"]["gps"]
     assert gps["health"] == "ok" and gps["reason"] == "" and gps["no_position"] == "" and data["problems"] == []
     assert gps["receiver_identified"] is True and gps["receiver_check"]["next_retry_at_no_position_s"] is None
-    assert "GPS: position again, after 2" in caplog.text
+    assert "GPS: position again, after 3" in caplog.text
     assert run_watching_starts(bench, 300) == []
 
 
-def test_no_satellites_is_not_called_a_gpsd_fault_and_the_retry_is_harmless(tmp_path, caplog):
+def test_identified_but_mode_0_is_an_error_too(tmp_path, caplog):
+    """gpsd identified, but the receiver sends no NAV-PVT (its enable lost): fix times, mode 0."""
     caplog.set_level("INFO")
     bench = retry_bench(tmp_path, "/bin/true")
     conn = bench.gpsd.connections[-1]
-    conn.tpv.update(mode=1, lat=None, lon=None)     # identified, but no fix: an antenna indoors
-    starts = run_watching_starts(bench, 70)
+    conn.tpv.update(mode=0, lat=None, lon=None)
+    starts = run_watching_starts(bench, 35)
+    data = bench.snap()
+    gps = data["sources"]["gps"]
+    assert gps["receiver_identified"] is True and gps["no_position"] == "no_position_messages"
+    assert gps["health"] == "error" and "gpsd reports mode 0" in gps["reason"] and "gps: error" in data["problems"]
+    assert "the receiver sends gpsd no position message (NAV-PVT off)" in caplog.text
+    assert starts == ["no position for 30 s"]
+    # No mode at all in gpsd's answer counts the same.
+    conn.tpv.pop("mode")
+    bench.run(2)
+    assert bench.snap()["sources"]["gps"]["no_position"] == "no_position_messages"
+
+
+def test_no_satellites_is_not_called_a_fault_and_the_retry_is_harmless(tmp_path, caplog):
+    caplog.set_level("INFO")
+    bench = retry_bench(tmp_path, "/bin/true")
+    conn = bench.gpsd.connections[-1]
+    conn.tpv.update(mode=1, lat=None, lon=None)     # NAV-PVT without a fix: an antenna indoors
+    starts = run_watching_starts(bench, 95)
     gps = bench.snap()["sources"]["gps"]
-    assert gps["health"] == "ok" and gps["reason"].startswith("no position fix for 7")
+    assert gps["health"] == "ok" and gps["reason"].startswith("no position fix for 9")
     assert gps["no_position"] == "no_fix" and gps["receiver_identified"] is True
-    assert "gpsd has identified the receiver, so most likely it has no satellites" in caplog.text
+    assert "gpsd gets the position message without a fix: most likely no satellites" in caplog.text
     assert len(starts) == 2 and gps["receiver_check"]["last_status"] == 0
     # gpsd going away ends the count without a position, and it starts again.
     conn.eof = True
     bench.run(2)
-    assert "GPS: no position for 7" in caplog.text and "counted again from now" in caplog.text
+    assert "GPS: no position for 9" in caplog.text and "counted again from now" in caplog.text
     assert bench.snap()["sources"]["gps"]["no_position"] == ""
 
 
-def test_receiver_command_that_hangs_is_stopped(tmp_path, caplog):
+def test_no_fix_time_either_is_no_data(tmp_path):
+    bench = retry_bench(tmp_path, "/bin/true")
+    conn = bench.gpsd.connections[-1]
+    conn.advance = False                    # gpsd repeats its last fix: nothing new from the receiver
+    bench.run(40)
+    gps = bench.snap()["sources"]["gps"]
+    assert gps["no_position"] == "no_data" and gps["health"] == "error" and "no fix data for" in gps["reason"]
+
+
+def test_retry_interval_has_a_floor(tmp_path):
+    bench = retry_bench(tmp_path, "/bin/true", gps__no_position_retry_s=0.0, gps__no_position_retry_max_s=0.0)
+    bench.gpsd.connections[-1].tpv.update(mode=1, lat=None, lon=None)
+    starts = run_watching_starts(bench, 100)
+    assert starts == [f"no position for {s} s" for s in (30, 60, 90)]
+
+
+def test_receiver_command_that_hangs_is_stopped_with_its_children(tmp_path, caplog):
     caplog.set_level("INFO")
-    bench = Bench(tmp_path, gps__receiver_fix_command="/bin/sleep 60", gps__receiver_fix_timeout_s=5.0)
+    child = tmp_path / "child.pid"
+    bench = Bench(tmp_path, gps__receiver_fix_command=f"/bin/sh -c 'sleep 60 & echo $! > {child}; wait'",
+                  gps__receiver_fix_timeout_s=5.0)
     svc = bench.service
     svc._start_fix(0.0, "test")
+    for _ in range(100):
+        if child.exists() and child.read_text().strip():
+            break
+        time.sleep(0.05)
+    pid = int(child.read_text())
     svc._reap_fix(4.0)
     assert svc._fix_proc is not None and svc._fix["running"]
-    svc._reap_fix(6.0)
-    assert svc._fix_proc is None and svc._fix["last_status"] == -9 and not svc._fix["running"]
+    svc._reap_fix(6.0)                      # stopped: never waited for here
     assert "GPS receiver check still running after 5 s: stopped" in caplog.text
+    svc._fix_proc.wait(timeout=5)
+    svc._reap_fix(6.25)
+    assert svc._fix_proc is None and svc._fix["last_status"] == -9 and not svc._fix["running"]
+    for _ in range(100):                    # the child (as ubxtool would be) is gone too
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("the command's child was left running")
+
+
+@pytest.mark.parametrize("command", ["/bin/sh -c 'unbalanced", "/nonexistent/command"])
+def test_broken_receiver_command_never_touches_the_amplifier_readings(tmp_path, caplog, command):
+    caplog.set_level("INFO")
+    bench = Bench(tmp_path, gps__receiver_fix_command=command)
+    bench.keep_streaming(60)
+    started(bench, 40)                       # the OLA start's run of the command was due at about 27 s
+    data = bench.run(10)
+    assert data["amp"]["fresh"] is True and data["sources"]["ola"]["health"] == "ok"
+    assert "GPS receiver check could not start" in caplog.text
+    assert bench.service._fix["runs"] == 1 and bench.service._fix_proc is None
+
+
+def test_failure_in_the_receiver_step_is_contained(tmp_path, monkeypatch):
+    bench = Bench(tmp_path)
+    bench.keep_streaming(60)
+    started(bench, 20)
+
+    def broken(mono):
+        raise RuntimeError("receiver bug")
+    monkeypatch.setattr(bench.service, "_step_receiver", broken)
+    data = bench.run(10)
+    assert data["amp"]["fresh"] is True and data["sources"]["ola"]["health"] == "ok"
+    assert data["sources"]["gps"]["receiver_check"]["error"] == "internal error: RuntimeError: receiver bug"
+
+
+def test_empty_receiver_command_never_runs(tmp_path):
+    bench = retry_bench(tmp_path, "/bin/true")
+    bench.service.cfg["gps"]["receiver_fix_command"] = ""
+    bench.gpsd.connections[-1].tpv.update(mode=1, lat=None, lon=None)
+    assert run_watching_starts(bench, 100) == []
 
 
 def test_no_position_defaults():

@@ -280,15 +280,28 @@ def test_check_script_rejects_unknown_options():
 
 # ---- check.py: gpsd's identification of the receiver (a pure function, taken from the source)
 
-def gps_identification(devices):
+def check_function(name):
     import ast
     with open(os.path.join(REPO, "setup", "check.py")) as f:
         tree = ast.parse(f.read())
-    wanted = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "gps_identification"]
+    wanted = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name]
     assert len(wanted) == 1
-    scope = {"PASS": "PASS", "FAIL": "FAIL", "SKIP": "SKIP"}
+    scope = {"PASS": "PASS", "FAIL": "FAIL", "SKIP": "SKIP", "INFO": "INFO"}
     exec(compile(ast.Module(body=wanted, type_ignores=[]), "check.py", "exec"), scope)
-    return scope["gps_identification"](devices)
+    return scope[name]
+
+
+def gps_identification(devices):
+    return check_function("gps_identification")(devices)
+
+
+def test_check_fails_fix_times_without_a_position_message():
+    finding = check_function("gps_fix_finding")
+    assert finding({"time": "2026-11-19T19:00:00.000Z", "mode": 0})[0] == "FAIL"
+    assert finding({"time": "2026-11-19T19:00:00.000Z"})[0] == "FAIL"
+    assert finding({"time": "2026-11-19T19:00:00.000Z", "mode": 1})[0] == "INFO"     # NAV-PVT without a fix
+    assert finding({"mode": 3, "time": "x"}) == ("INFO", "3D fix")
+    assert finding({})[0] == "INFO"                                                   # nothing from gpsd yet
 
 
 def test_check_fails_a_receiver_that_gpsd_has_not_identified():
@@ -298,6 +311,7 @@ def test_check_fails_a_receiver_that_gpsd_has_not_identified():
     assert gps_identification([dict(device, subtype="SW EXT CORE 1.00", subtype1="PROTVER=27.50,MOD=ZED-F9P")]) == (
         "PASS", "PROTVER=27.50,MOD=ZED-F9P")
     assert gps_identification([dict(device, subtype="SW EXT CORE 1.00")]) == ("PASS", "SW EXT CORE 1.00")
+    assert gps_identification([dict(device, subtype="Unknown")])[0] == "FAIL"     # gpsd's placeholder
     assert gps_identification([]) == ("SKIP", "gpsd has no receiver")             # cannot tell
     assert gps_identification(None)[0] == "SKIP"
 

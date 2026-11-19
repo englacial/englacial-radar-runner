@@ -433,11 +433,11 @@ step_gpsd() {
             # Its clients (the telemetry service, chrony) reconnect by themselves.
             run systemctl restart gpsd.service ;;
     esac
-    # Once per boot: check the receiver's UART1 NMEA setting and correct it (setup/gps_receiver.py).
+    # After every start of gpsd: the receiver check and its corrections (setup/gps_receiver.py).
     put_file "$REPO/systemd/radar-gps-receiver.service" /etc/systemd/system/radar-gps-receiver.service 0644
     [ "$CHANGED" -eq 0 ] || RELOAD_NEEDED=1
     if [ "$(systemctl is-enabled radar-gps-receiver.service 2>/dev/null || true)" = enabled ]; then
-        ok "radar-gps-receiver.service is enabled (runs once per boot, after gpsd)"
+        ok "radar-gps-receiver.service is enabled (runs after every start of gpsd)"
     else
         reload_systemd
         run systemctl enable radar-gps-receiver.service

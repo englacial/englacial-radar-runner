@@ -21,11 +21,14 @@ receiver's side of it.
 
 `no_position_s` says for how long gpsd has had a receiver without a new 2D or
 3D fix. On 2026-11-19, after a power cut, gpsd delivered fix times with mode 0
-for 77 minutes: it had not identified the receiver (empty `subtype` in its
-DEVICES report) and so had not switched on the position messages. While there
-is no position, or the last report did not show an identified receiver,
-`?DEVICES;` is asked every DEVICES_EVERY_S, and `identified` gives
-the answer. Both questions only read gpsd's state.
+for 77 minutes while the receiver had a fix: it had not identified the receiver
+(empty `subtype` in its DEVICES report), and the receiver sent it no position
+message (setup/gps_receiver.py has what gpsd does and what is inferred). gpsd
+clears the fix at every cycle, so mode 0 with fix times means no position
+message arrives, and mode 1 a position message without a fix. While there is no
+position, or the last report did not show an identified receiver, `?DEVICES;`
+is asked every DEVICES_EVERY_S, and `identified` gives the answer. Both
+questions only read gpsd's state.
 """
 import json
 import logging
@@ -126,7 +129,8 @@ class Gps:
         None if it has reported none or not been asked."""
         if not self.devices:
             return None
-        return all(d.get("subtype") or d.get("subtype1") for d in self.devices)
+        # `subtype` comes from the version reply; "Unknown" is gpsd's placeholder for older receivers.
+        return all(d.get("subtype1") or d.get("subtype") not in (None, "", "Unknown") for d in self.devices)
 
     def _devices(self, reply):
         devices = reply.get("devices")

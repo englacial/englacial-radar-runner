@@ -226,22 +226,33 @@ below that contradicts it):
   does not restart gpsd. The telemetry service runs the same command about 15 s after every
   OLA start (`telemetry.gps.receiver_fix_command`; "" switches that off).
 - Added the same evening: at the first boot after a power cut of several minutes gpsd delivered
-  no position for 77 minutes (TPV mode 0, chrony's GPS source never reached) while the receiver
-  had a 3D fix. gpsd had not identified the receiver (empty `subtype` in `?DEVICES;`) and had
-  not switched on its position messages; `ubxtool -P 27.50 -p MON-VER` by hand made gpsd
-  identify and configure it at once. Inferred from this one occurrence, not proven: gpsd's
-  version request at its start went unanswered and gpsd does not ask again.
-  `setup/gps_receiver.py --apply` now asks for the version itself when gpsd has not identified
-  the receiver, waits up to 20 s for the identification and 10 s for gpsd's configuration, and
-  only then checks the UART1 setting (gpsd's configuration is what sets it back to 1). Exit
-  status 2 means still not identified; `radar-gps-receiver.service` (`Restart=on-failure`) then
-  runs it again about once a minute (20 s restart delay, 20 s wait, the run). The telemetry
-  service reports a receiver without a position (`sources.gps.no_position`,
-  `radar_runner/telemetry/README.md`) and runs the command again at 2, 6, 14 and 30 minutes
+  no position for 77 minutes (TPV mode 0 with fix times, chrony's GPS source never reached)
+  while the receiver had a 3D fix. gpsd had not identified the receiver (empty `subtype` in
+  `?DEVICES;`), and the receiver sent gpsd only NAV-TIMEGPS and NAV-DOP. `ubxtool -P 27.50 -p
+  MON-VER` by hand made gpsd identify the receiver and switch the position messages on at once.
+  What gpsd 3.25 does (from its source, `driver_ubx.c`): at its start it sends MON-VER and an
+  unacknowledged burst of configuration that switches all position messages on while it does not
+  know the protocol version. The first NAV-PVT it reads makes it assume version 14, and it then
+  switches NAV-PVT, POSECEF, VELECEF, SAT, SIG and EOE off, leaving exactly NAV-DOP and
+  NAV-TIMEGPS; only a MON-VER reply (or a NAV-SAT, NAV-SIG or NAV-EOE) moves it on, and it never
+  asks for the version again. The same burst addresses UART1 (gpsd treats a device path without
+  "/ttyACM" as UART1) with NMEA on, which is why `CFG-UART1OUTPROT-NMEA` is 1 after every start
+  of gpsd. Inferred, not proven: the MON-VER reply was lost or came after the first NAV-PVT,
+  or part of the burst was lost. If the second burst (after the reply) loses the NAV-PVT enable,
+  gpsd is identified but still has no position, and another MON-VER does not help.
+  `setup/gps_receiver.py --apply` therefore: asks for the version when gpsd has not identified
+  the receiver (waits up to 20 s, then 3 s for the receiver to take gpsd's configuration);
+  switches `CFG-MSGOUT-UBX_NAV_PVT_USB` on in RAM (only RAM) if it is 0 (on a gpsd that has
+  never read a NAV-PVT this can take two runs: gpsd turns it off once); and then checks the UART1
+  setting. With `--ram` a read that gets no answer is followed by the write anyway. Exit status
+  2 means still not identified; `radar-gps-receiver.service` (`Restart=on-failure`) then runs it
+  again about once a minute (20 s restart delay, 20 s wait, the run). The telemetry service
+  reports a receiver without a position and why (`sources.gps.no_position`,
+  `radar_runner/telemetry/README.md`), and runs the command again at 2, 6, 14 and 30 minutes
   without a position, then every 30 minutes. `setup/check.py` fails when gpsd has a receiver
-  that it has not identified. **To do on the bench:** a cold boot
-  after several minutes without power, to see whether gpsd identifies the receiver by itself
-  and, if not, that the service's run recovers it.
+  that it has not identified, or a fix time with mode 0. **To do on the bench:** a cold boot
+  after several minutes without power, to see whether gpsd ends up in this state by itself and,
+  if so, that the service's run recovers it.
 
 - **What:** a drop-in for `gpsd.service` that replaces its command line with
   `gpsd -n /dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver-if00`
@@ -288,6 +299,24 @@ after an OLA reset (ZED-F9P, HPG 1.51, protocol 27.50):
 | `CFG-I2COUTPROT-NMEA` | 0 | 0 | 0 | 1 |
 | `CFG-MSGOUT-UBX_NAV_PVT_USB`, `..._NAV_SAT_USB`, `..._NAV_SIG_USB` and five more that gpsd switches on | 1 | 1 | 1 | 0 |
 | `CFG-MSGOUT-UBX_MON_SPAN_USB`, `..._MON_RF_USB` (from the `gps_jam` logger) | 10 | 10 | 10 | 0 |
+
+The message settings change. Read again on 2026-11-19 after the 77-minute outage (above):
+
+| Key | RAM | BBR | Flash | When |
+|---|---|---|---|---|
+| `CFG-MSGOUT-UBX_NAV_PVT_USB` | 1 | 0 | 0 | after the recovery at about 20:09, before the OLA start at 20:12 |
+| `CFG-MSGOUT-UBX_NAV_DOP_USB` | 1 | 1 | 1 | the same |
+| `CFG-MSGOUT-UBX_NAV_TIMEGPS_USB` | 1 | 1 | not read | the same |
+| `CFG-USBOUTPROT-NMEA`, `CFG-USBOUTPROT-UBX` | 1 | 1 | 1 | the same |
+| `CFG-MSGOUT-UBX_NAV_PVT_USB`, `..._NAV_DOP_USB`, `..._NAV_TIMEGPS_USB`, `..._NAV_SAT_USB`, `..._NAV_EOE_USB` | 1 | 1 | 1 | 20:55, after the OLA start at 20:12 |
+
+So at about 20:09 NAV-PVT was off in battery-backed memory and flash while NAV-DOP and
+NAV-TIMEGPS were on in both. If that was also so at the power-up (not measured), the receiver
+started with exactly the two messages seen during the outage. By 20:55 NAV-PVT was 1 in all
+three layers, which fits the OLA saving the receiver's configuration at its start (below). The
+first table (earlier the same day) had NAV-PVT at 1 in all layers: what is in battery-backed
+memory and flash is not stable, so `setup/gps_receiver.py` sets NAV-PVT in RAM rather than
+relying on it.
 
 - The setting that prevents the transmit-buffer overflow (`CFG-UART1OUTPROT-NMEA`
   = 0) **is in the receiver's flash and battery-backed memory already**, and it
