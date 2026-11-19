@@ -36,8 +36,8 @@ TimeoutStopSec=10
 # is left to finish (at most 30 s): killing that tool while it initialises the
 # SDR would leave the amplifier enabled.
 KillMode=process
-# It must keep running when the Pi is busy or short of memory. It uses about
-# half a percent of one core, so the higher priority costs the radar nothing.
+# It must keep running when the Pi is busy or short of memory. It uses well
+# under one percent of one core, so the higher priority costs the radar nothing.
 # No real-time class: at two short rounds a second it does not need one, and
 # a real-time process that went wrong could hold a core.
 Nice=-5
