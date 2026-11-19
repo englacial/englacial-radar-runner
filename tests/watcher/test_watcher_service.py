@@ -329,6 +329,17 @@ def test_a_tool_that_ends_with_no_valid_result_counts_as_assume_enabled(rig):
     assert (last["code"], last["name"]) == (3, "ASSUME_ENABLED") and "ended with status 1, which is no result" in last["text"]
 
 
+def test_the_tool_runs_even_if_its_output_file_cannot_be_made(rig):
+    r = rig()
+    r.watcher.tool_output_file = str(r.tmp / "no-such-directory" / "tool.out")
+    r.run(3.0)
+    r.amp["current_a"] = ENABLED_A
+    r.run(9.0)
+    assert len(r.tool.calls) == 1 and r.status().data["ok"] is True
+    last = r.status().data["reset_tool"]["last"]
+    assert (last["code"], last["text"]) == (0, "no output")
+
+
 def test_a_tool_that_cannot_be_started_is_reported_as_failed_and_the_state_becomes_stuck(rig):
     r = rig(command="/nonexistent/amp_safe")
     r.run(3.0)
@@ -468,6 +479,7 @@ def test_a_stopped_watcher_leaves_a_not_ok_status_and_does_not_kill_a_running_to
     assert d["ok"] is False and d["reason"] == "the safety watcher is not running" and d["running"] is False
     assert proc.poll() is None                      # left to finish: a kill would leave the amplifier enabled
     assert gone(proc) == 0 and r.tool.succeeded
+    assert "amp_safe: OK" in (r.tmp / "run" / "watcher-reset-tool.out").read_text()    # its output had somewhere to go
     assert [e["event"] for e in r.events][-2:] == ["reset_tool_left", "stop"]
 
 

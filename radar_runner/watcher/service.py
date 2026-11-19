@@ -198,6 +198,7 @@ class Watcher(Service):
         self.override_file = os.path.join(paths["state_dir"], self.cfg["override_file"])
         self.state_file = os.path.join(paths["state_dir"], self.cfg["reset"]["state_file"])
         self.events_file = os.path.join(paths["state_dir"], self.cfg["events_file"])
+        self.tool_output_file = os.path.join(paths["run_dir"], "watcher-reset-tool.out")
         self.radar = radar if radar is not None else RadarProcesses(self.cfg["radar_exe"])
         self.events = events
         self.logic = None
@@ -295,14 +296,22 @@ class Watcher(Service):
     def _start_tool(self, now):
         r = self.cfg["reset"]
         argv = [r["command"], "--timeout", f"{r['timeout_s']:g}", "--state-file", self.state_file]
+        # Its one line of output goes to a file, not a pipe: a pipe would break under the tool if the
+        # watcher ended first. If the file cannot be made the tool runs all the same.
+        try:
+            out = open(self.tool_output_file, "wb")
+        except OSError:
+            out = subprocess.DEVNULL
         try:
             # In a session of its own: a Ctrl-C meant for a watcher run by hand must not reach the tool.
-            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, start_new_session=True)
-            os.set_blocking(proc.stdout.fileno(), False)
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
         except OSError as e:
             self._tool_done(now, L.TOOL_FAILED, f"cannot start {argv[0]}: {e.strerror or e}; nothing was changed", 0.0)
             return
+        finally:
+            if out is not subprocess.DEVNULL:
+                out.close()
         self._tool = {"proc": proc, "started": now, "deadline": now + r["timeout_s"] + r["kill_margin_s"]}
 
     def _poll_tool(self, now):
@@ -314,7 +323,9 @@ class Watcher(Service):
         if code is None and now < tool["deadline"]:
             return
         try:
-            text = os.read(proc.stdout.fileno(), 65536).decode("utf-8", "replace").strip()
+            with open(self.tool_output_file, "rb") as f:
+                text = f.read(65536).decode("utf-8", "replace").strip()
+            os.unlink(self.tool_output_file)
         except OSError:
             text = ""
         if code is None:
@@ -328,8 +339,6 @@ class Watcher(Service):
             # Killed by a signal or failed in a way it never should: the tool may have started.
             text = f"amp_safe ended with status {code}, which is no result; assume enabled. {text}"
             code = L.TOOL_ASSUME_ENABLED
-        if proc.poll() is not None:
-            proc.stdout.close()
         self._tool = None
         self._tool_done(now, code, text or "no output", now - tool["started"])
 

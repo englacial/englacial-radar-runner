@@ -22,6 +22,20 @@ file, one flag file and `/proc`.
 | `logic.py` | Every decision, as a state machine without I/O or clock |
 | `service.py` | Reads the inputs, sends signals, runs the reset tool, writes the status file and the event log |
 
+| Reads | |
+|---|---|
+| `/run/radar-runner/user/telemetry.json` | amplifier readings, Pi readings (telemetry service) |
+| `/run/radar-runner/power.json` | is main power lost (power service) |
+| `/var/lib/radar-runner/user/override-no-amp-telemetry` | the user's override (set through the manager) |
+| `/proc/<pid>/exe` | which processes are radar processes |
+
+| Writes | |
+|---|---|
+| `/run/radar-runner/user/watcher.json` | status, twice a second |
+| `/var/lib/radar-runner/user/watcher-events.jsonl` (and `.1`) | event log |
+| `/run/radar-runner/user/watcher-reset-tool.out` | output of a reset tool run, while it runs |
+| `/var/lib/radar-runner/user/sdr-state` | written by `amp_safe`, not by the watcher: is the amplifier pin known to be safe |
+
 ## What counts as a usable reading
 
 A reading is the `amp` block of `/run/radar-runner/user/telemetry.json`. It is
