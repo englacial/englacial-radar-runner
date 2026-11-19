@@ -27,6 +27,8 @@ log = logging.getLogger("manager.control")
 
 SOCKET_NAME = "manager.sock"
 MAX_REQUEST = 1 << 16
+MAX_CLIENTS = 8             # served at the same time
+CLIENT_TIMEOUT_S = 2.0      # a client has this long to send its request
 
 
 class ControlServer(threading.Thread):
@@ -38,6 +40,7 @@ class ControlServer(threading.Thread):
         self.handler = handler
         self._closing = threading.Event()
         self._sock = None
+        self._slots = threading.BoundedSemaphore(MAX_CLIENTS)
 
     def open(self):
         """Bind the socket. Raises OSError, also if another manager already answers on it."""
@@ -77,18 +80,30 @@ class ControlServer(threading.Thread):
                     return
                 time.sleep(0.2)
                 continue
-            try:
-                self._serve(conn)
-            except Exception:
-                log.exception("error while serving a command")
-            finally:
-                conn.close()
+            # One short-lived thread per client: a client that is slow or sends nothing
+            # holds up nobody else (the power service's stop hook is a client).
+            if not self._slots.acquire(blocking=False):
+                conn.close()                    # too many at once: the client sees "no answer"
+                continue
+            threading.Thread(target=self._client, args=(conn,), daemon=True, name="manager-client").start()
+
+    def _client(self, conn):
+        try:
+            self._serve(conn)
+        except Exception:
+            log.exception("error while serving a command")
+        finally:
+            conn.close()
+            self._slots.release()
 
     def _serve(self, conn):
-        conn.settimeout(2.0)
+        conn.settimeout(CLIENT_TIMEOUT_S)
+        deadline = time.monotonic() + CLIENT_TIMEOUT_S     # for the whole request, not per byte
         data = b""
         try:
             while b"\n" not in data and len(data) < MAX_REQUEST:
+                if time.monotonic() >= deadline:
+                    raise ValueError("request not complete in time")
                 part = conn.recv(4096)
                 if not part:
                     break

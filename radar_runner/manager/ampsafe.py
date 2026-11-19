@@ -1,46 +1,54 @@
 """Making the amplifier safe: when the reset tool runs, and the record of the SDR's state.
 
-The tool (stage 3) is `tools/sdr_gpio_safe/amp_safe --timeout N`. It drives the
-SDR's amplifier-enable pin to the shutdown level and verifies it. It must never
-be called while a radar process is alive, and it serialises concurrent callers.
-Every run of it initialises UHD, which itself enables the amplifier for about
-0.3-0.5 s, so it is not run when it is not needed.
+The tool (stage 3) is `tools/sdr_gpio_safe/amp_safe --timeout N --state-file PATH`.
+It drives the SDR's amplifier-enable pin to the shutdown level and verifies it.
+It must never be called while a radar process is alive, and it serialises
+concurrent callers. Every run of it initialises UHD, which itself enables the
+amplifier for about 0.3-0.5 s, so **it runs only when the pin is not known to
+be safe** (decided by the user, 2026-11-19).
 
 Exit status of the tool
     0   OK: the only safe result
     3   ASSUME_ENABLED: this run initialised the SDR and did not verify the pin.
-        Urgent: retried at once, then a fault
-    2 NOT_FOUND, 6 BUSY (SDR in use, e.g. by a radar), 7 AMBIGUOUS, 4 TIMEOUT,
-    5 FAILED, 64 USAGE: the state is unknown and was not changed by the call
+        Urgent: run again at once, then a fault
+    2 NOT_FOUND, 6 BUSY (SDR in use), 4 TIMEOUT (e.g. another caller holds its
+        lock): the SDR may be coming back after a kill: tried again a few
+        times with a delay before it counts as a failure
+    7 AMBIGUOUS, 5 FAILED, 8 STATE_FILE (the record could not be written; the
+        tool was not started), 64 USAGE: a failure
+    After every result but 0 the record says `unknown`, also if it said `safe`
+    before the call: the wrapper writes `unknown` before it starts the tool.
 
-Policy (decided by the user, 2026-11-19): **the tool runs only when the pin is
-not known to be safe.** Setting `manager.amp_safe.policy`:
-
-    when_needed   (default) as above
-    always        run the tool after every radar exit as well
-
-Known safe means one of:
-  * the last thing that initialised the SDR was the radar (with the amplifier
-    pin configured: the config limits enforce that) and it exited cleanly;
-  * the tool ran successfully since;
-  * nothing has initialised the SDR since it was powered (it is still in its
-    boot loader).
-Where a fresh amplifier reading with the 28 V rail present is available, taken
-with no radar process, the current decides instead: shutdown current is safe,
-enabled current is not, whatever the history says.
-Everything else is "unknown" and the tool runs: a radar that was killed,
-crashed, exited non-zero or never reached its running state; a tool run that
-did not succeed; no record at all (first start, or the record was lost).
-
-The record is the file <state_dir>/sdr-state. Its first line is the word
-`safe` or `unknown`; the rest is free text for people. A missing or unreadable
-file means unknown. It is set to `unknown` before every radar launch. Other
-programs (the manager unit's stop hook, a power-loss hook) can read it:
+The record: <state_dir>/sdr-state. Its first line is the word `safe` or
+`unknown`; the rest is free text for people. A missing or unreadable file means
+unknown. Who writes it:
+  * the tool's wrapper (--state-file): `unknown` before it starts the tool,
+    `safe` after an OK. The manager does not write around a tool run;
+  * the manager: `unknown` before the turn-on-check hook and before every
+    radar launch; `safe` when it finds the pin safe without the tool (below).
+Other programs can read it:
 
     [ "$(head -n1 /var/lib/radar-runner/user/sdr-state 2>/dev/null)" = safe ]
 
-The decisions are the three pure functions `known_safe_after_exit`, `decide`
-and `idle_need`; runner.py and service.py only carry them out.
+Known safe without the tool means one of:
+  * the last thing that initialised the SDR was the radar (with the amplifier
+    pin configured: the config limits enforce that), it reached its running
+    state and exited cleanly;
+  * nothing has initialised the SDR since it was powered (boot loader);
+  * a fresh amplifier reading with the 28 V rail present, taken with no radar
+    process and at least `confirm_settle_s` after the last radar or tool run
+    ended, shows shutdown current. Where there is such a reading it decides,
+    in both directions, whatever the history says: with one exception, a
+    radar that was signalled before its start line (it has no SIGINT handler
+    until then, so it died in the middle of the SDR set-up) is never trusted.
+Enabled current always wins: also over the boot-loader rule.
+
+On a power loss (the stop came from the power service, or the 28 V rail reads
+absent) nothing is checked and nothing is written after the radar exit: the
+current says nothing without the rail, and the time belongs to the shutdown.
+
+The decisions are the pure functions `known_safe_after_exit`, `after_exit` and
+`idle_need`; runner.py and service.py only carry them out.
 """
 import os
 import time
@@ -49,18 +57,23 @@ from radar_runner.common.status import boottime_s, read_status, status_path
 
 from .gates import StatusFileGate, _lookup
 
-ALWAYS, WHEN_NEEDED = "always", "when_needed"
 SAFE, UNKNOWN = "safe", "unknown"
 STATE_FILE = "sdr-state"
 OK, ASSUME_ENABLED = 0, 3
 KILLED_BY_CALLER = -1       # not a status of the tool: the caller killed it (its own, longer limit passed)
 EXIT_MEANING = {0: "OK", 2: "NOT_FOUND", 3: "ASSUME_ENABLED", 4: "TIMEOUT", 5: "FAILED", 6: "BUSY",
-                7: "AMBIGUOUS", 64: "USAGE"}
+                7: "AMBIGUOUS", 8: "STATE_FILE", 64: "USAGE"}
+RETRY_LATER = (2, 6, 4)     # NOT_FOUND, BUSY, TIMEOUT: worth another try after a delay
 ABSENT, BOOTLOADER, LOADED = "absent", "bootloader", "loaded"       # the SDR, as sysfs shows it
 
 
 def unclean(facts):
-    """Why this radar exit was not clean, or "". facts: reached_running, killed, exit_status, failure."""
+    """Why this radar exit was not clean, or "".
+
+    facts: reached_running, killed, exit_status, failure, signalled_before_start.
+    """
+    if facts.get("signalled_before_start"):
+        return "the radar was signalled before its start line, in the middle of the SDR set-up"
     if facts.get("killed"):
         return "the radar was killed"
     if not facts.get("reached_running"):
@@ -72,14 +85,16 @@ def unclean(facts):
     return ""
 
 
-def known_safe_after_exit(facts, reading):
+def known_safe_after_exit(facts, read):
     """Is the pin known to be safe after this radar exit? Returns (known_safe, why).
 
-    `reading` is (state, text) from the amplifier telemetry sampled after the
-    exit: state True = shutdown current, False = enabled current, None = no
-    usable reading (not fresh, or the 28 V rail is off).
+    `read()` gives (state, text) from the amplifier telemetry sampled after
+    the exit: True = shutdown current, False = enabled current, None = no
+    usable reading. It is not called when the answer does not depend on it.
     """
-    state, text = reading
+    if facts.get("signalled_before_start"):
+        return False, unclean(facts)
+    state, text = read()
     if state is True:
         return True, f"telemetry: {text}"
     if state is False:
@@ -90,20 +105,17 @@ def known_safe_after_exit(facts, reading):
     return True, f"clean radar exit; no telemetry to check ({text})"
 
 
-def decide(policy, facts, read):
-    """After a radar exit: should the tool run? Returns (run, known_safe, why).
+def after_exit(facts, read, power_lost):
+    """What to do after a radar exit. Returns (action, why).
 
-    `read()` returns the reading for `known_safe_after_exit`. Under `always`
-    it is not asked: the tool runs anyway, and the history alone says whether
-    the pin was known safe before (which matters if the tool then fails
-    without changing anything).
+    "leave"  power loss: check nothing, write nothing
+    "safe"   the pin is known to be safe: record it
+    "run"    run the tool
     """
-    if policy != WHEN_NEEDED:
-        known, why = known_safe_after_exit(facts, (None, "not asked"))
-        label = "policy always" if policy == ALWAYS else f"unknown policy {policy!r}, treated as always"
-        return True, known, f"{label}; {why}"
-    known, why = known_safe_after_exit(facts, read())
-    return (not known), known, why
+    if power_lost:
+        return "leave", f"power loss ({power_lost}): nothing checked, the record is left as it is"
+    known, why = known_safe_after_exit(facts, read)
+    return ("safe" if known else "run"), why
 
 
 def idle_need(state, sdr, reading, enabled_for_s, enabled_limit_s):
@@ -112,46 +124,47 @@ def idle_need(state, sdr, reading, enabled_for_s, enabled_limit_s):
     action: "none", "mark_safe" or "run" (the tool).
     state            SAFE or UNKNOWN: the record
     sdr              ABSENT, BOOTLOADER or LOADED
-    reading          True shutdown current / False enabled current / None no usable reading
+    reading          True = shutdown current in a reading new enough to count,
+                     False = enabled current, None = no usable reading
     enabled_for_s    for how long the reading has said "enabled" without a break
     """
+    if sdr == ABSENT:
+        return "none", "the SDR is not on USB: nothing can be done or checked"
+    if reading is False:
+        # Enabled current wins over everything else, but not on one sample:
+        # every start of the tool and of the radar enables the amplifier briefly.
+        if enabled_for_s >= enabled_limit_s:
+            return "run", f"telemetry shows the amplifier enabled for {enabled_for_s:.0f} s with no radar process"
+        return "none", ""
     if sdr == BOOTLOADER:
         if state != SAFE:
             return "mark_safe", "nothing has initialised the SDR since it was powered"
         return "none", ""
-    if sdr == ABSENT:
-        return "none", "the SDR is not on USB: nothing can be done or checked"
     if reading is True:
         if state != SAFE:
             return "mark_safe", "telemetry shows shutdown current with no radar process"
-        return "none", ""
-    if reading is False:
-        # Not on one sample: every start of the tool and of the radar enables the amplifier briefly.
-        if enabled_for_s >= enabled_limit_s:
-            return "run", f"telemetry shows the amplifier enabled for {enabled_for_s:.0f} s with no radar process"
         return "none", ""
     if state != SAFE:
         return "run", "the state of the SDR is not known and there is no telemetry to decide"
     return "none", ""
 
 
-def after_tool(status, known_before):
-    """The record after a run of the tool. Returns (state, ok): ok = confirmed or still known safe."""
-    if status == OK:
-        return SAFE, True
-    if status in (ASSUME_ENABLED, KILLED_BY_CALLER):
-        return UNKNOWN, False       # the SDR may have been initialised and left unverified
-    # Nothing was changed by the call (also: it could not be started): what was known before still holds.
-    return (SAFE, True) if known_before else (UNKNOWN, False)
-
-
 def describe(status):
-    """Text for an exit status of the tool (None = it did not finish or could not be started)."""
+    """Text for an exit status of the tool (None = it could not be started)."""
     if status is None:
         return "not started"
     if status == KILLED_BY_CALLER:
         return "no result within the caller's limit, killed"
     return f"status {status} ({EXIT_MEANING.get(status, 'not a status of the tool')})"
+
+
+def tool_timeout(command):
+    """The value after --timeout in the tool's command line, or None."""
+    args = [str(a) for a in command]
+    try:
+        return float(args[args.index("--timeout") + 1])
+    except (ValueError, IndexError):
+        return None
 
 
 class AmpTelemetry:
@@ -183,18 +196,31 @@ class AmpTelemetry:
             return None
         return values
 
-    def _judge(self, sample):
-        _, current, voltage = sample
-        if voltage < self.cfg["min_voltage_v"]:
-            return None, f"28 V rail reads {voltage:.1f} V: the current says nothing"
-        return current < self.cfg["enabled_current_a"], f"amplifier current {current:.2f} A at {voltage:.1f} V"
+    def rail_absent(self):
+        """True if the latest fresh reading shows the 28 V rail off (a power loss)."""
+        sample = self._sample()
+        return sample is not None and sample[2] < self.cfg["min_voltage_v"]
 
-    def now(self):
-        """The latest reading: (True shutdown / False enabled / None unusable, text). Does not wait."""
+    def now(self, after_uptime):
+        """The latest reading, without waiting: (True shutdown / False enabled / None unusable, text).
+
+        Shutdown current counts only in a sample read at least `confirm_settle_s`
+        after `after_uptime` (the end of the last radar or tool run): the
+        sample's time is when the Pi read the row, which is later than when
+        the ADC measured it, and an older row may show the state before.
+        """
         sample = self._sample()
         if sample is None:
             return None, "no fresh amplifier reading"
-        return self._judge(sample)
+        uptime, current, voltage = sample
+        if voltage < self.cfg["min_voltage_v"]:
+            return None, f"28 V rail reads {voltage:.1f} V: the current says nothing"
+        text = f"amplifier current {current:.2f} A at {voltage:.1f} V"
+        if current >= self.cfg["enabled_current_a"]:
+            return False, text
+        if uptime < after_uptime + self.cfg["confirm_settle_s"]:
+            return None, f"{text}, but not read {self.cfg['confirm_settle_s']:g} s after the last run ended"
+        return True, text
 
     def confirm_shutdown(self, exit_uptime):
         """Wait for a reading taken after a radar exit. Returns (True/False/None, text)."""
@@ -203,7 +229,10 @@ class AmpTelemetry:
         while True:
             sample = self._sample()
             if sample is not None and sample[0] >= exit_uptime + cfg["confirm_settle_s"]:
-                return self._judge(sample)
+                _, current, voltage = sample
+                if voltage < cfg["min_voltage_v"]:
+                    return None, f"28 V rail reads {voltage:.1f} V: the current says nothing"
+                return current < cfg["enabled_current_a"], f"amplifier current {current:.2f} A at {voltage:.1f} V"
             if self._monotonic() >= deadline:
                 return None, "no fresh amplifier reading after the exit"
             self._sleep(0.2)

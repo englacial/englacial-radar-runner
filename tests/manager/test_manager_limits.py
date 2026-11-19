@@ -174,12 +174,12 @@ def test_enable_duty_cap(tx, pri, ok):
     found = problems(change)
     assert (found == []) is ok
     if not ok:
-        assert "duty" in found[0] or "positive" in found[0]
+        assert any("duty" in f or "positive" in f for f in found)
 
 
 def test_receive_window_must_cover_the_transmit_pulse():
     found = problems(setter("CHIRP", "rx_duration", 12e-6))
-    assert len(found) == 1 and "rx_duration 12 us is shorter than CHIRP.tx_duration 13 us" in found[0]
+    assert len(found) == 1 and "the receive window (12 us) is shorter than the transmit burst (13 us)" in found[0]
     assert problems(setter("CHIRP", "rx_duration", 13e-6)) == []
     assert "tx_lead" in problems(setter("CHIRP", "tx_lead", 13e-6))[0]
     assert "tx_lead" in problems(setter("CHIRP", "tx_lead", -1e-6))[0]
@@ -346,3 +346,99 @@ def test_default_chunk_is_a_few_hundred_megabytes_at_most():
         size = n / presums * L.record_bytes(config)
         seconds = n * 200e-6
         assert size <= 128e6 and seconds <= 300.0
+
+
+# ------------------------------------------- the fields ORCA really computes with
+
+def test_orca_sizes_bursts_from_rf1_so_rf1_rates_must_equal_rf0():
+    # sdr.cpp reads its rates from RF1 and main.cpp sizes the bursts from them, while the
+    # hardware is clocked at RF0's rates: RF1.tx_rate = 4 x RF0.tx_rate makes every burst
+    # four times as long on the air, which a check of tx_duration alone does not see.
+    found = problems(setter("RF1", "tx_rate", 4 * 56e6))
+    assert any("RF1.tx_rate (2.24e+08) differs from RF0's (5.6e+07)" in f for f in found)
+    assert any("enable duty 0.260" in f for f in found)             # 52 us every 200 us, against the cap of 0.15
+    found = problems(setter("RF1", "rx_rate", 28e6))
+    assert any("RF1.rx_rate (2.8e+07) differs from RF0's" in f for f in found)
+    assert problems(lambda c: c.pop("RF1")) != []                   # ORCA cannot run without the section either
+
+
+def test_burst_lengths_follow_orca_arithmetic():
+    config = good()
+    assert L.burst(config) == {"tx_samples": 728, "rx_samples": 2352,      # as the radar's own log says
+                               "tx_s": 728 / 56e6, "rx_s": 2352 / 56e6}
+    config["RF1"]["tx_rate"] = 4 * 56e6
+    config["RF1"]["rx_rate"] = 28e6
+    on_air = L.burst(config)
+    assert on_air["tx_samples"] == 2912 and on_air["tx_s"] == pytest.approx(52e-6)
+    assert on_air["rx_samples"] == 1176 and on_air["rx_s"] == pytest.approx(21e-6)
+    assert L.record_bytes(config) == 1176 * 8                       # the record follows RF1.rx_rate, as in ORCA
+
+
+def test_duty_is_computed_from_the_real_burst_even_when_only_the_duty_rule_is_looked_at():
+    def change(config):
+        config["RF1"]["tx_rate"] = 4 * 56e6
+        config["CHIRP"]["rx_duration"] = 60e-6
+    assert any("duty" in f and "52 us every 200 us" in f for f in problems(change))
+
+
+def test_chirp_generated_at_another_rate_than_it_is_played_is_refused():
+    # 14 MS/s chirp played at 56 MS/s: four times the bandwidth and the offset on the air.
+    found = problems(setter("GENERATE", "sample_rate", 14e6))
+    assert any("GENERATE.sample_rate (1.4e+07) differs from RF0.tx_rate (5.6e+07)" in f for f in found)
+
+    def narrow(config):
+        config["GENERATE"].update(sample_rate=14e6, chirp_bandwidth=10e6, lo_offset_sw=0.0)
+        config["RF0"]["freq"] = 380e6
+    found = problems(narrow)                                        # 375-385 MHz as written, 360-400 as played
+    assert len(found) == 1 and "differs from RF0.tx_rate" in found[0]
+
+    def out_of_band(config):
+        config["GENERATE"].update(sample_rate=14e6, chirp_bandwidth=12e6, lo_offset_sw=0.0)
+        config["RF0"]["freq"] = 380e6
+    assert any("chirp band 356-404 MHz is outside" in f for f in problems(out_of_band))
+
+
+def test_chirp_that_does_not_fit_in_the_sample_rate_is_refused():
+    def change(config):
+        config["GENERATE"].update(chirp_bandwidth=30e6, lo_offset_sw=20e6)     # reaches 35 MHz; Nyquist is 28
+    assert any("does not fit in the sample rate of 56 MHz: it would alias" in f for f in problems(change))
+
+
+@pytest.mark.parametrize("chirp, pulse, tx, ok", [
+    (10e-6, 13e-6, 13e-6, True),        # the bench config
+    (10e-6, 13e-6, 20e-6, True),        # shorter than the burst: the rest is zeros
+    (10e-6, 13.1e-6, 13e-6, False),     # the radar would cut the pulse off
+    (14e-6, 13e-6, 13e-6, False),       # the chirp is longer than its pulse
+    (20e-6, None, 13e-6, False),        # no pulse_length: it defaults to chirp_length
+    (10e-6, None, 13e-6, True),
+])
+def test_chirp_and_pulse_must_fit_in_the_transmit_burst(chirp, pulse, tx, ok):
+    def change(config):
+        config["GENERATE"]["chirp_length"] = chirp
+        if pulse is None:
+            config["GENERATE"].pop("pulse_length")
+        else:
+            config["GENERATE"]["pulse_length"] = pulse
+        config["CHIRP"]["tx_duration"] = tx
+    assert (problems(change) == []) is ok
+
+
+def test_real_configs_have_equal_rates():
+    for name in ("orca_default", "run300_d05_soak", "pa_soak", "pa_1w"):
+        found = L.check(L.load(fixture(name)), LIMITS)
+        assert not any("differs from" in f or "cut the chirp" in f for f in found), (name, found)
+
+
+def test_derived_config_writes_the_rates_in_canonical_form():
+    config = good()
+    config["RF1"]["tx_rate"] = "56e6"
+    derived = L.derive(config, "x", 1000)
+    assert derived["RF1"]["tx_rate"] == 56e6 and type(derived["RF1"]["tx_rate"]) is float
+    assert L.check(L.load(L.dump(derived)), LIMITS) == []
+
+
+def test_continuous_or_counted():
+    config = good()
+    assert L.continuous(config) is True
+    config["CHIRP"]["num_pulses"] = 10000
+    assert L.continuous(config) is False

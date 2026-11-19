@@ -187,3 +187,36 @@ def git_commit(directory):
     except OSError:
         pass
     return ""
+
+
+def git_dirty(directory, timeout_s=10.0):
+    """Does the working tree of a checkout differ from its commit? Returns (dirty, changed files).
+
+    dirty is True, False, or None if it could not be told (no git, not a
+    checkout, timeout). Untracked files do not count. Runs `git status`
+    without taking git's optional locks, so nothing in the checkout is written.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(["git", "--no-optional-locks", "-C", directory, "status", "--porcelain",
+                              "--untracked-files=no"], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, timeout=timeout_s)
+    except (OSError, subprocess.SubprocessError):
+        return None, []
+    if out.returncode != 0:
+        return None, []
+    changed = [line[3:].strip() for line in out.stdout.splitlines() if line.strip()]
+    return bool(changed), changed[:50]
+
+
+def sha256_file(path):
+    """SHA-256 of a file as hex text, or "" if it cannot be read."""
+    import hashlib
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                digest.update(block)
+    except OSError:
+        return ""
+    return digest.hexdigest()

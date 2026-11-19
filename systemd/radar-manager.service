@@ -35,16 +35,16 @@ WatchdogSignal=SIGKILL
 
 # Stopping. The radar must never be left running without the manager:
 #  * systemctl stop / shutdown: SIGTERM goes to the manager only (KillMode=mixed).
-#    It stops the radar with SIGINT (SIGKILL after orca.stop_timeout_s), runs the
-#    make-amplifier-safe step, and exits. The helper programs are not signalled,
+#    It stops the radar with SIGINT (gone within orca.urgent_stop_budget_s, killed
+#    if need be), makes the amplifier safe if that is needed, and exits. The helper programs are not signalled,
 #    so the amplifier tool is never interrupted half way.
 #  * the manager dies (crash, watchdog, kill -9): the kernel kills the radar at
 #    once (the manager starts it with `setpriv --pdeathsig KILL`).
 #  * whatever is left in the unit's control group after TimeoutStopSec gets SIGKILL.
 KillMode=mixed
-# Longest clean stop: orca.stop_timeout_s (3) + amp_safe.confirm_timeout_s (4)
-# + amp_safe.timeout_s (20) x 3 attempts + 15 s. Keep TimeoutStopSec above that sum.
-TimeoutStopSec=100
+# Longest clean stop: orca.urgent_stop_budget_s (3) + amp_safe.confirm_timeout_s (5)
+# + amp_safe.timeout_s (40) x 3 attempts + 15 s. Keep TimeoutStopSec above that sum.
+TimeoutStopSec=160
 TimeoutStartSec=30
 
 # After every stop of the unit, clean or not, once all its processes are gone:

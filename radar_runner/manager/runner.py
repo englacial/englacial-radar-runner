@@ -3,6 +3,7 @@
     runner = Runner(config, post)       # post(name, data) is called from the runner's threads
     runner.start({"trigger": "button", "attempt": 1, "resume": False}, flags=[...])
     runner.stop("why")                  # stop the radar, or abort the start sequence
+    runner.stop("why", urgent=True, power=True)     # power loss: within a fixed time, nothing checked after
     runner.shutdown(timeout)            # stop and wait; for the manager's own exit
 
 For every start, `post` is called with, in order:
@@ -16,7 +17,8 @@ and posts "safe_done".
 
 The start sequence: read and check the requested config, create the collection
 directory, write the derived config and check that too, generate the chirp,
-build, turn-on check (hook), launch the radar, wait for its start line.
+build, turn-on check (hook), launch the radar, wait for its start line, check
+the SDR's USB speed.
 
 How ORCA is made to write straight into the collection directory, unchanged
 (see docs/orca-proposals/README.md): the derived config gives FILES.output_dir
@@ -25,10 +27,22 @@ the radar is given the config's path relative to the checkout as well. The
 radar then writes rx_samps.bin.0, .1, ... there itself, and the chirp generator
 puts chirp.bin there. Nothing is moved or copied afterwards.
 
+Stopping a radar that has not printed its start line yet. ORCA installs its
+SIGINT handler only after the device set-up (firmware and FPGA load, tuning),
+so a SIGINT before that kills it in the middle of the set-up, with the SDR's
+pins as UHD's initialisation left them. A stop that is asked for in that time
+is therefore held until the start line has been seen, or until a limit has
+passed: the start timeout normally, `orca.urgent_grace_s` for an urgent stop
+(power loss, the manager's own exit). A radar that had to be signalled before
+its start line is treated as killed in mid-set-up: the pin is not known safe.
+An urgent stop has the radar process gone `orca.urgent_stop_budget_s` after it
+was asked for, whatever state the radar is in.
+
 One thread, started once and kept for the life of the manager, runs every
-sequence and is the parent of the radar process. That matters: the kernel
-sends the "parent died" signal (`setpriv --pdeathsig`) when the *thread* that
-started the process ends.
+sequence and every run of the tool, and is the parent of the radar process.
+That matters twice: the tool can never run while a radar of this manager is
+alive, and the kernel sends the "parent died" signal (`setpriv --pdeathsig`)
+when the *thread* that started the process ends.
 """
 import collections
 import logging
@@ -44,33 +58,32 @@ from radar_runner.common.status import boottime_s
 
 from . import ampsafe
 from . import collection as coll
+from . import gates
 from . import limits
 
 log = logging.getLogger("manager.runner")
 
 STDOUT_LOG, STDERR_LOG, PREPARE_LOG, AMP_SAFE_LOG = "uhd_stdout.log", "uhd_stderr.log", "prepare.log", "amp_safe.log"
-STDERR_MAX_BYTES = 16 << 20
-# After the output log is full only these lines are still written: the radar's
-# file and exit reports. The lines dropped then are the per-pulse error reports.
-KEEP_PREFIXES = ("[OPEN FILE]", "[CLOSE FILE]", "[RX]", "[TX] Done", "[TX] Closing", "[TX] stop", "[START]",
-                 "[VERSION]")
-FLOOD_PREFIXES = ("[ERROR]", "[TX] (Chirp")     # not worth a flush each
+FLOOD_PREFIXES = ("[ERROR]", "[TX] (Chirp")     # per-pulse reports: not worth a flush each
 
 
 class OutputLog:
-    """The radar's output as "[unix time] \\t<line>" (the format of ORCA's run.py), in parts, capped.
+    """The radar's output as "[unix time] \\t<line>" (the format of ORCA's run.py), in parts.
 
-    Parts are <name>, <name>.1, <name>.2 ... Never raises: a write error is
-    kept in `error` and the output is dropped from then on.
+    Everything is written: the per-pulse lines ("[ERROR] (Chirp N) ...", "[TX]
+    (Chirp N) time_offset increased by D") are needed to process the data.
+    Parts are <name>, <name>.1, <name>.2 ... of `part_bytes` each. Never
+    raises: a write error is kept in `error` and the output is dropped from
+    then on (the data-drive gate stops the radar when the drive is the cause).
     """
 
-    def __init__(self, directory, name, part_bytes, max_bytes, wall=time.time):
+    def __init__(self, directory, name, part_bytes, wall=time.time):
         self.directory, self.name = directory, name
-        self.part_bytes, self.max_bytes = max(4096, int(part_bytes)), int(max_bytes)
+        self.part_bytes = max(4096, int(part_bytes))
         self._wall = wall
         self.bytes = 0          # written in all parts
+        self.lines = 0
         self.parts = 0
-        self.dropped = 0        # lines not written because the log was full
         self.error = ""
         self._file = None
         self._part_bytes = 0
@@ -85,9 +98,6 @@ class OutputLog:
         """`line` is text without its newline."""
         if self.error:
             return
-        if self.bytes >= self.max_bytes and not line.startswith(KEEP_PREFIXES):
-            self.dropped += 1
-            return
         try:
             if self._file is None or self._part_bytes >= self.part_bytes:
                 if self._file is not None:
@@ -97,6 +107,7 @@ class OutputLog:
             self._file.write(data)
             self._part_bytes += len(data)
             self.bytes += len(data)
+            self.lines += 1
             if not line.startswith(FLOOD_PREFIXES):
                 self._file.flush()
         except OSError as e:
@@ -110,10 +121,6 @@ class OutputLog:
             self.error = self.error or f"{e.strerror}"
 
     def close(self):
-        if self.dropped and not self.error:
-            limit, self.max_bytes = self.max_bytes, float("inf")
-            self.write(f"[manager] {self.dropped} lines were not logged after the log reached "
-                       f"{limit / 1e6:.0f} MB")
         try:
             if self._file is not None:
                 self._file.flush()
@@ -124,7 +131,7 @@ class OutputLog:
         self._file = None
 
     def snapshot(self):
-        return {"bytes": self.bytes, "parts": self.parts, "lines_dropped": self.dropped, "error": self.error}
+        return {"bytes": self.bytes, "lines": self.lines, "parts": self.parts, "error": self.error}
 
 
 class _Reader(threading.Thread):
@@ -179,26 +186,34 @@ class _Run:
         self.flags = list(flags)
         self.stop = threading.Event()
         self.stop_reason = ""
+        self.urgent_at = None       # monotonic time of the first urgent stop request
+        self.power = False          # the stop came from the power service
         self.directory = None
         self.name = None
         self.meta = None
         self.proc = None
+        self.launching = False      # decided, under the lock, that the radar will be launched
         self.launched = False       # a radar process was started
+        self.radar_over = False     # ... and is gone again
         self.started = threading.Event()
         self.started_at = None
-        self.usb2 = threading.Event()
+        self.signalled_before_start = False
+        self.continuous = True      # CHIRP.num_pulses < 0: the radar runs until it is stopped
+        self.interrupted = ""       # it exited with status 0 all the same, unasked
         self.killed = False
         self.exit_status = None
         self.failure = ""
         self.kind = ""
         self.fatal = False
-        self.amp_safe = None        # None: no radar was launched; True/False: confirmed safe or not
-        self.amp_safe_ran = False   # the command was run (see ampsafe.decide)
+        self.amp_safe = None        # None: nothing checked; True/False: the pin is / is not known safe
+        self.amp_safe_ran = False   # the tool was run
         self.amp_safe_detail = ""
+        self.usb_speed = None
         self.chunks_closed = 0
         self.open_file = ""
         self.tail = collections.deque(maxlen=12)
         self.stdout_log = None
+        self.stderr_log = None
 
     def fail(self, kind, text, fatal=False):
         if not self.failure:
@@ -207,7 +222,9 @@ class _Run:
     def info(self):
         return {"requested": self.stop.is_set(), "stop_reason": self.stop_reason,
                 "failure": self.failure, "kind": self.kind, "fatal": self.fatal,
+                "interrupted": self.interrupted,
                 "launched": self.launched, "started": self.started.is_set(),
+                "signalled_before_start": self.signalled_before_start,
                 "exit_status": self.exit_status, "killed": self.killed,
                 "amp_safe": self.amp_safe, "amp_safe_command_run": self.amp_safe_ran,
                 "amp_safe_detail": self.amp_safe_detail,
@@ -226,12 +243,17 @@ class Runner:
         self._boot_number = boot_number
         self.amp_telemetry = amp_telemetry or ampsafe.AmpTelemetry(config)
         self.sdr_state = ampsafe.SdrState(self.state_dir)
+        self.sdr_gate = gates.SdrGate(self.cfg["gates"]["sdr"])
         self.making_safe = False    # a run of the tool outside a radar run is queued or in progress
+        # Uptime at which the last radar or tool run ended; a shutdown-current
+        # reading counts only if it is newer than this (ampsafe.AmpTelemetry.now).
+        self.last_activity_uptime = uptime()
         self._pending = 0
         # HOOK (stage 7, turn-on check): called after the build and before the
         # radar is launched, with the _Run. Returns (passed, text). A failure
-        # is a fault ("turn_on_check"); the radar is not launched.
-        self.turn_on_check = turn_on_check or (lambda run: (True, ""))
+        # is a fault ("turn_on_check"); the radar is not launched. The SDR's
+        # state is recorded as unknown before the hook is called.
+        self.turn_on_check = turn_on_check
         self._queue = queue.Queue()
         self._lock = threading.Lock()
         self._current = None
@@ -260,9 +282,6 @@ class Runner:
 
         Returns False (and does nothing) while a radar run or another such
         request is in progress: the end of a radar run decides for itself.
-        The runner's one thread does both, so the tool never runs while a
-        radar that this manager started is alive, and a start that is asked
-        for meanwhile waits for the tool.
         """
         with self._lock:
             if self._current is not None or self.making_safe:
@@ -273,12 +292,18 @@ class Runner:
             self._queue.put(("safe", why))
         return True
 
-    def stop(self, reason):
+    def stop(self, reason, urgent=False, power=False):
+        """Stop the radar or abort the start. May be called again to make a stop urgent."""
         with self._lock:
             run = self._current
-            if run is not None and not run.stop.is_set():
+            if run is None:
+                return
+            if not run.stop.is_set():
                 run.stop_reason = reason
                 run.stop.set()
+            if urgent and run.urgent_at is None:
+                run.urgent_at = time.monotonic()
+            run.power = run.power or power
 
     def add_flag(self, flag):
         """Mark the current collection, e.g. "no_amp_telemetry"."""
@@ -287,9 +312,19 @@ class Runner:
             if run is not None and flag not in run.flags:
                 run.flags.append(flag)
 
+    def radar_gone(self):
+        """True if no radar process of this manager exists, and none is about to be started."""
+        with self._lock:
+            run = self._current
+            if run is None or run.radar_over:
+                return True
+            if run.launching:
+                return False
+            return run.stop.is_set()        # it will never be launched (decided under this lock)
+
     def shutdown(self, timeout_s):
-        """Stop whatever runs and wait for the amplifier to be made safe. True if idle in time."""
-        self.stop("the manager is stopping")
+        """Stop whatever runs, urgently, and wait until all is done. True if idle in time."""
+        self.stop("the manager is stopping", urgent=True)
         return self._idle.wait(timeout_s)
 
     def snapshot(self):
@@ -299,14 +334,20 @@ class Runner:
             return {"active": False}
         proc = run.proc
         out = {"active": True, "collection": run.name, "directory": run.directory,
-               "pid": proc.pid if proc is not None and run.exit_status is None else None,
+               "pid": proc.pid if proc is not None and not run.radar_over else None,
                "recording": run.started.is_set(), "chunks_closed": run.chunks_closed,
-               "writing": run.open_file, "flags": list(run.flags)}
+               "writing": run.open_file, "flags": list(run.flags), "usb_speed_mbps": run.usb_speed}
         if run.stdout_log is not None:
             out["log"] = run.stdout_log.snapshot()
         return out
 
     # ------------------------------------------------------------------- thread
+
+    def _done(self):
+        with self._lock:
+            self._pending -= 1
+            if not self._pending:
+                self._idle.set()
 
     def _loop(self):
         while True:
@@ -315,17 +356,13 @@ class Runner:
                 result = {"ok": False, "state": ampsafe.UNKNOWN, "detail": "internal error", "why": run[1],
                           "status": None}
                 try:
-                    known = self.sdr_state.known_safe
-                    state, ok, detail, status = self._tool(os.path.join(self.state_dir, AMP_SAFE_LOG), known)
-                    self._record_state(state, f"{detail} ({run[1]})")
-                    result.update(ok=ok, state=state, detail=detail, status=status)
+                    ok, detail, status = self._tool(os.path.join(self.state_dir, AMP_SAFE_LOG), patient=False)
+                    result.update(ok=ok, state=self.sdr_state.get(), detail=detail, status=status)
                 except Exception:
                     log.exception("internal error while making the amplifier safe")
                 with self._lock:
                     self.making_safe = False
-                    self._pending -= 1
-                    if not self._pending:
-                        self._idle.set()
+                self._done()
                 self.post("safe_done", result)
                 continue
             try:
@@ -336,8 +373,10 @@ class Runner:
             try:
                 if run.proc is not None and run.proc.poll() is None:
                     self._kill(run)     # only after an internal error: no radar may outlive its run
-                if run.launched and run.amp_safe is None:
-                    self._make_amp_safe(run)
+                    run.radar_over = True
+                    self.last_activity_uptime = self._uptime()
+                if run.launched and run.amp_safe is None and not run.amp_safe_detail:
+                    self._after_radar(run)
                 self._finish(run)
             except Exception as e:
                 log.exception("internal error while ending the run")
@@ -347,9 +386,7 @@ class Runner:
             info = run.info()
             with self._lock:
                 self._current = None
-                self._pending -= 1
-                if not self._pending:
-                    self._idle.set()
+            self._done()
             self.post("ended", info)
 
     def _env(self):
@@ -435,6 +472,7 @@ class Runner:
         problems = limits.check(config, cfg["limits"])
         if problems:
             return run.fail("config", "radar config refused: " + "; ".join(problems), fatal=True)
+        run.continuous = limits.continuous(config)
 
         # 2. The collection directory and its metadata.
         try:
@@ -445,12 +483,15 @@ class Runner:
         if problem:
             log.warning("boot counter: %s", problem)
         per_file = limits.pulses_per_file(config, cfg["data"]["chunk_mb"] * 1e6, cfg["data"]["chunk_max_s"])
+        dirty, changed = coll.git_dirty(orca)
         run.meta = coll.Metadata(run.directory, {
             "name": run.name, "boot": boot, "sequence": seq, "boot_id": coll.current_boot_id(),
             "trigger": run.request.get("trigger"), "attempt": run.request.get("attempt"),
             "resume": bool(run.request.get("resume")), "flags": list(run.flags),
             "created": coll.stamp(self._wall), "requested_config": cfg["radar_config"],
-            "orca": {"dir": orca, "commit": coll.git_commit(orca)},
+            # dirty: the working tree differs from the commit (None = could not be told); changed: which files
+            "orca": {"dir": orca, "commit": coll.git_commit(orca), "dirty": dirty, "changed": changed},
+            "radar_binary": None,
             "data": {"file": limits.DATA_FILE, "pulses_per_file": per_file,
                      "record_bytes": limits.record_bytes(config), "sample_format": "complex64 little-endian"},
         })
@@ -475,7 +516,8 @@ class Runner:
         if run.stop.is_set():
             return
 
-        # 4. Chirp, 5. build. A failure of either is a failed start.
+        # 4. Chirp, 5. build. A failure of either is a failed start. No radar exists yet:
+        # a stop aborts these at once.
         prepare_log = os.path.join(run.directory, PREPARE_LOG)
         ok, text, _ = self._command(run.stop, self._fill(orca_cfg["chirp_command"], run, config_path),
                                     os.path.join(orca, orca_cfg["chirp_cwd"]), orca_cfg["chirp_timeout_s"],
@@ -496,20 +538,26 @@ class Runner:
                                         "build", prepare_log)
             if not ok:
                 return None if run.stop.is_set() else run.fail("build", text)
-
-        # 6. HOOK: the turn-on check of stage 7 goes here (see __init__).
-        passed, text = self.turn_on_check(run)
-        if not passed:
-            return run.fail("turn_on_check", f"turn-on check failed: {text}", fatal=True)
-        if run.stop.is_set():
-            return
-
-        # 7. The radar.
         radar_cwd = os.path.join(orca, orca_cfg["radar_cwd"])
         command = self._fill(orca_cfg["radar_command"], run, config_path)
-        if not command or not os.path.isfile(os.path.join(radar_cwd, command[0])):
+        binary = os.path.join(radar_cwd, command[0]) if command else ""
+        if not command or not os.path.isfile(binary):
             return run.fail("launch", f"the radar program {command[0] if command else ''} is not there "
                                       "after the build")
+        run.meta.data["radar_binary"] = {"path": binary, "sha256": coll.sha256_file(binary)}
+        run.meta.write()
+
+        # 6. HOOK: the turn-on check of stage 7 goes here (see __init__). It runs a
+        # radar of its own, so the SDR's state is unknown from here on.
+        if self.turn_on_check is not None:
+            if run.stop.is_set():
+                return
+            self._record_state(ampsafe.UNKNOWN, f"turn-on check, collection {run.name}")
+            passed, text = self.turn_on_check(run)
+            if not passed:
+                return run.fail("turn_on_check", f"turn-on check failed: {text}", fatal=True)
+
+        # 7. The radar.
         self._radar(run, list(orca_cfg["launch_prefix"]) + command, radar_cwd)
 
     def _on_line(self, run, radar_cwd, line, now):
@@ -522,8 +570,6 @@ class Runner:
         elif line.startswith("[CLOSE FILE] "):
             run.chunks_closed += 1
             self._sync_queue.put(os.path.join(radar_cwd, line[13:].strip()))
-        elif "Operating over USB 2" in line:
-            run.usb2.set()
 
     def _sync_closed_files(self, run):
         """Make each data file durable when the radar has closed it (the radar itself does not sync)."""
@@ -545,60 +591,112 @@ class Runner:
             except OSError as e:
                 log.warning("cannot sync %s: %s", path, e.strerror)
 
+    def _usb_check(self, run):
+        """After the start line: the SDR's link speed, from sysfs. Returns "" / a failure text / None (not yet)."""
+        cfg = self.cfg["gates"]["sdr"]
+        found = self.sdr_gate.find()
+        if len(found) != 1:
+            return None                 # not visible right now: look again
+        name, speed, _ = found[0]
+        run.usb_speed = speed
+        if speed < cfg["min_speed_mbps"]:
+            return (f"the SDR is on a USB 2 link ({speed} Mbit/s at {name}); the radar needs USB 3 "
+                    f"({cfg['min_speed_mbps']} Mbit/s)")
+        return ""
+
     def _radar(self, run, argv, cwd):
         orca_cfg, data_cfg = self.cfg["orca"], self.cfg["data"]
-        run.stdout_log = OutputLog(run.directory, STDOUT_LOG, data_cfg["log_part_mb"] * 1e6,
-                                   data_cfg["log_max_mb"] * 1e6, self._wall)
-        stderr_log = OutputLog(run.directory, STDERR_LOG, STDERR_MAX_BYTES, STDERR_MAX_BYTES, self._wall)
+        part_bytes = data_cfg["log_part_mb"] * 1e6
+        run.stdout_log = OutputLog(run.directory, STDOUT_LOG, part_bytes, self._wall)
+        run.stderr_log = OutputLog(run.directory, STDERR_LOG, part_bytes, self._wall)
         self._sync_queue = queue.Queue()
-        # From here on the SDR's state is not known to be safe, until _make_amp_safe says so.
+        with self._lock:                # against radar_gone(): a stop from here on finds a radar
+            if run.stop.is_set():
+                return
+            run.launching = True
+        # From here on the SDR's state is not known to be safe, until _after_radar says so.
         before = (self.sdr_state.get(), self.sdr_state.why())
         error = self.sdr_state.set(ampsafe.UNKNOWN, f"radar launched, collection {run.name}")
         if error:
+            run.launching = False
             return run.fail("state", f"cannot record that the SDR state is unknown: {error}")
         try:
             proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, start_new_session=True, env=self._env())
         except OSError as e:
-            self._record_state(*before)     # nothing touched the SDR
+            if before[1] == "no record":        # nothing touched the SDR: put the record back as it was
+                try:
+                    os.unlink(self.sdr_state.path)
+                except OSError:
+                    pass
+            else:
+                self._record_state(*before)
+            run.launching = False
             return run.fail("launch", f"cannot start the radar ({argv[0]}): {e.strerror or e}")
         run.proc = proc
         run.launched = True
         log.info("radar started: pid %d, collection %s", proc.pid, run.name)
         readers = [_Reader(proc.stdout, run.stdout_log, lambda line, now: self._on_line(run, cwd, line, now),
                            self._wall),
-                   _Reader(proc.stderr, stderr_log, None, self._wall)]
+                   _Reader(proc.stderr, run.stderr_log, None, self._wall)]
         syncer = threading.Thread(target=self._sync_closed_files, args=(run,), daemon=True, name="radar-sync")
         for thread in readers + [syncer]:
             thread.start()
 
-        deadline = time.monotonic() + orca_cfg["start_timeout_s"]
+        start_deadline = time.monotonic() + orca_cfg["start_timeout_s"]
         announced = False
+        usb_checked = not orca_cfg["require_usb3"]
+        usb_deadline = None
         while True:
             try:
                 run.exit_status = proc.wait(0.05)
                 break
             except subprocess.TimeoutExpired:
                 pass
-            if run.stop.is_set():
-                self._stop_radar(run)
-                break
-            if run.usb2.is_set() and orca_cfg["require_usb3"]:
-                run.fail("usb2", "the radar reports the SDR on a USB 2 link")
-                self._stop_radar(run)
-                break
-            if run.started.is_set():
-                if not announced:
+            now = time.monotonic()
+            started = run.started.is_set()
+            if started and not usb_checked:
+                usb_deadline = usb_deadline or now + 3.0
+                problem = self._usb_check(run)
+                if problem:
+                    run.fail("usb2", problem)
+                    usb_checked = True
+                elif problem == "" or now >= usb_deadline:
+                    usb_checked = True
+                    if problem is None:
+                        log.warning("the SDR's USB speed could not be read from sysfs")
+                        self.add_flag("usb_speed_unknown")
+            if run.stop.is_set() or run.failure:
+                if started:
+                    self._stop_radar(run)
+                    break
+                # No handler for SIGINT in the radar yet: hold the stop until the start line.
+                hold_until = start_deadline
+                if run.urgent_at is not None:
+                    hold_until = min(hold_until, run.urgent_at + orca_cfg["urgent_grace_s"])
+                if now >= hold_until:
+                    run.signalled_before_start = True
+                    log.warning("stopping the radar before its start line: it dies in the middle of the SDR set-up")
+                    self._stop_radar(run)
+                    break
+                continue
+            if started:
+                if not announced and usb_checked:
                     announced = True
                     run.meta.data["recording_started"] = coll.stamp(self._wall)
                     run.meta.data["flags"] = list(run.flags)
+                    run.meta.data["usb_speed_mbps"] = run.usb_speed
                     run.meta.write()
                     self.post("started", {})
-            elif time.monotonic() >= deadline:
+            elif now >= start_deadline:
                 run.fail("start_timeout", f"the radar did not report {orca_cfg['start_line']} within "
                                           f"{orca_cfg['start_timeout_s']:g} s")
+                run.signalled_before_start = True
                 self._stop_radar(run)
                 break
+        with self._lock:
+            run.radar_over = True
+        self.last_activity_uptime = self._uptime()
 
         for thread in readers:
             thread.join(5.0)        # the pipes close when the radar is gone
@@ -608,25 +706,39 @@ class Runner:
                                  + ("" if run.started.is_set() else " before it started recording"))
             elif not run.started.is_set():
                 run.fail("exit", "the radar exited before it started recording")
+            elif run.continuous:
+                run.interrupted = "the radar exited with status 0 without being asked to (num_pulses is -1)"
         log.info("radar exited: status %s%s", run.exit_status, ", KILLED" if run.killed else "")
-        self._make_amp_safe(run)    # first: the amplifier does not wait for the drive
+        self._after_radar(run)      # first: the amplifier does not wait for the drive
         self._sync_queue.put(None)
         syncer.join(30.0)
 
     def _stop_radar(self, run):
-        """SIGINT, wait the allowed time, SIGKILL only as the last resort."""
-        proc = run.proc
-        timeout_s = self.cfg["orca"]["stop_timeout_s"]
+        """SIGINT, wait the allowed time, SIGKILL only as the last resort.
+
+        Normally the radar gets `stop_timeout_s` to exit. An urgent stop has
+        it gone `urgent_stop_budget_s` after the stop was asked for.
+        """
+        proc, cfg = run.proc, self.cfg["orca"]
         try:
             proc.send_signal(signal.SIGINT)
         except OSError:
             pass
-        try:
-            run.exit_status = proc.wait(timeout_s)
-        except subprocess.TimeoutExpired:
-            log.error("LAST RESORT: the radar (pid %d) did not exit within %g s of SIGINT: sending SIGKILL",
-                      proc.pid, timeout_s)
-            self._kill(run)
+        deadline = time.monotonic() + cfg["stop_timeout_s"]
+        while True:
+            try:
+                run.exit_status = proc.wait(0.05)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            limit = deadline
+            if run.urgent_at is not None:
+                limit = min(limit, run.urgent_at + cfg["urgent_stop_budget_s"])
+            if time.monotonic() >= limit:
+                log.error("LAST RESORT: the radar (pid %d) did not exit in time after SIGINT: sending SIGKILL",
+                          proc.pid)
+                self._kill(run)
+                return
 
     def _kill(self, run):
         proc = run.proc
@@ -642,66 +754,85 @@ class Runner:
         except subprocess.TimeoutExpired:
             log.error("the radar (pid %d) is still there 10 s after SIGKILL", proc.pid)
 
-    def _make_amp_safe(self, run):
-        """After every radar exit, however it happened, and only then. Not interruptible.
+    # --------------------------------------------------------- amplifier made safe
 
-        Whether the tool runs is decided in ampsafe.decide (setting amp_safe.policy).
-        `run.amp_safe` becomes True if the pin is known to be safe afterwards.
+    def _after_radar(self, run):
+        """After every radar exit, however it happened, and only then: is the pin safe? (ampsafe.py)
+
+        `run.amp_safe` becomes True if the pin is known to be safe afterwards,
+        False if not, and stays None if nothing was checked (power loss).
         """
-        cfg = self.cfg["amp_safe"]
         exit_uptime = self._uptime()
         facts = {"reached_running": run.started.is_set(), "killed": run.killed,
-                 "exit_status": run.exit_status, "failure": run.failure}
-        run_it, known, why = ampsafe.decide(cfg["policy"], facts,
-                                            lambda: self.amp_telemetry.confirm_shutdown(exit_uptime))
-        run.amp_safe_ran = run_it
-        if not run_it:
-            run.amp_safe, run.amp_safe_detail = True, f"command not run: {why}"
+                 "exit_status": run.exit_status, "failure": run.failure,
+                 "signalled_before_start": run.signalled_before_start}
+        power = ""
+        if run.power:
+            power = "the stop came from the power service"
+        elif self.amp_telemetry.rail_absent():
+            power = "the 28 V rail reads absent"
+        action, why = ampsafe.after_exit(facts, lambda: self.amp_telemetry.confirm_shutdown(exit_uptime), power)
+        if action == "leave":
+            run.amp_safe_detail = why
+            log.warning("amplifier pin not checked after the radar exit: %s", why)
+        elif action == "safe":
+            run.amp_safe, run.amp_safe_detail = True, f"tool not run: {why}"
             log.info("amplifier safe, %s", run.amp_safe_detail)
             self._record_state(ampsafe.SAFE, why)
-            return
-        log_path = os.path.join(run.directory, AMP_SAFE_LOG) if run.directory else None
-        state, ok, detail, _ = self._tool(log_path, known)
-        run.amp_safe, run.amp_safe_detail = ok, f"{detail} ({why})"
-        self._record_state(state, run.amp_safe_detail)
-        if not ok:
-            log.error("AMPLIFIER NOT CONFIRMED SAFE after the radar exited: %s", run.amp_safe_detail)
+        else:
+            run.amp_safe_ran = True
+            log_path = os.path.join(run.directory, AMP_SAFE_LOG) if run.directory else None
+            ok, detail, _ = self._tool(log_path, patient=run.urgent_at is None)
+            run.amp_safe, run.amp_safe_detail = ok, f"{detail} ({why})"
+            if not ok:
+                log.error("AMPLIFIER NOT CONFIRMED SAFE after the radar exited: %s", run.amp_safe_detail)
 
-    def _tool(self, log_path, known_before):
-        """Run the make-amplifier-safe tool. Returns (state, ok, text, exit status).
+    def _tool(self, log_path, patient):
+        """Run the make-amplifier-safe tool. Returns (ok, text, exit status).
 
         Only ever called from the runner's thread, with no radar of this
-        manager alive. ASSUME_ENABLED (the tool initialised the SDR and could
-        not verify the pin) is urgent: the tool is run again at once, up to
-        `assume_enabled_retries` times.
+        manager alive. The tool's wrapper keeps the record itself
+        (--state-file): `unknown` before it starts, `safe` after an OK.
+
+        ASSUME_ENABLED (the tool initialised the SDR and could not verify the
+        pin) is urgent: the tool is run again at once, up to
+        `assume_enabled_retries` times. NOT_FOUND, BUSY and TIMEOUT can mean
+        that the SDR is coming back after a radar was killed: if `patient`,
+        the tool is tried again up to `unavailable_retries` times,
+        `unavailable_delay_s` apart.
         """
         cfg = self.cfg["amp_safe"]
         command = [str(a) for a in cfg["command"]]
         if not command:
-            state, ok = ampsafe.after_tool(None, known_before)
-            return state, ok, "the make-amplifier-safe command is not configured", None
+            return False, "the make-amplifier-safe command is not configured", None
+        command += ["--state-file", self.sdr_state.path]
         if log_path is not None:
             try:
                 if os.path.getsize(log_path) > 1 << 20:     # the log outside a collection must not grow for ever
                     os.replace(log_path, log_path + ".1")
             except OSError:
                 pass
-        attempts = 1 + max(0, cfg["assume_enabled_retries"])
-        for attempt in range(1, attempts + 1):
+        runs, urgent_left, later_left = 0, max(0, cfg["assume_enabled_retries"]), max(0, cfg["unavailable_retries"])
+        while True:
             _, text, status = self._command(None, command, None, cfg["timeout_s"], "make amplifier safe", log_path)
-            if status != ampsafe.ASSUME_ENABLED:
-                break
-            log.error("URGENT: the make-amplifier-safe tool initialised the SDR and could not verify the pin "
-                      "(attempt %d of %d)", attempt, attempts)
-        state, ok = ampsafe.after_tool(status, known_before)
-        detail = f"command run: {ampsafe.describe(status)}"
+            runs += 1
+            self.last_activity_uptime = self._uptime()
+            if status == ampsafe.ASSUME_ENABLED and urgent_left:
+                urgent_left -= 1
+                log.error("URGENT: the make-amplifier-safe tool initialised the SDR and could not verify the pin: "
+                          "running it again")
+                continue
+            if patient and status in ampsafe.RETRY_LATER and later_left:
+                later_left -= 1
+                log.warning("make-amplifier-safe tool: %s; trying again in %g s", ampsafe.describe(status),
+                            cfg["unavailable_delay_s"])
+                time.sleep(cfg["unavailable_delay_s"])
+                continue
+            break
+        detail = f"tool run {runs} time{'s' if runs != 1 else ''}: {ampsafe.describe(status)}"
         if status is None or status == ampsafe.KILLED_BY_CALLER:
             detail += f": {text}"
-        if status == ampsafe.ASSUME_ENABLED:
-            detail += f" in each of {attempts} attempts"
-        elif not ok or (status != ampsafe.OK and known_before):
-            detail += "; the state was " + ("known safe before and is unchanged" if ok else "not known safe before")
-        return state, ok, detail, status
+        return status == ampsafe.OK, detail, status
 
     def _record_state(self, state, why):
         error = self.sdr_state.set(state, why)
@@ -718,20 +849,25 @@ class Runner:
             how = "not_started"
         elif run.stop.is_set():
             how = "stopped"
+        elif run.interrupted:
+            how = "interrupted"
         else:
             how = "finished"
         if run.killed:
             run.meta.add_flag("killed")
-        if run.stdout_log is not None and run.stdout_log.dropped:
-            run.meta.add_flag("log_truncated")
+        if run.signalled_before_start:
+            run.meta.add_flag("stopped_before_start")
         for flag in run.flags:
             run.meta.add_flag(flag)
         end = coll.stamp(self._wall)
-        end.update({"how": how, "reason": run.failure or run.stop_reason, "exit_status": run.exit_status,
-                    "killed": run.killed, "amp_safe": run.amp_safe, "amp_safe_command_run": run.amp_safe_ran,
+        end.update({"how": how, "reason": run.failure or run.interrupted or run.stop_reason,
+                    "exit_status": run.exit_status, "killed": run.killed,
+                    "amp_safe": run.amp_safe, "amp_safe_command_run": run.amp_safe_ran,
                     "amp_safe_detail": run.amp_safe_detail,
                     "data_files_closed": run.chunks_closed,
-                    "log": run.stdout_log.snapshot() if run.stdout_log is not None else None})
+                    # the radar's output log (uhd_stdout.log, .1, ...) and UHD's own messages (uhd_stderr.log)
+                    "log": run.stdout_log.snapshot() if run.stdout_log is not None else None,
+                    "stderr_log": run.stderr_log.snapshot() if run.stderr_log is not None else None})
         run.meta.data["end"] = end
         error = run.meta.write()
         if error:

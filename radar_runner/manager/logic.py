@@ -11,16 +11,19 @@ Inputs
     clear_fault(t, src)
     auto(t, state, label)       the automatic source (the GPS motion trigger):
                                 "moving", "stationary" or "unknown" (no fix)
-    collection(t, name, ...)    from the runner: the collection directory exists
+    collection_created(t, name) from the runner: the collection directory exists
     started(t)                  from the runner: the radar reports that it records
     ended(t, info)              from the runner: the radar is gone and the amplifier
-                                has been made safe (or no radar was ever launched)
+                                step is done (or no radar was ever launched)
+    amp_unsafe(t, detail)       with no radar: the amplifier pin could not be made safe
+    amp_safe_again(t, why)      the record says the pin is safe (again)
     shutdown(t)                 the manager itself is stopping
 
 Actions
-    start   data = {"trigger", "attempt", "resume"}   run the start sequence
-    stop    data = {"kind", "reason"}                 stop the radar, or abort the start
-    event   data = {...}                              one line for the event log
+    start   data = {"trigger", "attempt", "resume"}       run the start sequence
+    stop    data = {"kind", "reason", "urgent", "power"}  stop the radar, or abort the start.
+                                                          May come again to make a stop urgent
+    event   data = {...}                                  one line for the event log
 
 States (what the LEDs show)
     not_ready   a gate refuses a start
@@ -32,14 +35,14 @@ States (what the LEDs show)
     power_fail  the power service reports a loss of main power
 
 A run exists while there is an `intent`: who asked for it. The intent survives
-failed starts and interruptions by a gate, and ends with a stop request, a
-fault, the manual-run timeout, or the radar finishing by itself.
+failed starts and interruptions, and ends with a stop request, a fault, the
+manual-run timeout, or a radar with a pulse count finishing by itself.
 
 Rules
   * Manual sources (button, command line) are equal. `toggle` is the button:
     it cancels a run that is wanted (starting, running, waiting to retry or to
     resume) and otherwise starts one. A manual start is refused, not
-    remembered, while a gate is bad.
+    remembered, while a gate is bad; it then changes nothing, also not a fault.
   * The automatic source is a level, not an event: while it says "moving", no
     run is wanted and nothing blocks it, a run is started as soon as the gates
     allow. It stops only runs that it started, and only on "stationary";
@@ -53,15 +56,27 @@ Rules
     after `retry_delays_s[n]`; when the delays are used up: fault. A fatal
     failure (the config fails its limits, the turn-on check fails) is a fault
     at once.
-  * A gate that fails during a run (or `interrupt`) stops the radar and keeps the intent. When
-    every gate has been good again for `resume_holdoff_s` the run resumes, at
-    most `max_resumes` times: then fault.
-  * `stable_run_s` of uninterrupted running clears both counts.
-  * A failed "make the amplifier safe" command is a fault at once.
-  * Fault is left by: `toggle` or `start` (clears it and starts if the gates
-    allow), `clear_fault` (clears only), or the automatic source saying
-    "moving" while it is not blocked (clears it and starts). `stop` never
-    clears a fault: the power service calls it.
+  * An interruption stops the radar and keeps the intent: a gate that fails
+    during a run, `interrupt`, or a radar that runs until stopped and exits
+    with status 0 unasked. When every gate has been good again for
+    `resume_holdoff_s` the run resumes, at most `max_resumes` times: then fault.
+  * `stable_run_s` of uninterrupted running clears both counts. Independent of
+    that, at most `max_restarts_per_hour` automatic restarts (retries and
+    resumes) are made in any hour: then fault (`restart_limit`). Nothing
+    resets that count but time.
+  * A stop is urgent when it comes from a loss of power (the power gate,
+    `interrupt`) or from the manager's own exit: the runner then has the radar
+    gone within a fixed time.
+  * An amplifier pin that could not be confirmed safe is a fault at once
+    (`amp_unsafe`).
+  * Leaving a fault:
+      - `amp_unsafe` clears by itself when the record says the pin is safe
+        again (`amp_safe_again`), and by `clear_fault`. Nothing else clears it.
+      - Every other fault is cleared by `toggle` or `start` when the gates
+        allow a start (which then begins), by `clear_fault` (clears only), or
+        by the automatic source saying "moving" while it is not blocked.
+      - `stop` never clears a fault: the power service calls it.
+    The last fault and how it was cleared stay in the status.
 """
 from dataclasses import dataclass, field
 
@@ -72,6 +87,7 @@ IDLE = "idle"                       # phases besides STARTING, RUNNING and STOPP
 BUTTON, COMMAND, AUTO = "button", "command", "auto"
 MANUAL = (BUTTON, COMMAND)
 MOVING, STATIONARY, UNKNOWN = "moving", "stationary", "unknown"
+AMP_UNSAFE = "amp_unsafe"
 
 # LED patterns per state: (yellow READY, green RUNNING)
 OFF, ON, FAST, BREATHE = "off", "on", "fast_blink", "breathing"
@@ -84,6 +100,11 @@ LEDS = {
     FAULT: (FAST, OFF),
     POWER_FAIL: (OFF, OFF),
 }
+
+# The smallest values the `manager.run` settings may have. Below them the
+# limits on restarts mean nothing (each radar start enables the amplifier for
+# about half a second), so such a value is refused and the default used.
+MINIMUMS = {"retry_delay_s": 5.0, "resume_holdoff_s": 2.0, "stable_run_s": 60.0}
 
 
 @dataclass(frozen=True)
@@ -115,20 +136,51 @@ class LogicConfig:
     max_resumes: int = 5
     resume_holdoff_s: float = 10.0
     stable_run_s: float = 300.0
+    max_restarts_per_hour: int = 12
     manual_timeout_s: float = 50400.0       # 0 = no limit
     sources: tuple = (BUTTON, COMMAND)      # enabled trigger sources; add AUTO for the motion trigger
 
     @classmethod
-    def from_config(cls, manager_cfg):
+    def from_config(cls, manager_cfg, minimums=None):
+        """Return (config, warnings). A setting below its minimum is refused and the default used."""
+        low = MINIMUMS if minimums is None else minimums
         run, triggers = manager_cfg["run"], manager_cfg["triggers"]
-        delays = tuple(float(d) for d in run["retry_delays_s"]
-                       if type(d) in (int, float) and d >= 0)
+        default = cls()
+        warnings = []
+
+        def refuse(name, why):
+            warnings.append(f"manager.run.{name} {why}: the default is used")
+
+        delays = run["retry_delays_s"]
+        if (not delays or not all(type(d) in (int, float) and d >= low["retry_delay_s"] for d in delays)
+                or len(delays) > 10):
+            refuse("retry_delays_s", f"must be 1 to 10 delays of at least {low['retry_delay_s']:g} s")
+            delays = default.retry_delays_s
+        holdoff = run["resume_holdoff_s"]
+        if holdoff < low["resume_holdoff_s"]:
+            refuse("resume_holdoff_s", f"must be at least {low['resume_holdoff_s']:g} s")
+            holdoff = default.resume_holdoff_s
+        stable = run["stable_run_s"]
+        if stable < low["stable_run_s"]:
+            refuse("stable_run_s", f"must be at least {low['stable_run_s']:g} s")
+            stable = default.stable_run_s
+        resumes = run["max_resumes"]
+        if not 0 <= resumes <= 100:
+            refuse("max_resumes", "must be between 0 and 100")
+            resumes = default.max_resumes
+        per_hour = run["max_restarts_per_hour"]
+        if not 1 <= per_hour <= 120:
+            refuse("max_restarts_per_hour", "must be between 1 and 120")
+            per_hour = default.max_restarts_per_hour
+        timeout = run["manual_timeout_s"]
+        if timeout < 0:
+            refuse("manual_timeout_s", "must not be negative")
+            timeout = default.manual_timeout_s
         sources = tuple(s for s, name in ((BUTTON, "button"), (COMMAND, "command"), (AUTO, "gps"))
                         if triggers[name])
-        return cls(retry_delays_s=delays, max_resumes=max(0, run["max_resumes"]),
-                   resume_holdoff_s=max(0.0, run["resume_holdoff_s"]),
-                   stable_run_s=max(0.0, run["stable_run_s"]),
-                   manual_timeout_s=max(0.0, run["manual_timeout_s"]), sources=sources)
+        return cls(retry_delays_s=tuple(float(d) for d in delays), max_resumes=resumes,
+                   resume_holdoff_s=float(holdoff), stable_run_s=float(stable),
+                   max_restarts_per_hour=per_hour, manual_timeout_s=float(timeout), sources=sources), warnings
 
 
 class ManagerLogic:
@@ -137,12 +189,15 @@ class ManagerLogic:
         self.phase = IDLE
         self.intent = None          # None, or {"source", "label", "since"}
         self.fault = None           # None, or {"kind", "reason", "since"}
+        self.last_fault = None      # the last fault, also after it was cleared: {"kind", "reason", "cleared_by"}
         self.failures = 0           # failed starts and crashes since the last stable run
-        self.interruptions = 0      # stops by a gate since the last stable run
-        self.retry_at = None        # earliest time of the next start after a failure
+        self.interruptions = 0      # interruptions since the last stable run
+        self.restarts = []          # times of the automatic restarts of the last hour
+        self.retry_at = None        # earliest time of the next start after a failure or an interruption
         self.resume = False         # the next start continues an interrupted run
         self.stop_kind = ""         # why the current stop was asked for
         self.stop_reason = ""
+        self.stop_urgent = False
         self.last_end = ""          # how the last run ended, for the status
         self.auto_state = UNKNOWN
         self.auto_label = "gps"
@@ -177,12 +232,13 @@ class ManagerLogic:
         return ""
 
     def _run_block(self):
+        """(why a running radar must stop, is it a loss of power), or ("", False)."""
         if self.results is None:
-            return ""
+            return "", False
         for name, r in self.results.items():
             if r.run:
-                return f"{name}: {r.run}"
-        return ""
+                return f"{name}: {r.run}", r.kind == "power_fail"
+        return "", False
 
     def not_ready_reasons(self):
         if self.results is None:
@@ -212,6 +268,7 @@ class ManagerLogic:
 
     def _set_fault(self, t, kind, reason):
         self.fault = {"kind": kind, "reason": reason, "since": t}
+        self.last_fault = {"kind": kind, "reason": reason, "cleared_by": None}
         self.intent = None
         self.retry_at = None
         self.resume = False
@@ -220,7 +277,9 @@ class ManagerLogic:
 
     def _clear_fault(self, why):
         if self.fault:
-            self._event("fault_cleared", by=why, kind=self.fault["kind"])
+            self._event("fault_cleared", by=why, kind=self.fault["kind"], reason=self.fault["reason"])
+            if self.last_fault:
+                self.last_fault["cleared_by"] = why
             self.fault = None
             self.failures = 0
             self.interruptions = 0
@@ -238,6 +297,14 @@ class ManagerLogic:
         self.resume = False
 
     def _start(self, t):
+        restart = self.failures > 0 or self.resume
+        if restart:
+            self.restarts = [x for x in self.restarts if t - x < 3600.0]
+            if len(self.restarts) >= self.cfg.max_restarts_per_hour:
+                self._set_fault(t, "restart_limit", f"{len(self.restarts)} automatic restarts within an hour "
+                                f"(limit {self.cfg.max_restarts_per_hour}); last end: {self.last_end}")
+                return
+            self.restarts.append(t)
         self.phase = STARTING
         self.collection = None
         data = {"trigger": self.intent["label"], "attempt": self.failures + 1, "resume": self.resume}
@@ -246,14 +313,28 @@ class ManagerLogic:
         self._event("start", **data)
         self._out.append(Action("start", data))
 
-    def _stop(self, t, kind, reason):
-        """Ask the runner to stop. Safe to call again: a later reason replaces the kind only."""
+    def _stop(self, t, kind, reason, urgent=False, power=False):
+        """Ask the runner to stop. Called again, it can only make the stop urgent."""
         first = self.phase != STOPPING
         self.phase = STOPPING
-        self.stop_kind, self.stop_reason = kind, reason
         if first:
-            self._event("stop", kind=kind, reason=reason)
-            self._out.append(Action("stop", {"kind": kind, "reason": reason}))
+            self.stop_kind, self.stop_reason, self.stop_urgent = kind, reason, False
+            self._event("stop", kind=kind, reason=reason, urgent=urgent)
+        if first or (urgent and not self.stop_urgent):
+            self.stop_urgent = self.stop_urgent or urgent
+            self._out.append(Action("stop", {"kind": kind, "reason": reason, "urgent": urgent, "power": power}))
+
+    def _interrupted(self, t, reason):
+        """A run ended that is still wanted: resume later, a limited number of times."""
+        self.interruptions += 1
+        if self.interruptions > self.cfg.max_resumes:
+            self._set_fault(t, "resume_limit", f"interrupted {self.interruptions} times "
+                            f"(limit {self.cfg.max_resumes}); last: {reason}")
+        else:
+            self.resume = True
+            # Never straight back on: `radarctl stop --wait` (the power
+            # service's hook) must be able to see the radar off.
+            self.retry_at = t + self.cfg.resume_holdoff_s
 
     def _finish(self, t):
         """Decide what follows from the present situation, and report a state change."""
@@ -261,9 +342,9 @@ class ManagerLogic:
         cfg = self.cfg
         if self.phase in (STARTING, RUNNING):
             intent = self.intent or {"source": None, "since": t}
-            block = self._run_block()
+            block, power = self._run_block()
             if block:
-                self._stop(t, "gate", block)
+                self._stop(t, "gate", block, urgent=power, power=power)
             elif (intent["source"] in MANUAL and cfg.manual_timeout_s
                   and t - intent["since"] >= cfg.manual_timeout_s):
                 self._drop_intent()
@@ -275,9 +356,12 @@ class ManagerLogic:
                   and t - self.run_since >= cfg.stable_run_s):
                 self.failures = 0
                 self.interruptions = 0
-        elif self.phase == IDLE and not self.closing:
+        elif self.phase == STOPPING:
+            if self.power_fail and not self.stop_urgent:    # power went while a stop was under way
+                self._stop(t, self.stop_kind, self.stop_reason, urgent=True, power=True)
+        elif not self.closing:
             auto_go = AUTO in cfg.sources and self.auto_state == MOVING and not self.auto_blocked
-            if self.fault and auto_go:
+            if self.fault and auto_go and self.fault["kind"] != AMP_UNSAFE:
                 self._clear_fault(self.auto_label)
             if not self.fault:
                 intent = self.intent
@@ -335,8 +419,6 @@ class ManagerLogic:
             return False, f"the {source} trigger is disabled"
         if self.closing:
             return False, "the manager is stopping"
-        if self.fault:
-            self._clear_fault(source)
         if self.intent:
             if self.intent["source"] == AUTO:
                 self.intent.update(source=source, label=source, since=t)
@@ -344,9 +426,14 @@ class ManagerLogic:
             return True, f"already {self.state}"
         if self.phase == STOPPING:
             return False, "the radar is stopping; try again when ready"
+        if self.fault and self.fault["kind"] == AMP_UNSAFE:
+            return False, (f"fault: {self.fault['reason']} (it clears when the amplifier pin is confirmed safe, "
+                           "or with clear-fault)")
         block = self._start_block()
-        if block:
-            return False, f"not ready: {block}"
+        if block:                       # nothing changes: a fault stays, with its reason
+            return False, f"not ready: {block}" + (f" (fault kept: {self.fault['reason']})" if self.fault else "")
+        if self.fault:
+            self._clear_fault(source)
         self._new_intent(t, source)
         return True, "starting"
 
@@ -366,20 +453,23 @@ class ManagerLogic:
             self._stop(t, "manual", f"stop by {source}")
             return True, "stopping"
         if self.phase == STOPPING:
-            self.stop_kind = "manual"       # a gate-caused stop must not resume afterwards
+            self.stop_kind = "manual"       # an interruption must not resume afterwards
             return True, "already stopping"
         return True, "start cancelled" if had_intent else "not running"
 
     def interrupt(self, t, source, reason):
-        """Stop now but keep the run wanted, as a failing gate does (the power service's stop hook).
+        """Stop now, urgently, but keep the run wanted (the power service's stop hook).
 
         The run resumes once every gate has been good for the hold-off time, counted from now.
         """
         if self.phase in (STARTING, RUNNING):
-            self._stop(t, "gate", reason)
+            self._stop(t, "gate", reason, urgent=True, power=True)
             message = "stopping"
+        elif self.phase == STOPPING:
+            self._stop(t, self.stop_kind, self.stop_reason, urgent=True, power=True)
+            message = "already stopping"
         else:
-            message = "already stopping" if self.phase == STOPPING else "not running"
+            message = "not running"
         if self.gates_good_since is not None:
             self.gates_good_since = t
         self._event("request", request="interrupt", source=source, accepted=True, message=message)
@@ -420,9 +510,15 @@ class ManagerLogic:
         self._finish(t)
 
     def amp_unsafe(self, t, detail):
-        """With no radar running, the amplifier could not be made safe (the tool said ASSUME_ENABLED)."""
-        if self.phase == IDLE and (self.fault or {}).get("kind") != "amp_unsafe":
-            self._set_fault(t, "amp_unsafe", f"the amplifier could not be confirmed safe: {detail}")
+        """With no radar running, the amplifier pin could not be made safe."""
+        if self.phase == IDLE and (self.fault or {}).get("kind") != AMP_UNSAFE:
+            self._set_fault(t, AMP_UNSAFE, f"the amplifier could not be confirmed safe: {detail}")
+        self._finish(t)
+
+    def amp_safe_again(self, t, why):
+        """The record says the amplifier pin is safe: an `amp_unsafe` fault is over."""
+        if self.fault and self.fault["kind"] == AMP_UNSAFE:
+            self._clear_fault(f"the amplifier pin is known safe again: {why}")
         self._finish(t)
 
     def collection_created(self, t, name):
@@ -435,13 +531,15 @@ class ManagerLogic:
         self._finish(t)
 
     def ended(self, t, info):
-        """The run is over: no radar process, amplifier made safe.
+        """The run is over: no radar process, and the amplifier step is done.
 
-        info: requested   the runner was asked to stop (or to abort the start)
-              failure     "" or why the start failed / the radar exited with an error
-              fatal       a retry cannot help (config limits, turn-on check)
-              kind        short name of the failure, used as the fault kind when fatal
-              amp_safe    True, False, or None when no radar process was launched
+        info: requested    the runner was asked to stop (or to abort the start)
+              failure      "" or why the start failed / the radar exited with an error
+              fatal        a retry cannot help (config limits, turn-on check)
+              kind         short name of the failure, used as the fault kind when fatal
+              interrupted  "" or why a radar that runs until stopped is gone, unasked, with status 0
+              amp_safe     True: the pin is known safe; False: it is not;
+                           None: not checked (power loss) or no radar was launched
               amp_safe_detail
         """
         if self.phase == IDLE:
@@ -454,20 +552,12 @@ class ManagerLogic:
         failure = info.get("failure", "")
         if info.get("amp_safe") is False:
             self.last_end = "amplifier not confirmed safe"
-            self._set_fault(t, "amp_unsafe", "the amplifier could not be confirmed safe after the radar "
+            self._set_fault(t, AMP_UNSAFE, "the amplifier could not be confirmed safe after the radar "
                             f"exited: {info.get('amp_safe_detail', '')}".rstrip(": "))
         elif was == STOPPING and info.get("requested", True):
             self.last_end = f"stopped ({self.stop_kind}: {self.stop_reason})"
             if self.stop_kind == "gate" and self.intent:
-                self.interruptions += 1
-                if self.interruptions > cfg.max_resumes:
-                    self._set_fault(t, "resume_limit", f"stopped by a gate {self.interruptions} times "
-                                    f"(limit {cfg.max_resumes}); last: {self.stop_reason}")
-                else:
-                    self.resume = True
-                    # Never straight back on: `radarctl stop --wait` (the power
-                    # service's hook) must be able to see the radar off.
-                    self.retry_at = t + cfg.resume_holdoff_s
+                self._interrupted(t, self.stop_reason)
         elif failure and info.get("fatal"):
             self.last_end = f"failed: {failure}"
             self._set_fault(t, info.get("kind") or "start", failure)
@@ -482,21 +572,27 @@ class ManagerLogic:
                 delay = cfg.retry_delays_s[self.failures - 1]
                 self.retry_at = t + delay
                 self._event("retry", attempt=self.failures + 1, delay_s=delay, after=failure)
+        elif info.get("interrupted"):
+            self.last_end = f"interrupted: {info['interrupted']}"
+            if self.intent:
+                self._interrupted(t, info["interrupted"])
         else:
             self.last_end = "the radar finished by itself"
             if self.intent:
                 self._drop_intent()
                 self._block_auto()
         self.stop_kind = self.stop_reason = ""
+        self.stop_urgent = False
         self._finish(t)
 
     def shutdown(self, t):
-        """The manager is stopping: stop the radar and start nothing new."""
+        """The manager is stopping: stop the radar, urgently, and start nothing new."""
         self.closing = True
         self._drop_intent()
         if self.phase in (STARTING, RUNNING):
-            self._stop(t, "shutdown", "the manager is stopping")
+            self._stop(t, "shutdown", "the manager is stopping", urgent=True)
         elif self.phase == STOPPING:
+            self._stop(t, "shutdown", "the manager is stopping", urgent=True)
             self.stop_kind = "shutdown"
         self._finish(t)
 
@@ -525,13 +621,16 @@ class ManagerLogic:
             "not_ready": self.not_ready_reasons() if (self.results is None or self._start_block()) else [],
             "fault": ({"kind": self.fault["kind"], "reason": self.fault["reason"],
                        "age_s": round(t - self.fault["since"], 1)} if self.fault else None),
+            "last_fault": dict(self.last_fault) if self.last_fault else None,
             "collection": self.collection if self.phase != IDLE else None,
             "last_end": self.last_end,
             "runs_ended": self.runs_ended,
             "retries": {"failed_starts": self.failures, "max_retries": len(self.cfg.retry_delays_s),
                         "retry_in_s": (round(max(0.0, self.retry_at - t), 1)
                                        if self.retry_at is not None else None),
-                        "interruptions": self.interruptions, "max_resumes": self.cfg.max_resumes},
+                        "interruptions": self.interruptions, "max_resumes": self.cfg.max_resumes,
+                        "restarts_last_hour": len([x for x in self.restarts if t - x < 3600.0]),
+                        "max_restarts_per_hour": self.cfg.max_restarts_per_hour},
             "auto": {"enabled": AUTO in self.cfg.sources, "source": self.auto_label,
                      "state": self.auto_state, "blocked": self.auto_blocked},
             "gates": {name: r.as_dict() for name, r in (self.results or {}).items()},

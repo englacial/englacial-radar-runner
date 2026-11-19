@@ -58,13 +58,13 @@ class Env:
             chirp_command=[sys.executable, "generate_chirp.py", "{config}"],
             build_commands=[[sys.executable, "fake_build.py"]],
             radar_command=[sys.executable, "radar.py", "{config_rel}"],
-            start_timeout_s=3.0, stop_timeout_s=1.5, chirp_timeout_s=5.0, build_timeout_s=5.0)
+            start_timeout_s=3.0, stop_timeout_s=1.5, chirp_timeout_s=5.0, build_timeout_s=5.0,
+            urgent_grace_s=0.3, urgent_stop_budget_s=1.0)
         m["data"].update(chunk_max_s=0.4)       # two records per data file
         m["amp_safe"].update(command=[sys.executable, os.path.join(self.orca, "amp_safe.py"), "--timeout", "2"],
                              timeout_s=3.0, confirm_settle_s=0.0, confirm_timeout_s=0.5,
-                             # Most tests count the runs of the tool: "always" makes that one per radar
-                             # exit. The default, "when_needed", has its own tests.
-                             policy="always", retry_s=0.3, idle_enabled_s=0.3, assume_enabled_retries=1)
+                             retry_s=0.3, idle_enabled_s=0.3, assume_enabled_retries=1,
+                             unavailable_retries=1, unavailable_delay_s=0.1)
         m["panel"]["enabled"] = False
         self.sdr(speed=5000, product="USRP B200")
         self._writers = {}
@@ -130,6 +130,10 @@ class Env:
 @pytest.fixture
 def env(tmp_path):
     return Env(tmp_path)
+
+
+# The smallest run settings the tests may use (the real minimums are in logic.MINIMUMS).
+TEST_MINIMUMS = {"retry_delay_s": 0.0, "resume_holdoff_s": 0.0, "stable_run_s": 0.0}
 
 
 class Events:

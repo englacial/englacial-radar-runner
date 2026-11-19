@@ -32,6 +32,7 @@ MANAGER_DEFAULTS = {
         "max_resumes": 5,                       # automatic resumes after a gate stopped the run; then fault
         "resume_holdoff_s": 10.0,               # the gates must have been good for this long before a resume
         "stable_run_s": 300.0,                  # running this long clears the retry and resume counts
+        "max_restarts_per_hour": 12,            # automatic restarts (retries and resumes) in any hour; then fault
     },
 
     "gates": {
@@ -107,30 +108,38 @@ MANAGER_DEFAULTS = {
         # Put in front of the radar command: the radar is killed if the manager dies.
         "launch_prefix": ["/usr/bin/setpriv", "--pdeathsig", "KILL"],
         "start_line": "[START]",            # the radar's own "recording has begun" line
-        "start_timeout_s": 45.0,            # from launch to that line
+        # From launch to that line. The first start after power-up loads the
+        # SDR's firmware and FPGA first: 14 s measured, then about 5 s of set-up.
+        "start_timeout_s": 60.0,
         "stop_timeout_s": 3.0,              # from SIGINT to exit; then SIGKILL
-        "require_usb3": True,               # a radar that reports "Operating over USB 2" is a failed start
+        # An urgent stop (power loss, the manager's own exit): the radar has no
+        # SIGINT handler before its start line, so the stop waits for that line
+        # for at most urgent_grace_s; the radar process is gone, killed if need
+        # be, urgent_stop_budget_s after the stop was asked for.
+        "urgent_grace_s": 1.0,
+        "urgent_stop_budget_s": 3.0,
+        "require_usb3": True,               # after the start line the SDR must be at min_speed_mbps (sysfs)
     },
 
     "data": {
         "chunk_mb": 128.0,                  # the radar starts a new data file at about this size ...
         "chunk_max_s": 300.0,               # ... or after this long, whichever is first
-        "log_part_mb": 32.0,                # the radar output log is split into parts of this size
-        "log_max_mb": 1024.0,               # per collection; beyond it only the radar's file and exit lines are kept
+        "log_part_mb": 32.0,                # the radar's output log is split into parts of this size; all is kept
     },
 
     # Making the amplifier safe (ampsafe.py): the tool that drives the SDR's
-    # amplifier pin to the shutdown level. A command that is missing or not
-    # executable means the radar is never started.
+    # amplifier pin to the shutdown level. It runs only when the pin is not
+    # known to be safe. A command that is missing or not executable means the
+    # radar is never started.
     "amp_safe": {
-        # --timeout is mandatory for the tool; timeout_s, the manager's own limit, must be longer.
-        "command": ["/home/englacial/englacial-radar-runner/tools/sdr_gpio_safe/amp_safe", "--timeout", "14"],
-        "timeout_s": 20.0,                  # the manager kills the command after this
-        # "when_needed": the tool runs only when the pin is not known to be safe
-        # (decided 2026-11-19). "always": also after every radar exit. Every
-        # run of the tool itself enables the amplifier for about 0.3-0.5 s.
-        "policy": "when_needed",
+        # The manager adds "--state-file <state_dir>/sdr-state". --timeout is
+        # mandatory for the tool: 30 s covers a first contact after power-up
+        # (16.7 s measured: firmware 5.9 s, FPGA 8.2 s).
+        "command": ["/home/englacial/englacial-radar-runner/tools/sdr_gpio_safe/amp_safe", "--timeout", "30"],
+        "timeout_s": 40.0,                  # the manager kills the tool after this; must be longer than --timeout
         "assume_enabled_retries": 2,        # immediate retries when the tool says ASSUME_ENABLED (exit 3)
+        "unavailable_retries": 3,           # after a radar exit: retries of NOT_FOUND, BUSY and TIMEOUT ...
+        "unavailable_delay_s": 5.0,         # ... this far apart (the SDR may be coming back after a kill)
         "retry_s": 60.0,                    # with no radar and the state unknown: try the tool this often
         "idle_enabled_s": 5.0,              # enabled current this long with no radar process: run the tool
         # The reading in the telemetry status file that decides, when it is fresh.
@@ -139,8 +148,11 @@ MANAGER_DEFAULTS = {
         "sample_uptime_field": "amp.sample_uptime_s",
         "enabled_current_a": 0.5,           # at or above: enabled (shutdown 0.16 A, enabled about 2.5 A)
         "min_voltage_v": 20.0,              # below: the 28 V rail is off and the current says nothing
-        "confirm_settle_s": 1.0,            # after a radar exit the reading must be this much newer than the exit
-        "confirm_timeout_s": 4.0,           # wait this long for such a reading
+        # A shutdown-current reading counts only if the Pi read it this long
+        # after the last radar or tool run ended: 1 s, plus 1 s because a row is
+        # read later than the ADC measured it.
+        "confirm_settle_s": 2.0,
+        "confirm_timeout_s": 5.0,           # after a radar exit: wait this long for such a reading
     },
 
     "panel": {

@@ -18,21 +18,23 @@ from radar_runner.common.service import Service
 from . import ampsafe, control, gates, logic as L, panel as panel_module
 from .runner import Runner
 
-REPLY_TIMEOUT_S = 5.0
+REPLY_TIMEOUT_S = 1.5       # shorter than radarctl waits for an answer (2 s)
 
 
 class Manager(Service):
     """Radar manager: starts and stops the radar on triggers, behind safety gates."""
     name = "manager"
 
-    def __init__(self, config, *, panel=None, runner=None, gate_list=None, **kw):
+    def __init__(self, config, *, panel=None, runner=None, gate_list=None, minimums=None, **kw):
         super().__init__(config, **kw)
         self.cfg = config["manager"]
         self.interval_s = max(0.01, self.cfg["tick_s"])
         self.max_failures = 100                 # at 10 rounds a second: about 10 s of errors
         self._events_in = queue.Queue()
         self._given = {"panel": panel, "runner": runner, "gates": gate_list}
-        self.logic = L.ManagerLogic(L.LogicConfig.from_config(self.cfg))
+        logic_cfg, refused = L.LogicConfig.from_config(self.cfg, minimums)
+        self.config_warnings += refused
+        self.logic = L.ManagerLogic(logic_cfg)
         self.overrides = gates.Overrides(config["paths"]["state_dir"])
         self.sdr_state = ampsafe.SdrState(config["paths"]["state_dir"])
         self.amp_telemetry = ampsafe.AmpTelemetry(config)
@@ -169,7 +171,8 @@ class Manager(Service):
         if self.logic.phase != L.IDLE or self.logic.closing or self.runner.busy:
             self._enabled_since = None
             return
-        reading, _ = self.amp_telemetry.now()
+        # Shutdown current counts only in a reading newer than the last radar or tool run.
+        reading, _ = self.amp_telemetry.now(self.runner.last_activity_uptime)
         if reading is False:
             if self._enabled_since is None:
                 self._enabled_since = now
@@ -185,6 +188,10 @@ class Manager(Service):
             self._next_tool = now + cfg["retry_s"]
             if self.runner.make_safe(why):
                 self._record({"event": "amp_safe_run", "why": why})
+        # An amp_unsafe fault is over when the record says safe again: a later run
+        # of the tool that succeeded, or a reading that qualified above.
+        if (self.logic.fault or {}).get("kind") == L.AMP_UNSAFE and self.sdr_state.known_safe:
+            self.logic.amp_safe_again(now, self.sdr_state.why())
 
     def _request(self, now, request):
         cmd = request.get("cmd")
@@ -243,7 +250,8 @@ class Manager(Service):
                     self._events_in.put(("runner", "ended", {"requested": False, "failure": str(e),
                                                              "kind": "internal", "amp_safe": None}))
             elif action.kind == "stop":
-                self.runner.stop(action.data.get("reason", ""))
+                self.runner.stop(action.data.get("reason", ""), urgent=bool(action.data.get("urgent")),
+                                 power=bool(action.data.get("power")))
             elif action.kind == "event":
                 self._record(action.data)
         return bool(actions)
@@ -274,12 +282,13 @@ class Manager(Service):
         snap.update({
             # True when no radar process exists and the amplifier has been made safe: `radarctl stop --wait`
             "idle": self.logic.phase == L.IDLE and not radar.get("active") and not self.runner.busy,
+            # True when no radar process exists and none is about to be started: `radarctl stop --wait`
+            "radar_gone": self.runner.radar_gone(),
             "radar": radar,
             "overrides": self.overrides.snapshot(),
             "sdr_state": self.sdr_state.get(),              # "safe" or "unknown" (ampsafe.py)
             "sdr_state_why": self.sdr_state.why(),
             "making_amp_safe": bool(getattr(self.runner, "making_safe", False)),
-            "amp_safe_policy": self.cfg["amp_safe"]["policy"],
             "panel": self.panel.snapshot(),
             "socket": self.socket_path,
             "events": {"file": self.event_log.path, "written": self.event_log.written,
@@ -298,7 +307,7 @@ class Manager(Service):
         self._act()
         self.panel.show(*L.LEDS[L.STOPPING] if self.runner.busy else (L.OFF, L.OFF))
         orca, amp = self.cfg["orca"], self.cfg["amp_safe"]
-        limit = (orca["stop_timeout_s"] + amp["confirm_timeout_s"]
+        limit = (orca["urgent_stop_budget_s"] + amp["confirm_timeout_s"]
                  + amp["timeout_s"] * (1 + max(0, amp["assume_enabled_retries"])) + 15.0)
         deadline = time.monotonic() + limit
         done = False

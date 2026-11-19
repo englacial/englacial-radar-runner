@@ -3,17 +3,22 @@
 # the unit, clean or not, once all its processes are gone, so no radar is alive.
 #
 # If the SDR's amplifier pin is not known to be safe (radar_runner/manager/ampsafe.py:
-# the first line of the state file is not "safe"), run the make-amplifier-safe
-# tool, and record "safe" if it succeeds. That is the case when the manager died
-# or was killed while a radar ran, or when its own attempt failed. After a clean
-# stop the record says "safe" and nothing is done.
+# the first line of the record is not "safe"), and the SDR has been initialised
+# since it was powered (it is not in its boot loader), run the make-amplifier-safe
+# tool. The tool keeps the record itself (--state-file). This is the case when the
+# manager died or was killed while a radar or the tool ran. After a clean stop
+# the record says "safe" and nothing is done.
 #
-#   radar-manager-stop-hook [state file] [tool]
+#   radar-manager-stop-hook [state file] [tool] [sysfs USB directory]
 here=$(dirname "$(readlink -f "$0")")
 state=${1:-/var/lib/radar-runner/user/sdr-state}
 tool=${2:-$here/../tools/sdr_gpio_safe/amp_safe}
+sysfs=${3:-/sys/bus/usb/devices}
 
 [ "$(head -n1 "$state" 2>/dev/null)" = safe ] && exit 0
-"$tool" --timeout 14 || exit $?
-printf 'safe\n%s made safe by the stop hook of radar-manager.service\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    > "$state.tmp" && mv "$state.tmp" "$state"
+for dev in "$sysfs"/*; do
+    [ "$(cat "$dev/idVendor" 2>/dev/null)" = 2500 ] || continue
+    # Boot loader: nothing has initialised the SDR since power-up, its pin floats high.
+    [ "$(cat "$dev/product" 2>/dev/null)" = WestBridge ] && exit 0
+done
+exec "$tool" --timeout 30 --state-file "$state"

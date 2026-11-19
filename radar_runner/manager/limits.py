@@ -22,6 +22,29 @@ How ORCA's YAML is read here
 The limits come from the bench (`~/radar-testbench/pa_bringup/pa_run.py`
 `check_config`, the HIL fixtures and STATUS.md); the numbers are in
 config.py under "limits".
+
+Which field ORCA really uses (checked against sdr/sdr.cpp, sdr/rf_settings.cpp,
+sdr/main.cpp and preprocessing/generate_chirp.py at 6fd9448). The checks follow
+this arithmetic, not the names of the fields:
+
+  * The hardware is set from RF0: rx_rate, tx_rate, freq, lo_offset, gains,
+    bw, antennas (`set_rf_params_single`), and RF0.transmit.
+  * The length of every burst is computed from **RF1**:
+        num_tx_samps = size_t(RF1.tx_rate * CHIRP.tx_duration)
+        num_rx_samps = size_t(RF1.rx_rate * CHIRP.rx_duration)
+    (the Sdr class reads its rates from RF1; main.cpp sizes the buffers from
+    them). On the air the transmit burst therefore lasts
+    num_tx_samps / RF0.tx_rate, and the receive window num_rx_samps /
+    RF0.rx_rate. A record in the data file is num_rx_samps complex float32.
+  * The chirp file is generated at GENERATE.sample_rate and played at
+    RF0.tx_rate: its bandwidth and offset on the air are scaled by
+    RF0.tx_rate / GENERATE.sample_rate. The radar sends the first num_tx_samps
+    samples of the file: a file longer than that is cut off.
+  * The amplifier is enabled while transmit and receive are both active.
+
+So the three rates must be equal (RF1 = RF0, GENERATE.sample_rate =
+RF0.tx_rate), and the chirp must fit in tx_duration; the duty, window and band
+checks are computed from the real burst lengths all the same.
 """
 import copy
 import math
@@ -161,10 +184,31 @@ def _text(config, section, key):
 _CHECKED = (
     ("GPIO", "pwr_amp_pin", _integer), ("GPIO", "pwr_amp_active_low", _boolean),
     ("RF0", "tx_gain", _number), ("RF0", "freq", _number), ("RF0", "transmit", _boolean),
+    ("RF0", "tx_rate", _number), ("RF0", "rx_rate", _number),
+    ("RF1", "tx_rate", _number), ("RF1", "rx_rate", _number),
+    ("GENERATE", "sample_rate", _number), ("GENERATE", "chirp_length", _number),
     ("GENERATE", "chirp_bandwidth", _number), ("GENERATE", "lo_offset_sw", _number),
     ("CHIRP", "tx_duration", _number), ("CHIRP", "rx_duration", _number),
     ("CHIRP", "pulse_rep_int", _number), ("CHIRP", "tx_lead", _number),
 )
+
+
+def burst(config):
+    """The real burst lengths, as ORCA computes them. Returns a dict; raises _Bad.
+
+    tx_samples, rx_samples   samples per pulse (sized from RF1's rates)
+    tx_s, rx_s               their duration on the air (clocked at RF0's rates)
+    """
+    rf0_tx, rf0_rx = _number(config, "RF0", "tx_rate"), _number(config, "RF0", "rx_rate")
+    rf1_tx, rf1_rx = _number(config, "RF1", "tx_rate"), _number(config, "RF1", "rx_rate")
+    tx, rx = _number(config, "CHIRP", "tx_duration"), _number(config, "CHIRP", "rx_duration")
+    if min(rf0_tx, rf0_rx, rf1_tx, rf1_rx) <= 0:
+        raise _Bad("the sample rates in RF0 and RF1 must be positive")
+    if tx <= 0 or rx <= 0:
+        raise _Bad("CHIRP.tx_duration and CHIRP.rx_duration must be positive")
+    tx_samples, rx_samples = int(rf1_tx * tx), int(rf1_rx * rx)     # size_t(double * double), as in main.cpp
+    return {"tx_samples": tx_samples, "rx_samples": rx_samples,
+            "tx_s": tx_samples / rf0_tx, "rx_s": rx_samples / rf0_rx}
 
 
 def check(config, limits):
@@ -214,32 +258,64 @@ def check(config, limits):
         if not _boolean(config, "RF0", "transmit", default=True):
             return "RF0.transmit is false: nothing would be transmitted"
 
-    def duty():
+    def rates():
+        # ORCA sets the hardware from RF0 but sizes every burst from RF1, and
+        # plays the chirp, generated at GENERATE.sample_rate, at RF0.tx_rate.
+        rf0_tx, rf0_rx = _number(config, "RF0", "tx_rate"), _number(config, "RF0", "rx_rate")
+        for name, value, want in (("RF1.tx_rate", _number(config, "RF1", "tx_rate"), rf0_tx),
+                                  ("RF1.rx_rate", _number(config, "RF1", "rx_rate"), rf0_rx)):
+            if value != want:
+                return (f"{name} ({value:g}) differs from RF0's ({want:g}): the radar sizes its bursts "
+                        "from RF1 and clocks them at RF0's rate")
+        generated = _number(config, "GENERATE", "sample_rate")
+        if generated != rf0_tx:
+            return (f"GENERATE.sample_rate ({generated:g}) differs from RF0.tx_rate ({rf0_tx:g}): the chirp "
+                    "would be played at another speed and its band would change")
+
+    def chirp_fits():
         tx = _number(config, "CHIRP", "tx_duration")
+        chirp = _number(config, "GENERATE", "chirp_length")
+        gen = config.get("GENERATE")
+        pulse = _number(config, "GENERATE", "pulse_length") if "pulse_length" in gen else chirp
+        if chirp <= 0:
+            return "GENERATE.chirp_length must be positive"
+        if chirp > pulse:
+            return f"GENERATE.chirp_length {chirp * 1e6:g} us is longer than GENERATE.pulse_length {pulse * 1e6:g} us"
+        if pulse > tx:
+            return (f"GENERATE.pulse_length {pulse * 1e6:g} us is longer than CHIRP.tx_duration {tx * 1e6:g} us: "
+                    "the radar would cut the chirp off")
+
+    def duty():
+        on_air = burst(config)
         pri = _number(config, "CHIRP", "pulse_rep_int")
-        if tx <= 0 or pri <= 0:
-            return "CHIRP.tx_duration and CHIRP.pulse_rep_int must be positive"
-        value = tx / pri
+        if pri <= 0:
+            return "CHIRP.pulse_rep_int must be positive"
+        value = on_air["tx_s"] / pri
         if value > limits["max_enable_duty"]:
-            return (f"amplifier enable duty {value:.3f} (tx_duration / pulse_rep_int) is above the cap "
-                    f"of {limits['max_enable_duty']:g}")
+            return (f"amplifier enable duty {value:.3f} (transmit burst of {on_air['tx_s'] * 1e6:g} us every "
+                    f"{pri * 1e6:g} us) is above the cap of {limits['max_enable_duty']:g}")
 
     def window():
-        tx = _number(config, "CHIRP", "tx_duration")
-        rx = _number(config, "CHIRP", "rx_duration")
+        on_air = burst(config)
         lead = _number(config, "CHIRP", "tx_lead")
-        if rx < tx:
-            return (f"CHIRP.rx_duration {rx * 1e6:g} us is shorter than CHIRP.tx_duration {tx * 1e6:g} us: "
-                    "the amplifier is enabled only while both transmit and receive are active")
-        if lead < 0 or lead >= tx:
-            return f"CHIRP.tx_lead {lead * 1e6:g} us must be between 0 and tx_duration"
+        if on_air["rx_s"] < on_air["tx_s"]:
+            return (f"the receive window ({on_air['rx_s'] * 1e6:g} us) is shorter than the transmit burst "
+                    f"({on_air['tx_s'] * 1e6:g} us): the amplifier is enabled only while both are active")
+        if lead < 0 or lead >= on_air["tx_s"]:
+            return f"CHIRP.tx_lead {lead * 1e6:g} us must be between 0 and the transmit burst length"
 
     def band():
-        centre = _number(config, "RF0", "freq") + _number(config, "GENERATE", "lo_offset_sw")
+        generated, played = _number(config, "GENERATE", "sample_rate"), _number(config, "RF0", "tx_rate")
         width = _number(config, "GENERATE", "chirp_bandwidth")
-        if width <= 0:
-            return "GENERATE.chirp_bandwidth must be positive"
-        low, high = centre - width / 2, centre + width / 2
+        offset = _number(config, "GENERATE", "lo_offset_sw")
+        if width <= 0 or generated <= 0 or played <= 0:
+            return "GENERATE.chirp_bandwidth and the sample rates must be positive"
+        if abs(offset) + width / 2 > generated / 2:
+            return (f"the chirp ({(offset - width / 2) / 1e6:g} to {(offset + width / 2) / 1e6:g} MHz at baseband) "
+                    f"does not fit in the sample rate of {generated / 1e6:g} MHz: it would alias")
+        scale = played / generated              # the chirp file is played at RF0.tx_rate
+        centre = _number(config, "RF0", "freq") + offset * scale
+        low, high = centre - width * scale / 2, centre + width * scale / 2
         if low < limits["min_freq_hz"] or high > limits["max_freq_hz"]:
             return (f"chirp band {low / 1e6:g}-{high / 1e6:g} MHz is outside the allowed "
                     f"{limits['min_freq_hz'] / 1e6:g}-{limits['max_freq_hz'] / 1e6:g} MHz")
@@ -263,15 +339,14 @@ def check(config, limits):
             return "CHIRP.num_pulses must be -1 (until stopped) or positive"
         if presums < 1:
             return "CHIRP.num_presums must be at least 1"
-        _number(config, "RF0", "rx_rate")       # needed for the data chunk size
 
     def files():
         for section, key in (("FILES", "chirp_loc"), ("FILES", "save_loc"), ("FILES", "gps_loc"),
                              ("GENERATE", "out_file")):
             _text(config, section, key)
 
-    for fn in (amp_pin, amp_low, bank, gain, channels, transmit, duty, window, band, clock, formats,
-               pulses, files):
+    for fn in (amp_pin, amp_low, bank, gain, channels, transmit, rates, chirp_fits, duty, window, band, clock,
+               formats, pulses, files):
         rule(fn)
     return problems
 
@@ -306,10 +381,13 @@ CHIRP_FILE, DATA_FILE, GPS_FILE = "chirp.bin", "rx_samps.bin", "gps_log.txt"
 
 
 def record_bytes(config):
-    """Size of one record in the data file: complex float32 per receive sample."""
-    # The radar computes: size_t num_rx_samps = rx_rate * rx_duration
-    samples = int(_number(config, "RF0", "rx_rate") * _number(config, "CHIRP", "rx_duration"))
-    return samples * 8
+    """Size of one record in the data file: num_rx_samps complex float32, sized as the radar sizes it."""
+    return burst(config)["rx_samples"] * 8
+
+
+def continuous(config):
+    """True if the radar runs until it is stopped (CHIRP.num_pulses < 0)."""
+    return _integer(config, "CHIRP", "num_pulses") < 0
 
 
 def pulses_per_file(config, chunk_bytes, chunk_max_s):
@@ -341,6 +419,8 @@ def derive(config, output_dir, max_chirps_per_file):
             if reader is _boolean and key not in out.get(section, {}):
                 continue                        # optional in ORCA; `check` knows its default
             out[section][key] = reader(out, section, key)
+        if "pulse_length" in out["GENERATE"]:
+            out["GENERATE"]["pulse_length"] = _number(out, "GENERATE", "pulse_length")
         _get(out, "FILES", "save_loc")
         _get(out, "GENERATE", "out_file")
     except _Bad as e:

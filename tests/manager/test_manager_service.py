@@ -21,6 +21,7 @@ from radar_runner.manager.panel import Panel
 from radar_runner.manager.service import Manager
 
 REPO = common_config.REPO
+TEST_MINIMUMS = {"retry_delay_s": 0.0, "resume_holdoff_s": 0.0, "stable_run_s": 0.0}
 
 
 class Running:
@@ -28,7 +29,7 @@ class Running:
 
     def __init__(self, env, panel=None):
         self.env = env
-        self.manager = Manager(env.config, panel=panel)
+        self.manager = Manager(env.config, panel=panel, minimums=TEST_MINIMUMS)
         self.result = None
         self._feeder_stop = threading.Event()
         self._feeder = threading.Thread(target=self._feed, daemon=True)

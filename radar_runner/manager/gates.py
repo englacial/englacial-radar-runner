@@ -332,6 +332,14 @@ class AmpSafeGate:
             return GateResult(start="the make-amplifier-safe command is not configured (manager.amp_safe.command)")
         if not (os.path.isfile(command[0]) and os.access(command[0], os.X_OK)):
             return GateResult(start=f"the make-amplifier-safe command {command[0]} is not an executable file")
+        # The tool's own --timeout is mandatory, and the manager must not kill the tool before it.
+        try:
+            tool_timeout = float(command[command.index("--timeout") + 1])
+        except (ValueError, IndexError):
+            return GateResult(start="the make-amplifier-safe command needs --timeout N (manager.amp_safe.command)")
+        if self.cfg["timeout_s"] <= tool_timeout:
+            return GateResult(start=f"manager.amp_safe.timeout_s ({self.cfg['timeout_s']:g} s) must be longer than "
+                                    f"the tool's --timeout ({tool_timeout:g} s)")
         return GateResult()
 
 
