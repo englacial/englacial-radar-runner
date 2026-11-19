@@ -717,6 +717,24 @@ def _(name):
           'USBAUTO="true": a replugged receiver is added by udev and gpsdctl')
 
 
+def gps_identification(devices):
+    """(status, observed) for gpsd's identification of the receiver, from its DEVICES report.
+
+    gpsd switches on the receiver's position messages only after it has identified it from its
+    version reply; on 2026-11-19 it had not, after a power cut, and delivered no position for 77
+    minutes (setup/gps_receiver.py).
+    """
+    if devices is None:
+        return SKIP, "gpsd did not send its list of devices"
+    if not devices:
+        return SKIP, "gpsd has no receiver"
+    missing = [d.get("path") for d in devices if not (d.get("subtype") or d.get("subtype1"))]
+    if missing:
+        return FAIL, (f"gpsd has not identified {', '.join(map(str, missing))}, so it gets no position "
+                      "(setup/gps_receiver.py --apply --ram asks the receiver for its version)")
+    return PASS, "; ".join(str(d.get("subtype1") or d.get("subtype")) for d in devices)
+
+
 @item("GPS receiver")
 def _(name):
     present = os.path.exists(GPS_DEVICE)
@@ -738,6 +756,7 @@ def _(name):
                     break
     except OSError as e:
         report(FAIL, name + " known to gpsd", f"cannot ask gpsd: {e}")
+        report(SKIP, name + " identified by gpsd", "cannot ask gpsd")
         return
     paths = [d.get("path") for d in devices or []]
     tpv = (reply.get("tpv") or [{}])[0]
@@ -746,6 +765,8 @@ def _(name):
     check(name + " known to gpsd, once", len(paths) == 1 and reply.get("active") == 1,
           f"{len(paths)} device(s) {paths}, {reply.get('active', 0)} active; fix mode {tpv.get('mode')}, time {tpv.get('time')}",
           "exactly 1 device, active")
+    status, observed = gps_identification(devices)
+    report(status, name + " identified by gpsd", observed)
     report(INFO, name + " fix", {2: "2D fix", 3: "3D fix"}.get(tpv.get("mode"), "no position fix (chrony gets GPS time only with a fix)"))
 
 

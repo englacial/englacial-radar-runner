@@ -225,6 +225,23 @@ below that contradicts it):
   `setup/gps_receiver.py --apply --ram` 20 s after every start of gpsd, as user englacial, and
   does not restart gpsd. The telemetry service runs the same command about 15 s after every
   OLA start (`telemetry.gps.receiver_fix_command`; "" switches that off).
+- Added the same evening: at the first boot after a power cut of several minutes gpsd delivered
+  no position for 77 minutes (TPV mode 0, chrony's GPS source never reached) while the receiver
+  had a 3D fix. gpsd had not identified the receiver (empty `subtype` in `?DEVICES;`) and had
+  not switched on its position messages; `ubxtool -P 27.50 -p MON-VER` by hand made gpsd
+  identify and configure it at once. Inferred from this one occurrence, not proven: gpsd's
+  version request at its start went unanswered and gpsd does not ask again.
+  `setup/gps_receiver.py --apply` now asks for the version itself when gpsd has not identified
+  the receiver, waits up to 20 s for the identification and 10 s for gpsd's configuration, and
+  only then checks the UART1 setting (gpsd's configuration is what sets it back to 1). Exit
+  status 2 means still not identified; `radar-gps-receiver.service` (`Restart=on-failure`) then
+  runs it again about once a minute (20 s restart delay, 20 s wait, the run). The telemetry
+  service reports a receiver without a position (`sources.gps.no_position`,
+  `radar_runner/telemetry/README.md`) and runs the command again at 2, 6, 14 and 30 minutes
+  without a position, then every 30 minutes. `setup/check.py` fails when gpsd has a receiver
+  that it has not identified. **To do on the bench:** a cold boot
+  after several minutes without power, to see whether gpsd identifies the receiver by itself
+  and, if not, that the service's run recovers it.
 
 - **What:** a drop-in for `gpsd.service` that replaces its command line with
   `gpsd -n /dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver-if00`

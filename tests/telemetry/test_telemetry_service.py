@@ -618,6 +618,115 @@ def test_receiver_correction_runs_once_after_each_ola_start(tmp_path):
     assert marker.read_text() == "x\nx\n"
 
 
+def retry_bench(tmp_path, command, **kw):
+    """A started bench whose receiver command is `command`, with short no-position waits."""
+    settings = dict(gps__no_position_warn_s=10.0, gps__no_position_retry_s=20.0, gps__no_position_retry_max_s=80.0)
+    bench = Bench(tmp_path, gps__receiver_fix_command=command, **dict(settings, **kw))
+    bench.keep_streaming(700)
+    started(bench, 40)                       # the OLA start's run of the command is over by now
+    wait_for_command(bench)
+    assert bench.service._fix["last_why"] == "the OLA has just started"
+    return bench
+
+
+def wait_for_command(bench):
+    if bench.service._fix_proc is not None:
+        bench.service._fix_proc.wait(timeout=10)
+    bench.run(0.25)                          # the next round picks up its exit status
+
+
+def run_watching_starts(bench, seconds):
+    """Run in simulated time; return the reasons the receiver command was started for."""
+    starts = []
+    for _ in range(int(seconds)):
+        runs = bench.service._fix["runs"]
+        bench.run(1)
+        if bench.service._fix["runs"] != runs:
+            starts.append(bench.service._fix["last_why"])
+            wait_for_command(bench)
+    return starts
+
+
+def test_gpsd_without_identification_is_reported_and_the_command_retried_with_growing_waits(tmp_path, caplog):
+    caplog.set_level("INFO")
+    marker = tmp_path / "ran"
+    bench = retry_bench(tmp_path, f"/bin/sh -c 'echo x >> {marker}; exit 2'")
+    gps = bench.snap()["sources"]["gps"]
+    assert gps["health"] == "ok" and gps["receiver_identified"] is True and gps["no_position"] == ""
+    assert gps["receiver_check"] == {"runs": 1, "running": False, "last_status": 2, "last_why": "the OLA has just started",
+                                     "next_retry_at_no_position_s": None}
+    # What 2026-11-19 looked like: gpsd has the receiver, fix times come, but mode 0 and no position.
+    conn = bench.gpsd.connections[-1]
+    conn.devices[0].update(subtype="", subtype1="")
+    conn.tpv.update(mode=0, lat=None, lon=None)
+    bench.run(8)
+    gps = bench.snap()["sources"]["gps"]
+    assert gps["health"] == "ok" and gps["reason"] == "no position fix" and gps["no_position"] == ""
+    assert gps["receiver_identified"] is False and 7 <= gps["no_position_s"] <= 9
+    bench.run(4)
+    data = bench.snap()
+    gps = data["sources"]["gps"]
+    assert gps["health"] == "error" and gps["no_position"] == "gpsd_unidentified" and "gps: error" in data["problems"]
+    assert "gpsd has not identified the receiver: no position for 1" in gps["reason"]
+    assert caplog.text.count("GPS: gpsd has a receiver but no position for") == 1
+    assert "gpsd has not identified the receiver, so it has not switched on the position messages" in caplog.text
+    # Retried at 20 s without a position, then after 40, 80, 80 s (the maximum).
+    starts = run_watching_starts(bench, 225)
+    assert starts == [f"no position for {s} s" for s in (20, 60, 140, 220)]
+    assert marker.read_text() == "x\n" * 5
+    check = bench.snap()["sources"]["gps"]["receiver_check"]
+    assert check["runs"] == 5 and check["last_status"] == 2 and check["last_why"].startswith("no position for 2")
+    assert 290 <= check["next_retry_at_no_position_s"] <= 310
+    assert "GPS receiver check finished with status 2 (gpsd has not identified the receiver)" in caplog.text
+    assert caplog.text.count("GPS: gpsd has a receiver but no position for") == 1      # warned once
+    # gpsd identifies the receiver and the positions follow.
+    conn.devices = [dict(conn.devices[0], subtype="SW EXT CORE 1.00", subtype1="PROTVER=27.50,MOD=ZED-F9P")]
+    conn.tpv.update(mode=3, lat=40.0, lon=-120.0)
+    assert run_watching_starts(bench, 12) == []
+    data = bench.snap()
+    gps = data["sources"]["gps"]
+    assert gps["health"] == "ok" and gps["reason"] == "" and gps["no_position"] == "" and data["problems"] == []
+    assert gps["receiver_identified"] is True and gps["receiver_check"]["next_retry_at_no_position_s"] is None
+    assert "GPS: position again, after 2" in caplog.text
+    assert run_watching_starts(bench, 300) == []
+
+
+def test_no_satellites_is_not_called_a_gpsd_fault_and_the_retry_is_harmless(tmp_path, caplog):
+    caplog.set_level("INFO")
+    bench = retry_bench(tmp_path, "/bin/true")
+    conn = bench.gpsd.connections[-1]
+    conn.tpv.update(mode=1, lat=None, lon=None)     # identified, but no fix: an antenna indoors
+    starts = run_watching_starts(bench, 70)
+    gps = bench.snap()["sources"]["gps"]
+    assert gps["health"] == "ok" and gps["reason"].startswith("no position fix for 7")
+    assert gps["no_position"] == "no_fix" and gps["receiver_identified"] is True
+    assert "gpsd has identified the receiver, so most likely it has no satellites" in caplog.text
+    assert len(starts) == 2 and gps["receiver_check"]["last_status"] == 0
+    # gpsd going away ends the count without a position, and it starts again.
+    conn.eof = True
+    bench.run(2)
+    assert "GPS: no position for 7" in caplog.text and "counted again from now" in caplog.text
+    assert bench.snap()["sources"]["gps"]["no_position"] == ""
+
+
+def test_receiver_command_that_hangs_is_stopped(tmp_path, caplog):
+    caplog.set_level("INFO")
+    bench = Bench(tmp_path, gps__receiver_fix_command="/bin/sleep 60", gps__receiver_fix_timeout_s=5.0)
+    svc = bench.service
+    svc._start_fix(0.0, "test")
+    svc._reap_fix(4.0)
+    assert svc._fix_proc is not None and svc._fix["running"]
+    svc._reap_fix(6.0)
+    assert svc._fix_proc is None and svc._fix["last_status"] == -9 and not svc._fix["running"]
+    assert "GPS receiver check still running after 5 s: stopped" in caplog.text
+
+
+def test_no_position_defaults():
+    gps = C.DEFAULTS["telemetry"]["gps"]
+    assert (gps["no_position_warn_s"], gps["no_position_retry_s"], gps["no_position_retry_max_s"]) == (60.0, 120.0, 1800.0)
+    assert gps["receiver_fix_timeout_s"] == 180.0
+
+
 def test_boot_number_comes_from_the_counter_and_the_existing_directories(tmp_path):
     config = copy.deepcopy(C.DEFAULTS)
     for d in ("run", "state", "drive/telemetry/b00041", "card"):

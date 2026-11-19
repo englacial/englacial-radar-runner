@@ -91,9 +91,18 @@ DEFAULTS = {
             "answer_timeout_s": 10.0,            # no answer from gpsd for this long: reconnect
             "reconnect_s": 5.0,
             "no_data_error_s": 30.0,             # receiver present but no fix time for this long: error
-            # Run a little after every OLA start ("" = never): see setup/gps_receiver.py
+            # Run a little after every OLA start and without a position ("" = never): see setup/gps_receiver.py
             "receiver_fix_command": "/usr/bin/python3 -B /home/englacial/englacial-radar-runner/setup/gps_receiver.py --apply --ram",
             "receiver_fix_delay_s": 15.0,
+            "receiver_fix_timeout_s": 180.0,     # the command is stopped after this (it limits itself to about 120 s)
+            # gpsd has a receiver but no 2D/3D fix for this long: a warning, and the status says why
+            # (sources.gps.no_position); "gpsd_unidentified" is an error. 60 s: a cold start under
+            # open sky takes about 25 s (data sheet).
+            "no_position_warn_s": 60.0,
+            # Then the receiver command is run again: after this long without a position, then after
+            # twice the previous wait each time, up to the maximum (2, 6, 14, 30 min, then every 30 min).
+            "no_position_retry_s": 120.0,
+            "no_position_retry_max_s": 1800.0,
         },
     },
     # The safety watcher (radar_runner/watcher/README.md, which says where each number comes from).

@@ -80,9 +80,21 @@ telemetry:
     no_data_error_s: 30.0     # receiver present but no fix time for this long: reported as an error
     # Each time the OLA starts it turns NMEA output on the receiver's unused UART1 back on, which
     # overflows the receiver's transmit buffer at 10 Hz. This command turns it off again (in the
-    # receiver's RAM, through gpsd) a little after every OLA start. "" = never run it.
+    # receiver's RAM, through gpsd) a little after every OLA start, and when there is no position
+    # (below). "" = never run it.
     receiver_fix_command: "/usr/bin/python3 -B /home/englacial/englacial-radar-runner/setup/gps_receiver.py --apply --ram"
     receiver_fix_delay_s: 15.0
+    receiver_fix_timeout_s: 180.0   # the command is stopped after this (it limits itself to about 120 s)
+    # gpsd has a receiver but no 2D/3D fix for this long: a warning, and the status says why
+    # (sources.gps.no_position); "gpsd_unidentified" is an error. 60 s: a cold start under open
+    # sky takes about 25 s (data sheet).
+    no_position_warn_s: 60.0
+    # Then the receiver command is run again (the same one; it asks for the receiver's version if
+    # gpsd has not identified it, and is harmless without satellites): after this long without a
+    # position, then after twice the previous wait each time, up to the maximum (at 2, 6, 14 and
+    # 30 min, then every 30 min).
+    no_position_retry_s: 120.0
+    no_position_retry_max_s: 1800.0
 
 # Safety watcher: stops the radar and resets the SDR GPIO on unsafe amplifier readings.
 # The rules, and where each number comes from: radar_runner/watcher/README.md
