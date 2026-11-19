@@ -229,7 +229,9 @@ def test_check_script_runs_and_reports_every_item():
                  "GPS receiver on USB", "GPS receiver known to gpsd, once", "radar-telemetry.service unit file",
                  "sensor log directory on the data drive", "telemetry status file", "chrony package",
                  "fake-hwclock package", "systemd-timesyncd removed", "chrony.service",
-                 "chrony steps the clock at any time", "fake-hwclock units", "fake-hwclock saves"):
+                 "chrony steps the clock at any time", "fake-hwclock units", "fake-hwclock saves",
+                 # stage 3
+                 "radar-watcher.service unit file", "SDR GPIO reset tool", "safety watcher status file"):
         assert name in r.stdout, name
 
 

@@ -87,7 +87,8 @@ telemetry:
 # Safety watcher: stops the radar and resets the SDR GPIO on unsafe amplifier readings.
 # The rules, and where each number comes from: radar_runner/watcher/README.md
 watcher:
-  loop_interval_s: 0.25       # how often everything is looked at and /run/radar-runner/user/watcher.json rewritten
+  loop_interval_s: 0.5        # how often everything is looked at and /run/radar-runner/user/watcher.json rewritten
+                              # (the telemetry service publishes a new reading every 0.5 s)
   radar_exe: /home/englacial/orca/sdr/build/radar   # a process with this executable is a radar process
   telemetry_status_file: telemetry.json       # the telemetry service's status: a file name in paths.run_dir, or a full path
   # The next two and reset.state_file: a file name in paths.state_dir, or a full path.

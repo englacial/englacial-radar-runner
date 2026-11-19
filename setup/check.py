@@ -832,6 +832,67 @@ def _(name):
           d.get("boot_count_problem") or f"boot {d.get('boot_count')}")
 
 
+section("setup.sh: safety watcher")
+
+
+@item("radar-watcher.service unit file")
+def _(name):
+    mine = read(os.path.join(REPO, "systemd", "radar-watcher.service"))
+    theirs = read("/etc/systemd/system/radar-watcher.service")
+    check(name, theirs is not None and mine == theirs,
+          "not installed" if theirs is None else "identical to systemd/radar-watcher.service" if mine == theirs
+          else "differs from systemd/radar-watcher.service")
+    enabled, active = unit_state("radar-watcher.service")
+    check("radar-watcher.service", (enabled, active) == ("enabled", "active"), f"{enabled}, {active}",
+          "enabled, active (stopped by hand for bench work? see radar_runner/watcher/README.md)")
+
+
+@item("SDR GPIO reset tool")
+def _(name):
+    tool_dir = os.path.join(REPO, "tools", "sdr_gpio_safe")
+    missing = [rel for rel in ("amp_safe", os.path.join("build", "sdr_gpio_safe"))
+               if not os.access(os.path.join(tool_dir, rel), os.X_OK)]
+    check(name, not missing, f"missing or not executable in tools/sdr_gpio_safe: {', '.join(missing)}" if missing
+          else "tools/sdr_gpio_safe/amp_safe and build/sdr_gpio_safe are there",
+          "built (tools/sdr_gpio_safe/README.md): without it an amplifier left enabled cannot be shut down")
+
+
+@item("safety watcher status file")
+def _(name):
+    r = status_files.read_status(status_files.status_path("watcher"), 5.0)
+    if not r.ok:
+        report(FAIL, name, f"{r.state}: {r.error}")
+        return
+    d = r.data
+    amp = d.get("amp") or {}
+    check(name, True, f"fresh ({r.age_s:.1f} s old): amplifier {amp.get('temp_c')} C, case {amp.get('case_temp_c')} C, "
+          f"{amp.get('current_a')} A, {amp.get('voltage_v')} V")
+    check("safety watcher says the radar may run", d.get("ok") is True and d.get("tripped") is False,
+          "ok" if d.get("ok") is True else f"NOT OK{' (TRIPPED)' if d.get('tripped') else ''}: {d.get('reason')}",
+          "ok: true, tripped: false")
+    warnings = [w.get("text", "?") for w in d.get("warnings") or []]
+    check("safety watcher warnings", not warnings, "; ".join(warnings) or "none")
+    for problem in d.get("config_warnings") or []:
+        report(FAIL, "safety watcher settings", problem)
+    tool = d.get("reset_tool") or {}
+    check("reset tool as the watcher will run it", tool.get("runnable") is True, f"{tool.get('command')}: "
+          + ("can be run" if tool.get("runnable") is True else "missing or not executable"))
+    last = tool.get("last")
+    report(INFO, "last reset tool run by the watcher", "none since the watcher started" if not last else
+           f"{last.get('time_utc')}: {last.get('name')} (exit {last.get('code')})")
+    events = d.get("events") or {}
+    check("safety watcher event log", not events.get("error") and not events.get("dropped"),
+          f"{events.get('file')}: " + (events.get("error") or f"{events.get('written')} written, {events.get('dropped')} dropped"))
+    loop = d.get("loop") or {}
+    check("safety watcher loop runs evenly", loop.get("longest_gap_s", 99) <= 2.0,
+          f"longest gap between rounds since it started: {loop.get('longest_gap_s')} s", "2 s or less")
+    override = (d.get("override") or {}).get("no_amp_telemetry")
+    report(INFO, "override: run without amplifier telemetry", "SET" if override else "not set")
+    counters = d.get("counters") or {}
+    report(INFO, "safety watcher since it started", ", ".join(f"{k} {counters.get(k)}" for k in (
+        "trips", "telemetry_losses", "tool_runs", "radar_sigint", "radar_sigkill", "stalls")))
+
+
 section("setup.sh: time (chrony, fake-hwclock)")
 
 

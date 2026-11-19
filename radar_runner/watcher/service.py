@@ -1,6 +1,6 @@
 """The safety watcher service: reads the inputs, carries out what the logic decides, publishes.
 
-One process and one loop (radar_runner/common/service.py), four rounds a second.
+One process and one loop (radar_runner/common/service.py), two rounds a second.
 Every round reads the telemetry status file and the power service's status
 file, looks whether the override file exists, lists the radar processes from
 /proc, and passes all of that to the logic (logic.py). Nothing in a round

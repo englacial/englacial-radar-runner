@@ -41,6 +41,8 @@ DATA_ROOT=/mnt/nvme/radar-runner                     # telemetry.data_root
 DESTDIR=${DESTDIR:-}
 OLA_PORT_DEFAULT=/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0     # telemetry.ola.port
 if [ -n "$DESTDIR" ]; then OLA_PORT=${OLA_PORT:-$OLA_PORT_DEFAULT}; else OLA_PORT=$OLA_PORT_DEFAULT; fi   # tests point it elsewhere
+RADAR_EXE_DEFAULT=/home/englacial/orca/sdr/build/radar                # watcher.radar_exe
+if [ -n "$DESTDIR" ]; then RADAR_EXE=${RADAR_EXE:-$RADAR_EXE_DEFAULT}; else RADAR_EXE=$RADAR_EXE_DEFAULT; fi  # tests point it elsewhere
 [ -n "$DESTDIR" ] || PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 DRY_RUN=0
@@ -515,6 +517,66 @@ step_telemetry_service() {
     esac
 }
 
+radar_process() {       # PID of a running radar (a process whose executable is the ORCA radar binary); nothing if none
+    local exe link pid
+    exe=$(readlink -f "$RADAR_EXE" 2>/dev/null || true)
+    [ -n "$exe" ] || return 0
+    link=$(find /proc/[0-9]*/exe -maxdepth 0 \( -lname "$exe" -o -lname "$exe (deleted)" \) 2>/dev/null | head -1 || true)
+    [ -n "$link" ] || return 0
+    pid=${link#/proc/}
+    printf '%s\n' "${pid%%/*}"
+}
+
+# (k) The safety watcher: the unit. It opens no device and needs no directory
+# of its own (status in /run/radar-runner/user, event log in
+# /var/lib/radar-runner/user, both made by the directories step). It is safe to
+# run without the radar manager. A running watcher is never restarted or stopped.
+step_watcher_service() {
+    step "Safety watcher unit"
+    local unit=/etc/systemd/system/radar-watcher.service enabled active radar
+    [ "$REPO" = "$UNIT_REPO" ] || [ -n "$DESTDIR" ] ||
+        die "the unit file expects this repository at $UNIT_REPO, but it is at $REPO"
+    [ -n "$DESTDIR" ] || [ -x "$REPO/.venv/bin/python" ] ||
+        die "the Python environment is missing: run setup/build_venv.sh as $SERVICE_USER first"
+    if [ -x "$REPO/tools/sdr_gpio_safe/build/sdr_gpio_safe" ]; then
+        ok "the SDR GPIO reset tool is built (tools/sdr_gpio_safe/build/sdr_gpio_safe)"
+    else
+        note "the SDR GPIO reset tool is NOT built: the watcher will run, but it cannot put an amplifier that was"
+        note "left enabled back into shutdown. Build it as $SERVICE_USER (tools/sdr_gpio_safe/README.md, \"Build\")."
+    fi
+    put_file "$REPO/systemd/radar-watcher.service" "$unit" 0644
+    [ "$CHANGED" -eq 0 ] || RELOAD_NEEDED=1
+    enabled=$(systemctl is-enabled radar-watcher.service 2>/dev/null || true)
+    active=$(systemctl is-active radar-watcher.service 2>/dev/null || true)
+    if [ "$CHANGED" -eq 1 ] && [ "$active" = active ]; then
+        note "the running service keeps the old unit until it is restarted: systemctl restart radar-watcher"
+    fi
+    case "$enabled" in
+        enabled)
+            if [ "$active" = active ]; then
+                ok "radar-watcher.service is enabled and running (not restarted)"
+            else
+                note "radar-watcher.service is enabled but ${active:-not running}: left as it is."
+                note "to start it: systemctl start radar-watcher"
+            fi ;;
+        masked)
+            note "radar-watcher.service is masked: left as it is" ;;
+        *)
+            log "           radar-watcher.service is ${enabled:-not enabled}, ${active:-not running}"
+            # Once it runs it stops every radar process while its status is not ok, and resets the SDR GPIO
+            # when the amplifier draws enabled current with no radar: never start that under a bench run.
+            radar=$(radar_process)
+            [ -z "$radar" ] || die "a radar process is running now (pid $radar, $RADAR_EXE)
+       The safety watcher was not enabled or started: it stops any radar process while its own status is not ok
+       (for example while the telemetry service is stopped for bench work).
+       Let that run finish, then run setup again. Bench work with the watcher installed: radar_runner/watcher/README.md"
+            note "from now on a radar started outside the radar manager (pa_run.py, the HIL harness) is stopped"
+            note "whenever the watcher's status is not ok (radar_runner/watcher/README.md: \"Bench work\")"
+            reload_systemd
+            run systemctl enable --now radar-watcher.service ;;
+    esac
+}
+
 # (j) Time. chrony takes time from gpsd and, when the internet is up, from
 # NTP; fake-hwclock saves the clock every minute and at shutdown and restores
 # it at boot (the Pi's clock has no battery). Both replace systemd-timesyncd,
@@ -700,6 +762,7 @@ step_watchdog
 step_power_service
 step_gpsd
 step_telemetry_service
+step_watcher_service
 [ "$OPT_NVME" -eq 0 ] || optional_nvme_by_label
 [ "$OPT_HOLD" -eq 0 ] || optional_hold_packages
 step_time           # last: the only step that needs the internet

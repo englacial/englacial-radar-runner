@@ -5,12 +5,12 @@ two systems, or to undo a change. Add each new system change here when it is mad
 
 Reference host: `englacial-radar-1`, Raspberry Pi 5, Ubuntu 24.04.5 LTS, kernel
 `6.8.0-1068-raspi`, systemd 255. Written 2026-11-18 (stage 0); sections 11-13
-added 2026-11-19 (stage 2).
+added 2026-11-19 (stage 2); section 14 added 2026-11-19 (stage 3).
 
 ```
 setup/setup.sh --dry-run     # show what would change; no root needed
 tmux                         # a dropped SSH session must not interrupt the next command
-sudo setup/setup.sh          # apply sections 1-13; safe to run again, also after an interruption
+sudo setup/setup.sh          # apply sections 1-14; safe to run again, also after an interruption
 sudo reboot                  # logind and journald read their files at boot
 setup/check.py               # one PASS/FAIL line per item below
 ```
@@ -18,7 +18,7 @@ setup/check.py               # one PASS/FAIL line per item below
 The script only writes files that this project owns (copied from
 `setup/files/`, same path as on the system), so reverting a change is deleting
 its file. It never touches network configuration or SSH, never restarts or
-stops the power service or the telemetry service, and never reboots. Its one
+stops the power service, the telemetry service or the safety watcher, and never reboots. Its one
 Tailscale change is section 5. Its one package change is section 13 (chrony
 and fake-hwclock in place of systemd-timesyncd), which is the last step and the
 only one that needs the internet. It restarts gpsd (section 11) and chrony
@@ -413,6 +413,35 @@ after an OLA reset (ZED-F9P, HPG 1.51, protocol 27.50):
   `sudo systemctl daemon-reload`.
 - **An alternative in hardware:** a clock battery on the Pi 5's J5 connector
   would keep the right time across power-offs and make fake-hwclock a fallback.
+
+### 14. Safety watcher
+
+- **What:** `systemd/radar-watcher.service` copied to `/etc/systemd/system/`,
+  enabled and started if it is not enabled yet. A running watcher is never
+  restarted or stopped; one that was stopped by hand stays stopped. It needs no
+  directory of its own: its status file goes to `/run/radar-runner/user`, its
+  event log to `/var/lib/radar-runner/user` (item 1). If a radar process
+  (`~/orca/sdr/build/radar`) is running, the script stops there and does not
+  enable or start the watcher: it would stop that radar if its status is not ok.
+  The script says whether the SDR GPIO reset tool is built; it does not build it
+  (`tools/sdr_gpio_safe/README.md`, "Build", as user `englacial`).
+- **Why and how it works:** `radar_runner/watcher/README.md`. It runs with
+  `Nice=-5` and `OOMScoreAdjust=-900` so that it keeps running on a busy Pi, and
+  with `KillMode=process` so that systemd never kills a reset tool that the
+  watcher started (a tool killed while it initialises the SDR leaves the
+  amplifier enabled).
+- **Side effects:** from then on a radar started outside the radar manager
+  (`pa_run.py`, the HIL harness) is stopped about 5 s after the watcher's status
+  goes not ok, which it is whenever the telemetry service is stopped or the
+  amplifier's 28 V is off. And the reset tool is run (a UHD initialisation: the
+  amplifier is enabled for about 0.5 s) whenever the amplifier draws more than
+  0.5 A for 5 s with no radar process. For bench work:
+  `sudo systemctl stop radar-watcher radar-telemetry`.
+- **Verify:** `systemctl status radar-watcher`;
+  `python3 -m json.tool /run/radar-runner/user/watcher.json` (`ok`, `reason`);
+  `tail /var/lib/radar-runner/user/watcher-events.jsonl`
+- **Revert:** `sudo systemctl disable --now radar-watcher && sudo rm /etc/systemd/system/radar-watcher.service && sudo systemctl daemon-reload`.
+  The event log stays.
 
 ## Deferred to later stages (not done by `setup.sh`)
 

@@ -26,6 +26,7 @@ UPDATE_UNITS = ["apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrad
                 "fwupd-refresh.timer", "rpi-eeprom-update.service"]
 POWER = "radar-power.service"
 TELEMETRY = "radar-telemetry.service"
+WATCHER = "radar-watcher.service"
 GPSD_DROP_IN = "etc/systemd/system/gpsd.service.d/radar-runner.conf"
 TIME_FILES = ["etc/chrony/conf.d/radar-runner.conf", "etc/systemd/system/chrony.service.d/radar-runner.conf",
               "etc/systemd/system/fake-hwclock-save.timer.d/radar-runner.conf"]
@@ -83,7 +84,8 @@ class System:
     def run(self, *args, **extra_env):
         # The OLA's port: a path that does not exist, unless a test puts a file there and opens it.
         env = {"PATH": str(self.bin), "DESTDIR": str(self.root), "FAKE_STATE": str(self.state_path),
-               "HOME": str(self.root), "OLA_PORT": str(self.root / "dev-ola-port"), **extra_env}
+               "HOME": str(self.root), "OLA_PORT": str(self.root / "dev-ola-port"),
+               "RADAR_EXE": str(self.root / "no-radar-binary"), **extra_env}     # no real radar process counts
         return subprocess.run([BASH, SETUP, *args], env=env, capture_output=True, text=True, timeout=120)
 
     def path(self, name):
@@ -696,3 +698,83 @@ def test_apt_runs_without_prompts_and_without_needrestart(system):
     text = open(SETUP).read()
     assert "DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1" in text
     assert "autoremove" not in text and "dist-upgrade" not in text and "apt-get upgrade" not in text
+
+
+# ---- the safety watcher
+
+def test_watcher_service_is_installed_enabled_and_started(system):
+    r = system.run("--dry-run")
+    assert r.returncode == 0 and "WOULD    run: systemctl enable --now radar-watcher.service" in r.stdout
+    assert WATCHER not in system.state["enabled"]
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "systemctl enable --now radar-watcher.service" in system.log
+    assert WATCHER in system.state["enabled"] and WATCHER in system.state["active"]
+    assert filecmp.cmp(os.path.join(REPO, "systemd", "radar-watcher.service"),
+                       system.path("/etc/systemd/system/radar-watcher.service"), shallow=False)
+    assert system.mode("/etc/systemd/system/radar-watcher.service") == 0o644
+    assert "a radar started outside the radar manager (pa_run.py, the HIL harness) is stopped" in r.stdout
+    # Whether the reset tool is built is said either way; it does not stop the step.
+    assert ("the SDR GPIO reset tool is built" in r.stdout) != ("the SDR GPIO reset tool is NOT built" in r.stdout)
+    # After the telemetry service, before the step that needs the internet.
+    log = system.log
+    assert (log.index("systemctl enable --now radar-telemetry.service")
+            < log.index("systemctl enable --now radar-watcher.service") < log.index(APT_INSTALL))
+    r = system.run()
+    assert "radar-watcher.service is enabled and running (not restarted)" in r.stdout
+
+
+def test_running_watcher_is_never_restarted_or_stopped(system):
+    assert system.run().returncode == 0
+    system.path("/etc/systemd/system/radar-watcher.service").write_text("[Unit]\nDescription=old\n")
+    system.set(log=[])
+    r = system.run()
+    assert r.returncode == 0 and "replace /etc/systemd/system/radar-watcher.service" in r.stdout
+    assert "keeps the old unit until it is restarted: systemctl restart radar-watcher" in r.stdout
+    assert system.log == ["systemctl daemon-reload"]
+    # Stopped by hand for bench work: left stopped. Masked: left masked.
+    system.set(active=[u for u in system.state["active"] if u != WATCHER], log=[])
+    r = system.run()
+    assert "radar-watcher.service is enabled but inactive: left as it is" in r.stdout
+    system.set(masked=system.state["masked"] + [WATCHER], log=[])
+    r = system.run()
+    assert "radar-watcher.service is masked: left as it is" in r.stdout
+    assert not [c for c in system.log if "watcher" in c]
+
+
+def test_refuses_to_start_the_watcher_while_a_radar_process_is_running(system, tmp_path):
+    radar = tmp_path / "radar"
+    shutil.copy(shutil.which("sleep"), radar)       # a stand-in: the watcher would stop a bench run's radar
+    proc = subprocess.Popen([str(radar), "300"])
+    try:
+        r = system.run(RADAR_EXE=str(radar))
+        assert r.returncode == 1
+        assert 'setup: FAILED in step "Safety watcher unit"' in r.stderr
+        assert f"a radar process is running now (pid {proc.pid}, {radar})" in r.stderr
+        assert "was not enabled or started" in r.stderr and "run setup again" in r.stderr
+        assert WATCHER not in system.state["enabled"] and WATCHER not in system.state["active"]
+        assert not [c for c in system.log if "radar-watcher" in c]
+        assert not [c for c in system.log if c.startswith("apt-get")]       # stopped there
+        assert "systemctl enable --now radar-telemetry.service" in system.log     # the steps before were done
+        r = system.run("--dry-run", RADAR_EXE=str(radar))                   # the dry run says so too
+        assert r.returncode == 1 and "a radar process is running now" in r.stderr
+        assert proc.poll() is None                  # only looked at, never signalled
+    finally:
+        proc.kill()
+        proc.wait(10)
+    r = system.run(RADAR_EXE=str(radar))            # the run has ended: run again
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "systemctl enable --now radar-watcher.service" in system.log
+
+
+def test_a_radar_running_under_an_already_running_watcher_is_no_obstacle(system, tmp_path):
+    assert system.run().returncode == 0
+    radar = tmp_path / "radar"
+    shutil.copy(shutil.which("sleep"), radar)
+    proc = subprocess.Popen([str(radar), "300"])
+    try:
+        r = system.run(RADAR_EXE=str(radar))
+    finally:
+        proc.kill()
+        proc.wait(10)
+    assert r.returncode == 0 and "radar-watcher.service is enabled and running (not restarted)" in r.stdout

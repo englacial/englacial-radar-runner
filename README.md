@@ -12,12 +12,15 @@ except the radar acquisition code itself (`~/orca`). Plan and stages:
 | `radar_runner/common/` | Shared code for all other services: status files, config, logging, systemd notification, the service loop |
 | `radar_runner/common/bootcount.py` | The boot counter used in names that must stay unique and ordered without a clock |
 | `radar_runner/telemetry/`, `systemd/radar-telemetry.service` | Telemetry service (stage 2): OLA, Pi, UPS and GPS readings logged and published. See `radar_runner/telemetry/README.md` |
+| `radar_runner/watcher/`, `systemd/radar-watcher.service` | Safety watcher (stage 3): amplifier limits, stops the radar, resets the SDR GPIO; independent of the radar manager. See `radar_runner/watcher/README.md` |
+| `tools/sdr_gpio_safe/` | The SDR GPIO reset tool and its wrapper `amp_safe`. See its `README.md` |
 | `radar_runner/example.py` | A minimal service to copy. Not installed |
 | `config/radar-runner.yaml` | Settings of those services, with every default |
 | `setup/` | System setup: `setup.sh`, `check.py`, `SYSTEM_CHANGES.md`, the files it installs (`files/`), version pins (`pins.toml`), and the Python environment tools |
 | `tests/power/` | Power service tests (unittest) |
 | `tests/common/` | Tests of the shared code and of `setup.sh` (pytest) |
 | `tests/telemetry/` | Telemetry service tests (pytest), with a recorded OLA session in `data/` |
+| `tests/watcher/` | Safety watcher tests (pytest): injected readings, a stand-in reset tool, stand-in radar processes |
 | `.venv/`, `wheelhouse/` | Python environment and the wheels it is built from. Not in git |
 
 ## Python environment

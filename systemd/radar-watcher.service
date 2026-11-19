@@ -25,7 +25,7 @@ WorkingDirectory=/home/englacial/englacial-radar-runner
 ExecStart=/home/englacial/englacial-radar-runner/.venv/bin/python -B -u -m radar_runner.watcher
 Restart=always
 RestartSec=1
-# The loop pings four times a second. No ping for 15 s: kill it and restart.
+# The loop pings at least once a second. No ping for 15 s: kill it and restart.
 # (Its status file is treated as "not ok" by the manager after 5 s already.)
 WatchdogSec=15
 WatchdogSignal=SIGKILL
@@ -38,7 +38,7 @@ TimeoutStopSec=10
 KillMode=process
 # It must keep running when the Pi is busy or short of memory. It uses about
 # half a percent of one core, so the higher priority costs the radar nothing.
-# No real-time class: at four short rounds a second it does not need one, and
+# No real-time class: at two short rounds a second it does not need one, and
 # a real-time process that went wrong could hold a core.
 Nice=-5
 OOMScoreAdjust=-900

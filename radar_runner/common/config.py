@@ -98,7 +98,7 @@ DEFAULTS = {
     },
     # The safety watcher (radar_runner/watcher/README.md, which says where each number comes from).
     "watcher": {
-        "loop_interval_s": 0.25,                 # how often everything is looked at and watcher.json rewritten
+        "loop_interval_s": 0.5,                  # how often everything is looked at and watcher.json rewritten
         "radar_exe": "/home/englacial/orca/sdr/build/radar",    # a process with this executable is a radar
         "telemetry_status_file": "telemetry.json",      # a name in paths.run_dir, or a full path
         "override_file": "override-no-amp-telemetry",   # these three: a name in paths.state_dir, or a full path

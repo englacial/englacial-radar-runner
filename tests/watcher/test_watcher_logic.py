@@ -36,6 +36,10 @@ def test_debounce_needs_readings_in_a_row_and_a_time_span():
     d = L.Debounce(3, 1.0, 30.0, 3.0)
     assert [d.update(t, L.ON) for t in (0.0, 0.1, 0.2)] == [False] * 3
     assert d.update(1.0, L.ON)
+    # ... and a long enough span is not enough with fewer than three readings.
+    d = L.Debounce(3, 1.0, 30.0, 3.0)
+    assert not d.update(0.0, L.ON) and not d.update(2.5, L.ON)
+    assert d.update(3.0, L.ON)
 
 
 def test_debounce_turns_off_only_after_the_hold_and_a_gap_starts_the_count_again():
@@ -478,6 +482,16 @@ def test_enabled_current_with_a_radar_process_alive_is_normal():
     assert sim.tool_starts == []
     sim.run(0.75)
     assert len(sim.tool_starts) == 1
+
+
+def test_a_radar_that_starts_during_the_five_seconds_ends_the_count():
+    sim = started()
+    sim.amp["current_a"] = ENABLED_A                # for example the enable at the start of the radar itself
+    sim.run(4.0)
+    assert sim.state("amp_enabled") == "pending"
+    sim.radar = (600,)
+    sim.run(60.0)
+    assert sim.tool_starts == [] and sim.ok and sim.state("amp_enabled") == "idle" and sim.events == []
 
 
 def test_an_amplifier_found_enabled_at_boot_is_reset_five_seconds_after_the_first_reading():
