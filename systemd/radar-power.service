@@ -1,0 +1,36 @@
+# Radar power service: shuts the Pi down cleanly when main power is lost.
+# Documentation and installation steps: power/README.md
+
+[Unit]
+Description=Radar power service (clean shutdown on loss of main power)
+Documentation=file:///home/englacial/englacial-radar-runner/power/README.md
+# Start as early as possible and depend on nothing: no ordering after the
+# network or after any other service of this project. The service copes with
+# devices and directories that are not there yet.
+# DefaultDependencies=no also means systemd does not stop this unit when a
+# shutdown starts. It keeps running, with its fallback timers, until systemd
+# kills the remaining processes at the very end of the shutdown.
+DefaultDependencies=no
+After=systemd-remount-fs.service
+# No start-rate limit: systemd never gives up restarting it.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+WorkingDirectory=/home/englacial/englacial-radar-runner
+# -B: no root-owned __pycache__ in the checkout. -E -s: ignore PYTHON*
+# variables and root's user site-packages. -u: unbuffered output.
+ExecStart=/usr/bin/python3 -B -E -s -u -m power
+Restart=always
+RestartSec=2
+# The service pings once a second. No ping for 30 s: kill it and restart.
+WatchdogSec=30
+WatchdogSignal=SIGKILL
+TimeoutStartSec=30
+TimeoutStopSec=10
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target
