@@ -204,6 +204,7 @@ class Watcher(Service):
         self.logic = None
         self._tool = None           # the running reset tool: {"proc", "started", "deadline"}
         self._leftover = []         # tools that were given up on, until they are gone
+        self._record_unwritable = False     # amp_safe could not write its state file (a read-only card?)
         self._inputs_seen = L.Inputs()
 
     # ---- start and stop
@@ -296,7 +297,9 @@ class Watcher(Service):
 
     def _start_tool(self, now):
         r = self.cfg["reset"]
-        argv = [r["command"], "--timeout", f"{r['timeout_s']:g}", "--state-file", self.state_file]
+        argv = [r["command"], "--timeout", f"{r['timeout_s']:g}"]
+        if not self._record_unwritable:
+            argv += ["--state-file", self.state_file]
         # Its one line of output goes to a file, not a pipe: a pipe would break under the tool if the
         # watcher ended first. If the file cannot be made the tool runs all the same.
         try:
@@ -340,6 +343,11 @@ class Watcher(Service):
             # Killed by a signal or failed in a way it never should: the tool may have started.
             text = f"amp_safe ended with status {code}, which is no result; assume enabled. {text}"
             code = L.TOOL_ASSUME_ENABLED
+        if code == L.TOOL_STATE_FILE:
+            # amp_safe refuses to start the tool when it cannot keep the record. An amplifier that
+            # is enabled matters more than the record: from now on the tool runs without it.
+            self._record_unwritable = True
+            text += " From now on the watcher runs the tool without --state-file."
         self._tool = None
         self._tool_done(now, code, text or "no output", now - tool["started"])
 

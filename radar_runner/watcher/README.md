@@ -136,6 +136,10 @@ there is stopped first, by the not-ok rule), and never without a reading at
 most 3 s old that says "enabled". So with telemetry lost the state stays as it
 was, latched, and nothing is tried until readings return.
 
+If `amp_safe` cannot write the state file (`STATE_FILE`, exit 8: a card that
+has gone read-only) it does not start the tool. The watcher's next runs are
+then without `--state-file`: an enabled amplifier matters more than the record.
+
 `amp_safe` returns within its `--timeout`. If it has not after 35 s, the
 watcher kills the script (not the tool under it) and takes it as
 `ASSUME_ENABLED`. When the watcher itself is stopped or killed while the tool

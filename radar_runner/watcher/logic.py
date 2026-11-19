@@ -36,7 +36,7 @@ IDLE, PENDING, RESETTING, STUCK = "idle", "pending", "resetting", "stuck"
 INTERRUPTED, KILLED = "interrupted", "killed"
 
 # Exit codes of amp_safe (tools/sdr_gpio_safe/README.md). Only 0 means safe.
-TOOL_OK, TOOL_ASSUME_ENABLED, TOOL_FAILED = 0, 3, 5
+TOOL_OK, TOOL_ASSUME_ENABLED, TOOL_FAILED, TOOL_STATE_FILE = 0, 3, 5, 8
 TOOL_NAMES = {0: "OK", 2: "NOT_FOUND", 3: "ASSUME_ENABLED", 4: "TIMEOUT", 5: "FAILED", 6: "BUSY",
               7: "AMBIGUOUS", 8: "STATE_FILE", 64: "USAGE"}
 

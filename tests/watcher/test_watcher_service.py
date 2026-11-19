@@ -319,6 +319,19 @@ def test_every_failing_exit_code_is_retried_twice_then_stuck_with_one_run_a_minu
     assert "no longer stuck enabled" in r.named("clear")[0]["text"]
 
 
+def test_when_the_state_file_cannot_be_written_the_tool_runs_without_it(rig):
+    # A card that has gone read-only: amp_safe then refuses to start the tool (exit 8).
+    r = rig()
+    r.tool.plan(codes=[8, 0])
+    r.run(3.0)
+    r.amp["current_a"] = ENABLED_A
+    r.run(14.0)
+    first, second = r.tool.calls
+    assert "--state-file" in first["argv"] and second["argv"] == ["--timeout", "30"]
+    assert r.status().data["ok"] is True
+    assert "without --state-file" in r.named("reset_tool_result")[0]["text"]
+
+
 def test_a_tool_that_ends_with_no_valid_result_counts_as_assume_enabled(rig):
     r = rig()
     r.tool.plan(codes=[1])                          # a traceback in amp_safe, for example
