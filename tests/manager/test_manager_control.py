@@ -135,6 +135,11 @@ def test_status_text():
                      "config:     x.yaml: unknown setting a: ignored"):
         assert expected in text
     assert radarctl.format_status({})                       # an empty status does not raise
+    cleared = radarctl.format_status({"state": "ready", "fault": None, "last_fault": {
+        "kind": "amp_unsafe", "reason": "tool run 3 times: status 3 (ASSUME_ENABLED)",
+        "cleared_by": "the amplifier pin is known safe again: amp_safe OK"}})
+    assert ("last fault: amp_unsafe: tool run 3 times: status 3 (ASSUME_ENABLED) "
+            "(cleared by: the amplifier pin is known safe again: amp_safe OK)") in cleared
 
 
 def test_radarctl_uses_only_the_standard_library():

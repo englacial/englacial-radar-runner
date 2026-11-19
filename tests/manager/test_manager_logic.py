@@ -950,6 +950,15 @@ def test_a_stop_for_power_loss_is_urgent_and_marked_as_power():
                                   "urgent": True, "power": True})]
 
 
+def test_power_loss_makes_the_stop_urgent_even_if_another_gate_is_listed_first():
+    s = Sim().running()
+    s.take()
+    s.gates(telemetry="amplifier telemetry: status stale", power=POWER_LOSS)       # both at once
+    kind, data = s.take()[0]
+    assert kind == "stop" and data["urgent"] is True and data["power"] is True
+    assert data["reason"].startswith("telemetry:")
+
+
 def test_a_stop_for_another_gate_or_by_hand_is_not_urgent():
     s = Sim().running()
     s.take()

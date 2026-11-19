@@ -766,6 +766,21 @@ def test_another_caller_holding_the_tool_leaves_the_record_as_it_was(env, events
         assert "radar launched" in f.read()     # still our "unknown": the tool never started
 
 
+def test_delayed_retries_end_when_the_stop_becomes_urgent(env, events, runner):
+    # The manager is asked to exit while the tool is being retried after a crash.
+    env.config["manager"]["amp_safe"].update(unavailable_retries=50, unavailable_delay_s=0.2)
+    env.behave(radar="crash", amp_safe=2)
+    runner.start(REQUEST)
+    events.wait("started")
+    deadline = time.monotonic() + 10
+    while env.amp_safe_calls() < 2:
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    runner.stop("the manager is stopping", urgent=True)
+    info = events.wait("ended", timeout=5)
+    assert info["amp_safe"] is False and env.amp_safe_calls() < 10      # not all 50
+
+
 def test_no_delayed_retries_when_the_stop_was_urgent(env, events, runner):
     env.config["manager"]["orca"]["stop_timeout_s"] = 0.3
     env.behave(radar="ignore_sigint", amp_safe=[2, 0])

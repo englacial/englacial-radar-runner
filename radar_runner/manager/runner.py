@@ -356,7 +356,8 @@ class Runner:
                 result = {"ok": False, "state": ampsafe.UNKNOWN, "detail": "internal error", "why": run[1],
                           "status": None}
                 try:
-                    ok, detail, status = self._tool(os.path.join(self.state_dir, AMP_SAFE_LOG), patient=False)
+                    ok, detail, status = self._tool(os.path.join(self.state_dir, AMP_SAFE_LOG),
+                                                    patient=lambda: False)
                     result.update(ok=ok, state=self.sdr_state.get(), detail=detail, status=status)
                 except Exception:
                     log.exception("internal error while making the amplifier safe")
@@ -782,7 +783,7 @@ class Runner:
         else:
             run.amp_safe_ran = True
             log_path = os.path.join(run.directory, AMP_SAFE_LOG) if run.directory else None
-            ok, detail, _ = self._tool(log_path, patient=run.urgent_at is None)
+            ok, detail, _ = self._tool(log_path, patient=lambda: run.urgent_at is None)
             run.amp_safe, run.amp_safe_detail = ok, f"{detail} ({why})"
             if not ok:
                 log.error("AMPLIFIER NOT CONFIRMED SAFE after the radar exited: %s", run.amp_safe_detail)
@@ -797,9 +798,11 @@ class Runner:
         ASSUME_ENABLED (the tool initialised the SDR and could not verify the
         pin) is urgent: the tool is run again at once, up to
         `assume_enabled_retries` times. NOT_FOUND, BUSY and TIMEOUT can mean
-        that the SDR is coming back after a radar was killed: if `patient`,
-        the tool is tried again up to `unavailable_retries` times,
-        `unavailable_delay_s` apart.
+        that the SDR is coming back after a radar was killed: while
+        `patient()` says so, the tool is tried again up to
+        `unavailable_retries` times, `unavailable_delay_s` apart. It stops
+        saying so when the stop becomes urgent (the manager is exiting: the
+        unit's stop hook takes over).
         """
         cfg = self.cfg["amp_safe"]
         command = [str(a) for a in cfg["command"]]
@@ -822,7 +825,7 @@ class Runner:
                 log.error("URGENT: the make-amplifier-safe tool initialised the SDR and could not verify the pin: "
                           "running it again")
                 continue
-            if patient and status in ampsafe.RETRY_LATER and later_left:
+            if status in ampsafe.RETRY_LATER and later_left and patient():
                 later_left -= 1
                 log.warning("make-amplifier-safe tool: %s; trying again in %g s", ampsafe.describe(status),
                             cfg["unavailable_delay_s"])

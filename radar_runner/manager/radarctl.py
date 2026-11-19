@@ -69,6 +69,9 @@ def format_status(s):
     lines = [f"state:      {s.get('state')}" + (f"  ({s['detail']})" if s.get("detail") else "")]
     if s.get("fault"):
         lines.append(f"fault:      {s['fault'].get('kind')}: {s['fault'].get('reason')}")
+    last = s.get("last_fault")
+    if last and not s.get("fault"):
+        lines.append(f"last fault: {last.get('kind')}: {last.get('reason')} (cleared by: {last.get('cleared_by')})")
     for reason in s.get("not_ready") or []:
         lines.append(f"not ready:  {reason}")
     if s.get("run_wanted"):

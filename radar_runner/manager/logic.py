@@ -235,9 +235,10 @@ class ManagerLogic:
         """(why a running radar must stop, is it a loss of power), or ("", False)."""
         if self.results is None:
             return "", False
+        power = any(r.run and r.kind == "power_fail" for r in self.results.values())
         for name, r in self.results.items():
             if r.run:
-                return f"{name}: {r.run}", r.kind == "power_fail"
+                return f"{name}: {r.run}", power
         return "", False
 
     def not_ready_reasons(self):
