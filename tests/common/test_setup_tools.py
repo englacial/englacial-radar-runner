@@ -226,7 +226,8 @@ def test_check_script_runs_and_reports_every_item():
                  "/var/lib/radar-runner/user", "held packages",
                  # stage 2
                  "gpsd.service enabled and running", "gpsd keeps reading without clients", "gpsd hotplug",
-                 "GPS receiver on USB", "GPS receiver known to gpsd, once", "radar-telemetry.service unit file",
+                 "GPS receiver on USB", "GPS receiver known to gpsd, once", "GPS receiver identified by gpsd",
+"radar-telemetry.service unit file",
                  "sensor log directory on the data drive", "telemetry status file", "chrony package",
                  "fake-hwclock package", "systemd-timesyncd removed", "chrony.service",
                  "chrony steps the clock at any time", "fake-hwclock units", "fake-hwclock saves",
@@ -275,6 +276,44 @@ def test_check_script_rejects_unknown_options():
     r = subprocess.run(["/usr/bin/python3", "-B", os.path.join(REPO, "setup", "check.py"), "--fix"],
                        capture_output=True, text=True, timeout=60, cwd="/")
     assert r.returncode != 0 and "usage: setup/check.py [--receiver]" in r.stderr and r.stdout == ""
+
+
+# ---- check.py: gpsd's identification of the receiver (a pure function, taken from the source)
+
+def check_function(name):
+    import ast
+    with open(os.path.join(REPO, "setup", "check.py")) as f:
+        tree = ast.parse(f.read())
+    wanted = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name]
+    assert len(wanted) == 1
+    scope = {"PASS": "PASS", "FAIL": "FAIL", "SKIP": "SKIP", "INFO": "INFO"}
+    exec(compile(ast.Module(body=wanted, type_ignores=[]), "check.py", "exec"), scope)
+    return scope[name]
+
+
+def gps_identification(devices):
+    return check_function("gps_identification")(devices)
+
+
+def test_check_fails_fix_times_without_a_position_message():
+    finding = check_function("gps_fix_finding")
+    assert finding({"time": "2026-11-19T19:00:00.000Z", "mode": 0})[0] == "FAIL"
+    assert finding({"time": "2026-11-19T19:00:00.000Z"})[0] == "FAIL"
+    assert finding({"time": "2026-11-19T19:00:00.000Z", "mode": 1})[0] == "INFO"     # NAV-PVT without a fix
+    assert finding({"mode": 3, "time": "x"}) == ("INFO", "3D fix")
+    assert finding({})[0] == "INFO"                                                   # nothing from gpsd yet
+
+
+def test_check_fails_a_receiver_that_gpsd_has_not_identified():
+    device = {"class": "DEVICE", "path": "/dev/ttyACM0", "driver": "u-blox", "subtype": ""}
+    status, observed = gps_identification([device])
+    assert status == "FAIL" and "gpsd has not identified /dev/ttyACM0" in observed and "gps_receiver.py" in observed
+    assert gps_identification([dict(device, subtype="SW EXT CORE 1.00", subtype1="PROTVER=27.50,MOD=ZED-F9P")]) == (
+        "PASS", "PROTVER=27.50,MOD=ZED-F9P")
+    assert gps_identification([dict(device, subtype="SW EXT CORE 1.00")]) == ("PASS", "SW EXT CORE 1.00")
+    assert gps_identification([dict(device, subtype="Unknown")])[0] == "FAIL"     # gpsd's placeholder
+    assert gps_identification([]) == ("SKIP", "gpsd has no receiver")             # cannot tell
+    assert gps_identification(None)[0] == "SKIP"
 
 
 # ---- check.py: the radar's hooks in the power service's config (a pure function, taken from the source)

@@ -735,7 +735,7 @@ def _(name):
     check("Ubuntu's gpsdctl hotplug path switched off", "/bin/true" in exec_start and "gpsdctl add" not in exec_start,
           "no-op" if "/bin/true" in exec_start else "still runs gpsdctl add", "no-op (the receiver was opened twice at boot otherwise)")
     enabled, _active = unit_state("radar-gps-receiver.service")
-    check("radar-gps-receiver.service (once-per-boot receiver setting check)", enabled == "enabled", enabled, "enabled")
+    check("radar-gps-receiver.service (receiver check after every start of gpsd)", enabled == "enabled", enabled, "enabled")
 
 
 @item("gpsd hotplug (USBAUTO in /etc/default/gpsd)")
@@ -743,6 +743,34 @@ def _(name):
     found = re.findall(r'^USBAUTO="?(\w+)"?', read("/etc/default/gpsd") or "", re.M)
     check(name, bool(found) and found[-1] == "true", f"USBAUTO={found[-1]}" if found else "not set",
           'USBAUTO="true": a replugged receiver is added by udev and gpsdctl')
+
+
+def gps_identification(devices):
+    """(status, observed) for gpsd's identification of the receiver, from its DEVICES report.
+
+    `subtype` comes from the receiver's version reply. On 2026-11-19, after a power cut, it was
+    empty, the receiver sent gpsd no position message, and gpsd delivered no position for 77
+    minutes (setup/gps_receiver.py has what gpsd does and what is inferred).
+    """
+    if devices is None:
+        return SKIP, "gpsd did not send its list of devices"
+    if not devices:
+        return SKIP, "gpsd has no receiver"
+    missing = [d.get("path") for d in devices
+               if not (d.get("subtype1") or d.get("subtype") not in (None, "", "Unknown"))]
+    if missing:
+        return FAIL, (f"gpsd has not identified {', '.join(map(str, missing))}: no version reply seen "
+                      "(setup/gps_receiver.py --apply --ram asks the receiver for its version)")
+    return PASS, "; ".join(str(d.get("subtype1") or d.get("subtype")) for d in devices)
+
+
+def gps_fix_finding(tpv):
+    """(status, observed) for gpsd's latest fix. gpsd clears the fix at every cycle, so a fix time
+    with mode 0 (or none) means that no position message (NAV-PVT) came from the receiver."""
+    if tpv.get("time") and not tpv.get("mode"):
+        return FAIL, ("fix time but mode 0: the receiver sends gpsd no position message "
+                      "(setup/gps_receiver.py --apply --ram switches NAV-PVT on)")
+    return INFO, {2: "2D fix", 3: "3D fix"}.get(tpv.get("mode"), "no position fix (chrony gets GPS time only with a fix)")
 
 
 @item("GPS receiver")
@@ -766,6 +794,7 @@ def _(name):
                     break
     except OSError as e:
         report(FAIL, name + " known to gpsd", f"cannot ask gpsd: {e}")
+        report(SKIP, name + " identified by gpsd", "cannot ask gpsd")
         return
     paths = [d.get("path") for d in devices or []]
     tpv = (reply.get("tpv") or [{}])[0]
@@ -774,7 +803,10 @@ def _(name):
     check(name + " known to gpsd, once", len(paths) == 1 and reply.get("active") == 1,
           f"{len(paths)} device(s) {paths}, {reply.get('active', 0)} active; fix mode {tpv.get('mode')}, time {tpv.get('time')}",
           "exactly 1 device, active")
-    report(INFO, name + " fix", {2: "2D fix", 3: "3D fix"}.get(tpv.get("mode"), "no position fix (chrony gets GPS time only with a fix)"))
+    status, observed = gps_identification(devices)
+    report(status, name + " identified by gpsd", observed)
+    status, observed = gps_fix_finding(tpv)
+    report(status, name + " fix", observed)
 
 
 @item("GPS receiver settings (asked of the receiver)")
