@@ -172,9 +172,14 @@ class Manager(Service):
         if self.logic.phase != L.IDLE or self.logic.closing or self.runner.busy:
             self.enabled_idle = ""
             return
+        if self.logic.power_fail or self.amp_telemetry.rail_absent():
+            # Power is going or the 28 V rail is off: the amplifier cannot be enabled, the
+            # current says nothing, and the power service has its own hook. Leave the record.
+            self.enabled_idle = ""
+            return
         # Shutdown current counts only in a reading newer than the last radar or tool run.
         reading, text = self.amp_telemetry.now(self.runner.last_activity_uptime)
-        self.enabled_idle = text if reading is False else ""
+        self.enabled_idle = text if reading is False else ""        # True, PENDING and None are not "enabled"
         action, why = ampsafe.idle_need(self.sdr_state.get(), self._sdr_presence(), reading)
         if action == "mark_safe":
             error = self.sdr_state.set(ampsafe.SAFE, why)

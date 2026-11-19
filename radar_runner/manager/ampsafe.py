@@ -72,6 +72,7 @@ EXIT_MEANING = {0: "OK", 2: "NOT_FOUND", 3: "ASSUME_ENABLED", 4: "TIMEOUT", 5: "
                 7: "AMBIGUOUS", 8: "STATE_FILE", 64: "USAGE"}
 RETRY_LATER = (2, 6, 4)     # NOT_FOUND, BUSY, TIMEOUT: worth another try after a delay
 ABSENT, BOOTLOADER, LOADED = "absent", "bootloader", "loaded"       # the SDR, as sysfs shows it
+PENDING = "pending"         # a reading: shutdown current, but not yet read long enough after the last run
 
 
 def unclean(facts):
@@ -132,7 +133,8 @@ def idle_need(state, sdr, reading):
     state     SAFE or UNKNOWN: the record
     sdr       ABSENT, BOOTLOADER or LOADED
     reading   True = shutdown current in a reading new enough to count,
-              False = enabled current, None = no usable reading
+              False = enabled current, None = no usable reading,
+              PENDING = shutdown current, and a reading that counts is due shortly
 
     The tool runs only if the record is not `safe` and the SDR has been
     initialised since it was powered. Enabled current while the record says
@@ -152,6 +154,8 @@ def idle_need(state, sdr, reading):
         if state != SAFE:
             return "mark_safe", "telemetry shows shutdown current with no radar process"
         return "none", ""
+    if reading == PENDING:
+        return "none", "waiting for a reading taken after the last run"
     if state != SAFE:
         return "run", "the state of the SDR is not known and there is no telemetry to decide"
     return "none", ""
@@ -231,20 +235,25 @@ class AmpTelemetry:
         return True, text
 
     def now(self, after_uptime):
-        """The latest reading, without waiting: (True shutdown / False enabled / None unusable, text).
+        """The latest reading, without waiting: (True / False / PENDING / None, text).
 
+        True = shutdown current, False = enabled current, None = unusable.
         Shutdown current counts only in a sample read at least `confirm_settle_s`
-        after `after_uptime` (the end of the last radar or tool run). The
-        sample's time is the earliest moment the row can have reached the Pi;
-        the ADC measured it before that, so an older row may show the state
-        before the run ended.
+        after `after_uptime` (the end of the last radar or tool run, or the
+        manager's start). The sample's time is the earliest moment the row can
+        have reached the Pi; the ADC measured it before that, so an older row
+        may show the state before the run ended. While such a sample can
+        still be expected (`confirm_timeout_s` more), the answer is PENDING.
         """
         sample = self._sample()
         if sample is None:
             return None, "no fresh amplifier reading"
         state, text = self._judge(sample)
-        if state is True and sample[0] < after_uptime + self.cfg["confirm_settle_s"]:
-            return None, f"{text}, but not read {self.cfg['confirm_settle_s']:g} s after the last run ended"
+        settle = self.cfg["confirm_settle_s"]
+        if state is True and sample[0] < after_uptime + settle:
+            if self._uptime() < after_uptime + settle + self.cfg["confirm_timeout_s"]:
+                return PENDING, f"{text}; waiting for a reading taken {settle:g} s after the last run ended"
+            return None, f"{text}, but not read {settle:g} s after the last run ended"
         return state, text
 
     def confirm_shutdown(self, exit_uptime):

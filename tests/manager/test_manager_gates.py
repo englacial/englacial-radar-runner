@@ -427,6 +427,13 @@ def test_idle_enabled_current_is_never_marked_safe_and_is_left_to_the_watcher():
     assert ampsafe.idle_need("safe", "bootloader", False)[0] == "none"
 
 
+def test_idle_waits_for_a_reading_that_is_due_before_it_runs_the_tool():
+    # Right after a run (or the manager's start) the reading is not yet old enough to count.
+    action, why = ampsafe.idle_need("unknown", "loaded", ampsafe.PENDING)
+    assert action == "none" and "waiting for a reading" in why
+    assert ampsafe.idle_need("safe", "loaded", ampsafe.PENDING)[0] == "none"
+
+
 def test_idle_without_an_sdr_nothing_is_done():
     for state in ("safe", "unknown"):
         for reading in (None, True, False):
@@ -488,8 +495,13 @@ def test_sample_lag_a_row_read_just_after_the_exit_was_measured_before_it(env):
     exit_uptime = now_uptime() - 1.5
     publish_amp(env, 0.156)
     assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is None
-    assert amp_telemetry(env).now(exit_uptime)[0] is None
-    assert "not read 2 s after the last run ended" in amp_telemetry(env).now(exit_uptime)[1]
+    # Without waiting: pending while a reading that counts is still due (confirm_timeout_s more) ...
+    state, text = amp_telemetry(env).now(exit_uptime)
+    assert state == ampsafe.PENDING and "waiting for a reading taken 2 s after the last run ended" in text
+    # ... and unusable when that time has passed and the rows are still not newer (sample time stuck).
+    late = amp_telemetry(env, uptime=lambda: exit_uptime + 2.0 + 0.3 + 0.01)
+    state, text = late.now(exit_uptime)
+    assert state is None and "not read 2 s after the last run ended" in text
     exit_uptime = now_uptime() - 2.1
     publish_amp(env, 0.156)
     assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is True
