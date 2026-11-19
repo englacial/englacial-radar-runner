@@ -732,6 +732,24 @@ def test_no_satellites_is_not_called_a_fault_and_the_retry_is_harmless(tmp_path,
     assert bench.snap()["sources"]["gps"]["no_position"] == ""
 
 
+def test_a_timeless_mode_0_reply_does_not_change_the_cause(tmp_path, caplog):
+    """A POLL between gpsd clearing its fix and the next message: no time, mode 0 (3 of 1227 rows on 2026-11-19)."""
+    caplog.set_level("INFO")
+    bench = retry_bench(tmp_path, "/bin/true")
+    conn = bench.gpsd.connections[-1]
+    conn.tpv.update(mode=1, lat=None, lon=None)
+    bench.run(8)
+    conn.tpv.update(mode=0, time=None)      # such replies just as the warning is due
+    bench.run(3)
+    gps = bench.snap()["sources"]["gps"]
+    assert gps["values"]["mode"] == 0 and gps["values"]["gps_time"] is None
+    assert gps["no_position"] == "no_fix" and gps["health"] == "ok"
+    assert "most likely no satellites" in caplog.text and "NAV-PVT off" not in caplog.text
+    conn.tpv.update(mode=1, time="2026-11-19T01:00:00.000Z")
+    bench.run(2)
+    assert bench.snap()["sources"]["gps"]["no_position"] == "no_fix"
+
+
 def test_no_fix_time_either_is_no_data(tmp_path):
     bench = retry_bench(tmp_path, "/bin/true")
     conn = bench.gpsd.connections[-1]

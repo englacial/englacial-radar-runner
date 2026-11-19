@@ -65,6 +65,9 @@ class Gps:
         self.last_reply_at = None
         self.last_new_fix_at = None
         self.last_position_at = None    # the last new fix with mode 2 or 3
+        # The mode of the last sample with a new fix time. A reply between gpsd clearing its fix and
+        # the next message has no time and mode 0: that says nothing about the receiver.
+        self.new_fix_mode = None
         self.devices = None             # gpsd's devices from its last DEVICES report
         self._sock = None
         self._buf = b""
@@ -119,6 +122,7 @@ class Gps:
         if sample["new_fix"]:
             self._last_fix_time = fix_time
             self.last_new_fix_at = now
+            self.new_fix_mode = sample["mode"]
             if isinstance(sample["mode"], int) and sample["mode"] >= 2:
                 self.last_position_at = now
         return sample

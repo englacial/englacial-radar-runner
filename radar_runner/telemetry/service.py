@@ -288,10 +288,9 @@ class Telemetry(Service):
             return "gpsd_unidentified"
         if gps.no_data_s(mono) > self.cfg["gps"]["stale_after_s"]:
             return "no_data"
-        latest = self._latest.get("gps")
-        mode = latest["values"][GPS_COLUMNS.index("mode")] if latest else None
         # gpsd clears the fix at every cycle: mode 1 only comes with a NAV-PVT that has no fix in it.
-        return "no_fix" if mode == 1 else "no_position_messages"
+        # Taken from the last sample with a new fix time (gps.py: new_fix_mode).
+        return "no_fix" if gps.new_fix_mode == 1 else "no_position_messages"
 
     def _step_gps(self, mono, wall, up):
         sample = self.gps.poll(mono)

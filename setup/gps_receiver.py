@@ -16,8 +16,9 @@ With --apply, in this order:
  2. If CFG-MSGOUT-UBX_NAV_PVT_USB (the position message) is 0 in RAM, set it to 1 in RAM. Never
     to battery-backed memory or flash.
  3. If CFG-UART1OUTPROT-NMEA is not 0, set it to 0.
-With --ram, a setting whose read gets no answer is written anyway (both writes are idempotent and
-RAM only), because the state in which an answer gets lost is the one that needs the write.
+A setting whose read gets no answer is written anyway when the write is to RAM only (NAV-PVT
+always; CFG-UART1OUTPROT-NMEA with --ram): both writes are idempotent, and the state in which an
+answer gets lost is the one that needs the write.
 
 What gpsd 3.25 does (driver_ubx.c): when it recognises UBX at its start it sends MON-VER and,
 without waiting for acknowledgements, a burst of configuration. That burst addresses UART1 (gpsd

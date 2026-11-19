@@ -19,6 +19,8 @@ ExecStartPre=/bin/sleep 20
 ExecStart=/usr/bin/python3 -B -E -s setup/gps_receiver.py --apply --ram
 # A failure (gpsd has not identified the receiver: exit status 2) is tried again.
 Restart=on-failure
+# Except wrong options: that would fail the same way for ever.
+RestartPreventExitStatus=4
 RestartSec=20
 # 20 s wait plus at most about 100 s for the script.
 TimeoutStartSec=180
