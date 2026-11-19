@@ -779,9 +779,9 @@ def test_power_service_hooks_are_printed_not_applied(system):
             '"stop", "--interrupt", "--wait", "--timeout", "4"]') in out
     assert "stop_radar_timeout_s = 5.0" in out
     assert ('amp_safe = ["/usr/bin/setpriv", "--reuid=englacial", "--regid=englacial", "--init-groups", '
-            '"--reset-env", "/home/englacial/englacial-radar-runner/tools/sdr_gpio_safe/amp_safe", '
-            '"--timeout", "20", "--state-file", "/var/lib/radar-runner/user/sdr-state"]') in out
-    assert "amp_safe_timeout_s = 22.0" in out
+            '"--reset-env", "/home/englacial/englacial-radar-runner/bin/radar-manager-stop-hook", '
+            '"--timeout", "10", "/var/lib/radar-runner/user/sdr-state"]') in out
+    assert "amp_safe_timeout_s = 12.0" in out
     # ... and the installed config is the repository's, with no hook set.
     config = system.path("/etc/radar-runner/power.toml").read_text()
     assert "stop_radar = []" in config and "amp_safe = []" in config and "setpriv" not in config
@@ -799,6 +799,14 @@ def test_printed_hook_limits_are_longer_than_the_commands_own_timeouts(system):
         own = float(argv[argv.index("--timeout") + 1])
         assert hooks[f"{name}_timeout_s"] > own, name
         assert argv[0] == "/usr/bin/setpriv" and "--reset-env" in argv      # root never runs a user's file directly
-    assert re.search(r"amp_safe\b", hooks["amp_safe"][5])
+    # The amp_safe hook runs the tool only when it is needed: through the manager's stop hook script.
+    assert hooks["amp_safe"][5].endswith("/bin/radar-manager-stop-hook")
+    assert hooks["amp_safe"][6:] == ["--timeout", "10", "/var/lib/radar-runner/user/sdr-state"]
+    assert os.path.exists(os.path.join(REPO, "bin", "radar-manager-stop-hook"))
+    # Worst case of the power-off sequence (power/README.md): signals agree 1.8 s, ride-through 8 s,
+    # each hook its limit + 1 s, sync 5 s, guard record 3 s, 0.4 s. Well inside 58 s of capacitor,
+    # with the last resort 10 s after the command.
+    command_at = 1.8 + 8.0 + sum(hooks[f"{n}_timeout_s"] + 1.0 for n in ("stop_radar", "amp_safe")) + 5.0 + 3.0 + 0.4
+    assert command_at <= 38.0 and command_at + 10.0 <= 48.0
     assert os.path.exists(os.path.join(REPO, "tools", "sdr_gpio_safe", "amp_safe"))
     assert os.path.exists(os.path.join(REPO, "radar_runner", "manager", "radarctl.py"))

@@ -835,6 +835,7 @@ def _(name):
 section("setup.sh: radar manager")
 
 MANAGER_STATE_DIR = "/var/lib/radar-runner/user"
+POWER_OFF_BUDGET_S = 48.0       # the last resort of the power-off sequence must come within this of the loss
 AMP_SAFE = os.path.join(REPO, "tools", "sdr_gpio_safe", "amp_safe")
 
 
@@ -842,7 +843,8 @@ def manager_settings():
     """The manager's merged settings and what it finds wrong with the radar config, read with the
     repository's own Python environment (PyYAML). Returns a dict, or raises Skip."""
     code = ("import json, os; from radar_runner.common import config as C; from radar_runner.manager import limits\n"
-            "c, w = C.load(secrets_file=None); m = c['manager']; out = {'manager': m, 'warnings': w}\n"
+            "c, w = C.load(secrets_file=None); m = c['manager']\n"
+            "out = {'manager': m, 'warnings': w, 'paths': c['paths']}\n"
             "p = m['radar_config']\n"
             "out['radar_config_exists'] = os.path.exists(p)\n"
             "try:\n"
@@ -956,27 +958,74 @@ def _(name):
           f"{'is' if os.path.ismount(mount) else 'is NOT'} mounted", f"owner {OWNER.pw_name}, on the mounted drive")
 
 
+def power_hook_findings(power, state_file):
+    """What is right and wrong with the radar's hooks in the power service's config.
+
+    `power` is power.toml as a dict, `state_file` the record that the manager keeps.
+    Returns a list of (ok, name, observed, expected); ok None = information only.
+    No I/O: tests/common/test_setup_tools.py runs it on made-up configs.
+    """
+    out = []
+    hooks = power.get("hooks", {})
+    hook_time = 0.0
+    for hook in ("stop_radar", "amp_safe"):
+        argv = [str(a) for a in hooks.get(hook) or []]
+        if not argv:
+            out.append((None, f"power service hook {hook}",
+                        "not set (setup.sh prints the lines to add after the manager's first start)", ""))
+            continue
+        limit = hooks.get(f"{hook}_timeout_s", 5.0)
+        hook_time += limit + 1.0            # the power service gives a hook 1 s more to die
+        try:
+            own = float(argv[argv.index("--timeout") + 1])
+        except (ValueError, IndexError):
+            own = None
+        out.append((own is not None and limit > own and argv[0] == "/usr/bin/setpriv", f"power service hook {hook}",
+                    f"limit {limit:g} s, command's own --timeout {own if own is None else format(own, 'g')} s, "
+                    f"run through {os.path.basename(argv[0])}",
+                    "through setpriv (never a user's file as root), and the limit longer than --timeout"))
+        if hook == "amp_safe":
+            # The record that the hook reads must be the one the manager keeps.
+            through_script = any(a.endswith("/bin/radar-manager-stop-hook") for a in argv)
+            if "--state-file" in argv:                                  # the tool called directly
+                where = argv.index("--state-file") + 1
+            elif "--timeout" in argv:                                   # bin/radar-manager-stop-hook
+                where = argv.index("--timeout") + 2
+            else:
+                where = len(argv)
+            given = argv[where] if where < len(argv) else "/var/lib/radar-runner/user/sdr-state"
+            out.append((given == state_file, "power service hook amp_safe reads the manager's record",
+                        given, state_file))
+            out.append((through_script, "power service hook amp_safe runs the tool only when needed",
+                        "through bin/radar-manager-stop-hook" if through_script else "calls the tool every time",
+                        "bin/radar-manager-stop-hook (every run of the tool enables the amplifier for half a second)"))
+    # Worst case of the power-off sequence, every step at its limit (power/README.md): the signals
+    # agree 1.8 s after the loss, ride-through, the hooks, sync, guard record 3 s, 0.4 s.
+    shutdown = power.get("shutdown", {})
+    command_at = (1.8 + shutdown.get("ride_through_s", 8.0) + hook_time + shutdown.get("sync_timeout_s", 5.0)
+                  + 3.0 + 0.4)
+    last_resort = command_at + shutdown.get("last_resort_after_s", 10.0)
+    out.append((last_resort <= POWER_OFF_BUDGET_S, "power-off sequence fits the capacitor",
+                f"worst case: hooks {hook_time:g} s, power-off command {command_at:.1f} s after the loss, "
+                f"last resort at {last_resort:.1f} s",
+                f"last resort within {POWER_OFF_BUDGET_S:g} s (the capacitor lasted about 58 s at room temperature)"))
+    return out
+
+
 @item("power service hooks for the radar")
 def _(name):
     text = read("/etc/radar-runner/power.toml")
     if text is None:
         raise Skip("/etc/radar-runner/power.toml missing or unreadable")
-    hooks = tomllib.loads(text).get("hooks", {})
-    for hook in ("stop_radar", "amp_safe"):
-        argv = [str(a) for a in hooks.get(hook) or []]
-        if not argv:
-            report(INFO, f"power service hook {hook}", "not set (setup.sh prints the lines to add after the "
-                                                       "manager's first start)")
-            continue
-        limit = hooks.get(f"{hook}_timeout_s", 5.0)
-        try:
-            own = float(argv[argv.index("--timeout") + 1])
-        except (ValueError, IndexError):
-            own = None
-        check(f"power service hook {hook}", own is not None and limit > own and argv[0] == "/usr/bin/setpriv",
-              f"limit {limit:g} s, command's own --timeout {own if own is None else format(own, 'g')} s, "
-              f"run through {os.path.basename(argv[0])}",
-              "through setpriv (never a user's file as root), and the limit longer than --timeout")
+    try:
+        state_dir = manager_settings()["paths"]["state_dir"]
+    except Skip:
+        state_dir = MANAGER_STATE_DIR
+    for ok, what, observed, expected in power_hook_findings(tomllib.loads(text), os.path.join(state_dir, "sdr-state")):
+        if ok is None:
+            report(INFO, what, observed)
+        else:
+            check(what, ok, observed, expected)
 
 
 section("setup.sh: time (chrony, fake-hwclock)")

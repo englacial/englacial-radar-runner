@@ -24,6 +24,8 @@ What it copies from ORCA, because the manager depends on it:
 Time runs fast: FAKE_RADAR_SPEEDUP (default 1) multiplies the pulse rate.
 
 Control file (JSON, named by FAKE_ORCA_CONTROL):
+  "coerce_rate"  true: the SDR runs at half the requested rates (prints ORCA's "[WARNING]: Requested
+              ... rate" lines; they are also printed whenever RF0's rates do not divide DEVICE.clk_rate)
   "init_s"    how long the device set-up takes (default 0.1 s); SIGINT during it kills the program
   "radar"     "fail_start"     exit 1 at the end of the set-up, before the start line
               "no_start"       never print the start line (the handler is installed)
@@ -88,6 +90,15 @@ time.sleep(float(control.get("init_s", 0.1)))      # createUsrp, setupUsrp: firm
 if mode == "fail_start":
     say("Error: LookupError: KeyError: No devices found for ----->")
     sys.exit(1)
+# As UHD: the SDR runs at its clock divided by a whole number; ORCA (rf_settings.cpp) only warns.
+clk_rate = float(config["DEVICE"]["clk_rate"])
+for name, key in (("RX", "rx_rate"), ("TX", "tx_rate")):
+    requested = float(config["RF0"][key])
+    actual = clk_rate / max(1, round(clk_rate / requested))
+    if control.get("coerce_rate"):
+        actual = requested / 2
+    if actual != requested:
+        say(f"[WARNING]: Requested {name} rate (CH0): {requested:f} Hz. Actual {name} rate: {actual:f} Hz.")
 
 files = config["FILES"]
 chirp = config["CHIRP"]

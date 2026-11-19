@@ -118,6 +118,8 @@ DEFAULTS = {
             "resume_holdoff_s": 10.0,               # the gates must have been good for this long before a resume
             "stable_run_s": 300.0,                  # running this long clears the retry and resume counts
             "max_restarts_per_hour": 12,            # automatic restarts (retries and resumes) in any hour; then fault
+            "max_starts_per_hour": 40,              # starts of any kind in any hour, fresh runs included; then fault
+            "min_start_gap_s": 5.0,                 # no start sooner than this after the last run ended
         },
 
         "gates": {
@@ -153,8 +155,8 @@ DEFAULTS = {
                 "min_speed_mbps": 5000,                             # USB 3
                 # Until the first UHD start after power-up the SDR runs its boot
                 # loader, which is a USB 2 device with this product name. Its link
-                # speed is then unknown and the gate passes; the runner checks the
-                # radar's own "Operating over USB 3" line.
+                # speed is then unknown and the gate passes; the runner reads the
+                # speed from sysfs again once the radar has printed its start line.
                 "bootloader_product": "WestBridge",
             },
         },
@@ -221,6 +223,9 @@ DEFAULTS = {
             # mandatory for the tool: 30 s covers a first contact after power-up
             # (16.7 s measured: firmware 5.9 s, FPGA 8.2 s).
             "command": ["/home/englacial/englacial-radar-runner/tools/sdr_gpio_safe/amp_safe", "--timeout", "30"],
+            # The file that the tool's wrapper locks while it runs. "-" = the first word of `command`
+            # (the wrapper locks itself). The manager never records `safe` while the lock is held.
+            "lock_file": "-",
             "timeout_s": 40.0,                  # the manager kills the tool after this; must be longer than --timeout
             "assume_enabled_retries": 2,        # immediate retries when the tool says ASSUME_ENABLED (exit 3)
             "unavailable_retries": 3,           # after a radar exit: retries of NOT_FOUND, BUSY and TIMEOUT ...

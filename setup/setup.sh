@@ -560,11 +560,13 @@ step_manager() {
                            "stop", "--interrupt", "--wait", "--timeout", "4"]
              stop_radar_timeout_s = 5.0
              amp_safe = ["/usr/bin/setpriv", "--reuid=$SERVICE_USER", "--regid=$SERVICE_USER", "--init-groups", "--reset-env",
-                         "$UNIT_REPO/tools/sdr_gpio_safe/amp_safe",
-                         "--timeout", "20", "--state-file", "/var/lib/radar-runner/user/sdr-state"]
-             amp_safe_timeout_s = 22.0
+                         "$UNIT_REPO/bin/radar-manager-stop-hook",
+                         "--timeout", "10", "/var/lib/radar-runner/user/sdr-state"]
+             amp_safe_timeout_s = 12.0
 EOF
-    note "(each hook's limit is longer than its command's own --timeout; a first SDR contact took 17 s)"
+    note "(each hook's limit is longer than its command's own --timeout. The amp_safe hook runs the tool only"
+    note "if the record does not say safe and the SDR has its firmware; the tool then needs a few seconds."
+    note "Worst case, every step at its limit: power-off command 37 s after the loss, last resort at 47 s)"
 }
 
 # (j) Time. chrony takes time from gpsd and, when the internet is up, from

@@ -22,7 +22,7 @@ from radar_runner.manager.panel import Panel
 from radar_runner.manager.service import Manager
 
 REPO = common_config.REPO
-TEST_MINIMUMS = {"retry_delay_s": 0.0, "resume_holdoff_s": 0.0, "stable_run_s": 0.0}
+TEST_MINIMUMS = {"retry_delay_s": 0.0, "resume_holdoff_s": 0.0, "stable_run_s": 0.0, "min_start_gap_s": 0.0}
 
 
 class Running:
@@ -196,7 +196,8 @@ def test_status_file_content(env, mgr):
     assert status["overrides"] == {"no_amp_telemetry": False} and status["fault"] is None
     assert status["last_fault"] is None
     assert status["retries"] == {"failed_starts": 0, "max_retries": 2, "retry_in_s": None, "interruptions": 0,
-                                 "max_resumes": 5, "restarts_last_hour": 0, "max_restarts_per_hour": 12}
+                                 "max_resumes": 5, "restarts_last_hour": 0, "max_restarts_per_hour": 12,
+                                 "starts_last_hour": 0, "max_starts_per_hour": 600}
     assert status["not_ready"] == [] and status["leds"] == {"ready_yellow": "on", "running_green": "off"}
     assert status["sdr_state"] == "safe" and status["making_amp_safe"] is False
     assert status["amp_enabled_while_idle"] == "" and status["radar_gone"] is True and status["idle"] is True
@@ -266,7 +267,7 @@ def test_run_is_stopped_by_lost_telemetry_and_resumes_by_itself(env, mgr):
     mgr.ctl("stop", "--wait")
 
 
-def test_power_loss_stops_the_radar_checks_nothing_and_resumes_when_power_is_back(env, mgr):
+def test_power_loss_stops_the_radar_records_safe_without_a_reading_and_resumes_when_power_is_back(env, mgr):
     mgr.wait_state("ready")
     mgr.ctl("start")
     mgr.wait_state("running")
@@ -276,15 +277,17 @@ def test_power_loss_stops_the_radar_checks_nothing_and_resumes_when_power_is_bac
     assert status["leds"] == {"ready_yellow": "off", "running_green": "off"}
     assert status["idle"] and status["run_wanted"]
     end = env.metadata()["end"]
-    assert end["amp_safe"] is None and "power loss" in end["amp_safe_detail"] and end["amp_safe_command_run"] is False
+    # A clean exit: safe from that alone (the current says nothing without the 28 V rail).
+    assert end["amp_safe"] is True and end["amp_safe_command_run"] is False
+    assert "clean radar exit; power loss" in end["amp_safe_detail"]
+    assert env.sdr_state() == "safe"            # what the power service's amp_safe hook reads: nothing to do
     time.sleep(0.8)                             # several retry periods: the manager does nothing about the SDR now
-    assert env.amp_safe_calls() == 0 and mgr.status()["sdr_state"] == "unknown" and mgr.status()["fault"] is None
+    assert env.amp_safe_calls() == 0 and mgr.status()["sdr_state"] == "safe" and mgr.status()["fault"] is None
     stop = [e for e in mgr.events("stop")][-1]
     assert stop["urgent"] is True
     mgr.power = {"state": "normal", "radar_stop_requested": False}     # power is back before the shutdown
     mgr.amp_voltage, mgr.amp_current = 28.0, 0.16
     mgr.wait_state("running")
-    assert mgr.events("sdr_state")[-1]["why"] == "telemetry shows shutdown current with no radar process"
     assert env.amp_safe_calls() == 0
     mgr.ctl("stop", "--wait")
 
@@ -663,6 +666,47 @@ def test_a_reading_counts_only_some_time_after_the_manager_started(env):
         mgr.stop()
 
 
+def test_tool_ok_with_an_unwritable_record_is_not_asked_for_again_and_the_problem_is_shown(env):
+    # The wrapper returns 0 but could not write the record: without a memory of it the manager
+    # would run the tool (and enable the amplifier for half a second) every retry_s for ever.
+    env.behave(amp_safe="ok_unwritten")
+    mgr = Running(env).start(feed=("watcher", "power"))
+    try:
+        wait_for(lambda: mgr.events("amp_safe_done"))
+        time.sleep(1.2)                                     # four retry periods
+        assert env.amp_safe_calls() == 1
+        status = mgr.status()
+        assert status["sdr_state"] == "safe" and "kept in memory only" in status["sdr_state_problem"]
+        assert env.sdr_state() == "unknown"                 # the file itself
+        code, out = mgr.ctl("status")
+        assert "sdr:        PROBLEM: the record" in out
+    finally:
+        mgr.stop()
+
+
+def test_a_tool_run_of_another_program_keeps_the_manager_from_marking_the_record_safe(env):
+    import fcntl
+    lock = os.path.join(env.tmp, "amp_safe_lock")
+    open(lock, "w").close()
+    env.config["manager"]["amp_safe"]["lock_file"] = lock
+    ampsafe.SdrState(env.state_dir).set("unknown", "amp_safe: sdr_gpio_safe is starting")
+    holder = os.open(lock, os.O_RDONLY)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    mgr = Running(env).start()                              # a good reading: shutdown current
+    try:
+        mgr.wait_state("ready")
+        time.sleep(0.8)
+        assert env.sdr_state() == "unknown" and mgr.events("sdr_state") == []
+        os.close(holder)                                    # the other run is over (it failed to record)
+        holder = None
+        mgr.wait_sdr_safe()
+        assert env.amp_safe_calls() == 0
+    finally:
+        if holder is not None:
+            os.close(holder)
+        mgr.stop()
+
+
 def test_sdr_still_in_its_boot_loader_is_safe_without_the_tool(env):
     # After a power cycle a record left "unknown" by a hard power cut is stale.
     ampsafe.SdrState(env.state_dir).set("unknown", "radar launched, collection x")
@@ -875,6 +919,33 @@ def test_stop_wait_times_out_with_an_error_inside_its_timeout(env, mgr):
     assert code == 0 and time.monotonic() - t0 < 4.0
 
 
+def test_status_request_asks_for_radar_gone_now_not_from_the_last_snapshot(env, mgr):
+    mgr.wait_state("ready")
+    manager = mgr.manager
+    stale = dict(manager._status, radar_gone=False, marker="old snapshot")
+
+    class Frozen:                               # the service loop is busy: the snapshot stays as it is
+        def __get__(self, obj, cls):
+            return stale
+
+        def __set__(self, obj, value):
+            pass
+    original = type(manager).__dict__.get("_status")
+    type(manager)._status = Frozen()
+    try:
+        reply = manager._handle_request({"cmd": "status"})
+        assert reply["status"]["marker"] == "old snapshot" and reply["status"]["radar_gone"] is True
+        manager.runner.radar_gone = lambda: False
+        assert manager._handle_request({"cmd": "status"})["status"]["radar_gone"] is False
+        assert stale["radar_gone"] is False     # the snapshot itself is not changed from the socket thread
+    finally:
+        del manager.runner.radar_gone
+        if original is None:
+            del type(manager)._status
+        else:
+            type(manager)._status = original
+
+
 def test_stop_wait_does_not_wait_for_the_tool(env, mgr):
     env.config["manager"]["amp_safe"]["timeout_s"] = 4.0
     mgr.wait_state("ready")
@@ -886,7 +957,7 @@ def test_stop_wait_does_not_wait_for_the_tool(env, mgr):
     t0 = time.monotonic()
     code, out = mgr.ctl("stop", "--wait", "--timeout", "3")
     assert code == 0 and time.monotonic() - t0 < 1.5
-    status = mgr.status()
+    status = json.loads(mgr.ctl("status", "--json")[1])     # asked now; the status file follows within a round
     assert status["radar_gone"] is True and status["idle"] is False     # the amplifier step is still going
 
 
@@ -1097,3 +1168,75 @@ def test_manager_killed_during_a_tool_run_with_no_radar(env):
         proc2.send_signal(signal.SIGTERM)
         proc2.communicate(timeout=30)
     assert proc2.returncode == 0
+
+
+# ------------------------------------------------------------- the real default timings
+
+def test_with_the_default_timings_nothing_is_shrunk(env):
+    """One service run with every timing at its shipped default and the real minimums.
+
+    The other tests shorten the delays; this one shows the behaviour a unit really has:
+    a stop, the 5 s pause before the next start, a crash and its 10 s retry delay, the 2 s
+    settle time of the amplifier reading, and an urgent stop inside its 3 s budget.
+    """
+    defaults = common_config.DEFAULTS["manager"]
+    m = env.config["manager"]
+    for key in ("tick_s", "gate_interval_s", "status_interval_s"):
+        m[key] = defaults[key]
+    m["run"] = dict(defaults["run"])
+    for key in ("start_timeout_s", "stop_timeout_s", "urgent_grace_s", "urgent_stop_budget_s",
+                "chirp_timeout_s", "build_timeout_s"):
+        m["orca"][key] = defaults["orca"][key]
+    for key in ("timeout_s", "assume_enabled_retries", "unavailable_retries", "unavailable_delay_s", "retry_s",
+                "confirm_settle_s", "confirm_timeout_s", "max_loop_gap_s"):
+        m["amp_safe"][key] = defaults["amp_safe"][key]
+    m["amp_safe"]["command"] = m["amp_safe"]["command"][:-1] + ["30"]       # --timeout 30, as shipped
+    m["amp_safe"].pop("idle_enabled_s", None)
+    mgr = Running(env, minimums=None).start()               # the real minimums: nothing is refused
+    try:
+        mgr.wait_state("ready", timeout=15)                 # the first reading must be 2 s newer than the start
+        assert "config_warnings" not in mgr.status()
+        retries = mgr.status()["retries"]
+        assert retries["max_restarts_per_hour"] == 12 and retries["max_starts_per_hour"] == 40
+
+        # A run, a stop: the reading that marks the pin safe is waited for (settle 2 s), no tool.
+        assert mgr.ctl("start")[0] == 0
+        mgr.wait_state("running", timeout=15)
+        t_stop = time.monotonic()
+        assert mgr.ctl("stop", "--wait")[0] == 0
+        wait_for(lambda: mgr.status().get("idle"), timeout=15)
+        assert 1.5 < time.monotonic() - t_stop < 8.0        # confirm_settle_s, not the tests' zero
+        t_end = time.monotonic()
+        assert "tool not run: telemetry: amplifier current 0.16 A" in env.metadata()["end"]["amp_safe_detail"]
+
+        # Start again at once: accepted, but the SDR is not started within min_start_gap_s (5 s).
+        assert mgr.ctl("start")[0] == 0
+        assert "start in" in mgr.wait_state("starting")["detail"]
+        time.sleep(2.5)
+        assert len(env.collections()) == 1
+        mgr.wait_state("running", timeout=15)
+        assert time.monotonic() - t_end >= 4.5
+
+        # The radar crashes: the retry comes after retry_delays_s[0] (10 s), not sooner.
+        env.behave(radar="crash")
+        os.kill(mgr.status()["radar"]["pid"], signal.SIGKILL)
+        wait_for(lambda: mgr.events("retry"), timeout=15)
+        t_retry = time.monotonic()
+        assert mgr.events("retry")[-1]["delay_s"] == 10.0
+        env.behave()
+        time.sleep(7.0)
+        assert len(env.collections()) == 2 and mgr.state() == "starting"
+        mgr.wait_state("running", timeout=15)
+        assert time.monotonic() - t_retry >= 9.0
+        assert mgr.status()["retries"]["restarts_last_hour"] == 1 and mgr.status()["retries"]["starts_last_hour"] == 3
+
+        # The power service's stop hook: inside its 4 s with the default budget of 3 s.
+        t0 = time.monotonic()
+        code, out = mgr.ctl("stop", "--interrupt", "--wait", "--timeout", "4")
+        assert code == 0 and time.monotonic() - t0 < 3.5
+        assert env.sdr_state() == "safe" and env.amp_safe_calls() <= 1      # at most the one after the kill
+        assert mgr.ctl("stop")[0] == 0                      # and do not resume
+        wait_for(lambda: mgr.status().get("idle"), timeout=15)
+        assert mgr.status()["fault"] is None
+    finally:
+        mgr.stop()

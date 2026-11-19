@@ -42,6 +42,16 @@ this arithmetic, not the names of the fields:
     samples of the file: a file longer than that is cut off.
   * The amplifier is enabled while transmit and receive are both active.
 
+  * ORCA sets the SDR's master clock to DEVICE.clk_rate. The SDR can only
+    run at the clock divided by a whole number, and UHD quietly picks the
+    nearest such rate; ORCA prints "[WARNING]: Requested TX rate ... Actual
+    ..." and carries on, with every burst and the chirp's band scaled by
+    requested / actual. So the clock must be one the SDR has, and every rate
+    the clock divided by a whole number (the runner also treats that warning
+    line as a failed start).
+  * The mixer is tuned to RF0.freq + RF0.lo_offset; its leakage is on the air
+    there, and the chirp must lie within half the clock rate of it.
+
 So the three rates must be equal (RF1 = RF0, GENERATE.sample_rate =
 RF0.tx_rate), and the chirp must fit in tx_duration; the duty, window and band
 checks are computed from the real burst lengths all the same.
@@ -52,6 +62,11 @@ import os
 import re
 
 import yaml
+
+
+# The USRP B2xx: range of the master clock, and the largest whole-number divider
+# from the clock to a sample rate up to which every value is supported.
+MIN_CLK_RATE_HZ, MAX_CLK_RATE_HZ, MAX_RATE_DIVIDER = 5.0e6, 61.44e6, 128
 
 
 class ConfigError(Exception):
@@ -186,6 +201,7 @@ _CHECKED = (
     ("RF0", "tx_gain", _number), ("RF0", "freq", _number), ("RF0", "transmit", _boolean),
     ("RF0", "tx_rate", _number), ("RF0", "rx_rate", _number),
     ("RF1", "tx_rate", _number), ("RF1", "rx_rate", _number),
+    ("DEVICE", "clk_rate", _number),
     ("GENERATE", "sample_rate", _number), ("GENERATE", "chirp_length", _number),
     ("GENERATE", "chirp_bandwidth", _number), ("GENERATE", "lo_offset_sw", _number),
     ("CHIRP", "tx_duration", _number), ("CHIRP", "rx_duration", _number),
@@ -272,6 +288,21 @@ def check(config, limits):
             return (f"GENERATE.sample_rate ({generated:g}) differs from RF0.tx_rate ({rf0_tx:g}): the chirp "
                     "would be played at another speed and its band would change")
 
+    def clock_rate():
+        clk = _number(config, "DEVICE", "clk_rate")
+        if not MIN_CLK_RATE_HZ <= clk <= MAX_CLK_RATE_HZ:
+            return (f"DEVICE.clk_rate {clk:g} is outside what the SDR supports "
+                    f"({MIN_CLK_RATE_HZ:g} to {MAX_CLK_RATE_HZ:g})")
+        for key in ("tx_rate", "rx_rate"):
+            rate = _number(config, "RF0", key)
+            if rate <= 0:
+                return f"RF0.{key} must be positive"
+            divider = clk / rate
+            if rate > clk or divider != int(divider) or divider > MAX_RATE_DIVIDER:
+                return (f"RF0.{key} ({rate:g}) is not DEVICE.clk_rate ({clk:g}) divided by a whole number up to "
+                        f"{MAX_RATE_DIVIDER}: the SDR would run at another rate, and every burst and the "
+                        "chirp's band would change with it")
+
     def chirp_fits():
         tx = _number(config, "CHIRP", "tx_duration")
         chirp = _number(config, "GENERATE", "chirp_length")
@@ -316,9 +347,21 @@ def check(config, limits):
         scale = played / generated              # the chirp file is played at RF0.tx_rate
         centre = _number(config, "RF0", "freq") + offset * scale
         low, high = centre - width * scale / 2, centre + width * scale / 2
+        allowed = f"{limits['min_freq_hz'] / 1e6:g}-{limits['max_freq_hz'] / 1e6:g} MHz"
         if low < limits["min_freq_hz"] or high > limits["max_freq_hz"]:
-            return (f"chirp band {low / 1e6:g}-{high / 1e6:g} MHz is outside the allowed "
-                    f"{limits['min_freq_hz'] / 1e6:g}-{limits['max_freq_hz'] / 1e6:g} MHz")
+            return f"chirp band {low / 1e6:g}-{high / 1e6:g} MHz is outside the allowed {allowed}"
+        # The mixer runs at freq + lo_offset (ORCA: tune_request_t(freq, lo_offset); 0 if not given).
+        rf0 = config.get("RF0")
+        lo_offset = _number(config, "RF0", "lo_offset") if "lo_offset" in rf0 else 0.0
+        mixer = _number(config, "RF0", "freq") + lo_offset
+        if not limits["min_freq_hz"] <= mixer <= limits["max_freq_hz"]:
+            return (f"the mixer frequency {mixer / 1e6:g} MHz (RF0.freq + RF0.lo_offset) is outside the "
+                    f"allowed {allowed}: its leakage is transmitted")
+        clk = _number(config, "DEVICE", "clk_rate")
+        if max(abs(low - mixer), abs(high - mixer)) > clk / 2:
+            return (f"chirp band {low / 1e6:g}-{high / 1e6:g} MHz is more than half the clock rate "
+                    f"({clk / 2e6:g} MHz) from the mixer at {mixer / 1e6:g} MHz (RF0.lo_offset): "
+                    "the SDR cannot shift it there")
 
     def clock():
         value = _text(config, "DEVICE", "clk_ref")
@@ -345,7 +388,7 @@ def check(config, limits):
                              ("GENERATE", "out_file")):
             _text(config, section, key)
 
-    for fn in (amp_pin, amp_low, bank, gain, channels, transmit, rates, chirp_fits, duty, window, band, clock,
+    for fn in (amp_pin, amp_low, bank, gain, channels, transmit, rates, clock_rate, chirp_fits, duty, window, band, clock,
                formats, pulses, files):
         rule(fn)
     return problems
@@ -421,6 +464,8 @@ def derive(config, output_dir, max_chirps_per_file):
             out[section][key] = reader(out, section, key)
         if "pulse_length" in out["GENERATE"]:
             out["GENERATE"]["pulse_length"] = _number(out, "GENERATE", "pulse_length")
+        if "lo_offset" in out["RF0"]:
+            out["RF0"]["lo_offset"] = _number(out, "RF0", "lo_offset")
         _get(out, "FILES", "save_loc")
         _get(out, "GENERATE", "out_file")
     except _Bad as e:

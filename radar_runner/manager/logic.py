@@ -62,8 +62,12 @@ Rules
     `resume_holdoff_s` the run resumes, at most `max_resumes` times: then fault.
   * `stable_run_s` of uninterrupted running clears both counts. Independent of
     that, at most `max_restarts_per_hour` automatic restarts (retries and
-    resumes) are made in any hour: then fault (`restart_limit`). Nothing
-    resets that count but time.
+    resumes) are made in any hour: then fault (`restart_limit`). And at most
+    `max_starts_per_hour` starts of any kind, fresh runs included: then fault
+    (`start_limit`). Nothing resets these counts but time, and a person
+    clearing that fault (button, start, clear-fault): both lists then start
+    afresh. A fault cleared by the automatic source keeps them.
+  * No start comes sooner than `min_start_gap_s` after the last run ended.
   * A stop is urgent when it comes from a loss of power (the power gate,
     `interrupt`) or from the manager's own exit: the runner then has the radar
     gone within a fixed time.
@@ -104,7 +108,8 @@ LEDS = {
 # The smallest values the `manager.run` settings may have. Below them the
 # limits on restarts mean nothing (each radar start enables the amplifier for
 # about half a second), so such a value is refused and the default used.
-MINIMUMS = {"retry_delay_s": 5.0, "resume_holdoff_s": 2.0, "stable_run_s": 60.0}
+MINIMUMS = {"retry_delay_s": 5.0, "resume_holdoff_s": 2.0, "stable_run_s": 60.0, "min_start_gap_s": 2.0}
+LIMIT_FAULTS = ("restart_limit", "start_limit")
 
 
 @dataclass(frozen=True)
@@ -137,6 +142,8 @@ class LogicConfig:
     resume_holdoff_s: float = 10.0
     stable_run_s: float = 300.0
     max_restarts_per_hour: int = 12
+    max_starts_per_hour: int = 40
+    min_start_gap_s: float = 5.0
     manual_timeout_s: float = 50400.0       # 0 = no limit
     sources: tuple = (BUTTON, COMMAND)      # enabled trigger sources; add AUTO for the motion trigger
 
@@ -172,6 +179,14 @@ class LogicConfig:
         if not 1 <= per_hour <= 120:
             refuse("max_restarts_per_hour", "must be between 1 and 120")
             per_hour = default.max_restarts_per_hour
+        starts = run["max_starts_per_hour"]
+        if not 1 <= starts <= 600:
+            refuse("max_starts_per_hour", "must be between 1 and 600")
+            starts = default.max_starts_per_hour
+        gap = run["min_start_gap_s"]
+        if not low.get("min_start_gap_s", 0.0) <= gap <= 600:
+            refuse("min_start_gap_s", f"must be between {low.get('min_start_gap_s', 0.0):g} and 600 s")
+            gap = default.min_start_gap_s
         timeout = run["manual_timeout_s"]
         if timeout < 0:
             refuse("manual_timeout_s", "must not be negative")
@@ -180,7 +195,8 @@ class LogicConfig:
                         if triggers[name])
         return cls(retry_delays_s=tuple(float(d) for d in delays), max_resumes=resumes,
                    resume_holdoff_s=float(holdoff), stable_run_s=float(stable),
-                   max_restarts_per_hour=per_hour, manual_timeout_s=float(timeout), sources=sources), warnings
+                   max_restarts_per_hour=per_hour, max_starts_per_hour=starts, min_start_gap_s=float(gap),
+                   manual_timeout_s=float(timeout), sources=sources), warnings
 
 
 class ManagerLogic:
@@ -193,6 +209,8 @@ class ManagerLogic:
         self.failures = 0           # failed starts and crashes since the last stable run
         self.interruptions = 0      # interruptions since the last stable run
         self.restarts = []          # times of the automatic restarts of the last hour
+        self.starts = []            # times of all starts of the last hour
+        self.last_end_t = None      # when the last run ended
         self.retry_at = None        # earliest time of the next start after a failure or an interruption
         self.resume = False         # the next start continues an interrupted run
         self.stop_kind = ""         # why the current stop was asked for
@@ -276,9 +294,11 @@ class ManagerLogic:
         self._block_auto()
         self._event("fault", kind=kind, reason=reason)
 
-    def _clear_fault(self, why):
+    def _clear_fault(self, why, human=False):
         if self.fault:
             self._event("fault_cleared", by=why, kind=self.fault["kind"], reason=self.fault["reason"])
+            if human and self.fault["kind"] in LIMIT_FAULTS:
+                self.restarts, self.starts = [], []     # a person took charge: the hour starts afresh
             if self.last_fault:
                 self.last_fault["cleared_by"] = why
             self.fault = None
@@ -299,13 +319,19 @@ class ManagerLogic:
 
     def _start(self, t):
         restart = self.failures > 0 or self.resume
+        self.restarts = [x for x in self.restarts if t - x < 3600.0]
+        self.starts = [x for x in self.starts if t - x < 3600.0]
+        if restart and len(self.restarts) >= self.cfg.max_restarts_per_hour:
+            self._set_fault(t, "restart_limit", f"{len(self.restarts)} automatic restarts within an hour "
+                            f"(limit {self.cfg.max_restarts_per_hour}); last end: {self.last_end}")
+            return
+        if len(self.starts) >= self.cfg.max_starts_per_hour:
+            self._set_fault(t, "start_limit", f"{len(self.starts)} starts within an hour "
+                            f"(limit {self.cfg.max_starts_per_hour}); last end: {self.last_end}")
+            return
         if restart:
-            self.restarts = [x for x in self.restarts if t - x < 3600.0]
-            if len(self.restarts) >= self.cfg.max_restarts_per_hour:
-                self._set_fault(t, "restart_limit", f"{len(self.restarts)} automatic restarts within an hour "
-                                f"(limit {self.cfg.max_restarts_per_hour}); last end: {self.last_end}")
-                return
             self.restarts.append(t)
+        self.starts.append(t)
         self.phase = STARTING
         self.collection = None
         data = {"trigger": self.intent["label"], "attempt": self.failures + 1, "resume": self.resume}
@@ -378,7 +404,8 @@ class ManagerLogic:
                     waited = self.retry_at is None or t >= self.retry_at
                     settled = (not self.resume or
                                t - self.gates_good_since >= cfg.resume_holdoff_s)
-                    if waited and settled:
+                    rested = self.last_end_t is None or t - self.last_end_t >= cfg.min_start_gap_s
+                    if waited and settled and rested:
                         self._start(t)
         new = self.state
         if new != self._state:
@@ -434,7 +461,7 @@ class ManagerLogic:
         if block:                       # nothing changes: a fault stays, with its reason
             return False, f"not ready: {block}" + (f" (fault kept: {self.fault['reason']})" if self.fault else "")
         if self.fault:
-            self._clear_fault(source)
+            self._clear_fault(source, human=True)
         self._new_intent(t, source)
         return True, "starting"
 
@@ -494,7 +521,7 @@ class ManagerLogic:
     def clear_fault(self, t, source):
         if not self.fault:
             return True, "no fault"
-        self._clear_fault(source)
+        self._clear_fault(source, human=True)
         self._finish(t)
         return True, "fault cleared"
 
@@ -548,6 +575,7 @@ class ManagerLogic:
         was = self.phase
         self.phase = IDLE
         self.runs_ended += 1
+        self.last_end_t = t
         self.run_since = None
         cfg = self.cfg
         failure = info.get("failure", "")
@@ -608,9 +636,10 @@ class ManagerLogic:
         if state == NOT_READY and intent:
             detail = "will resume when ready" if self.resume else "will start when ready"
         elif state == STARTING and self.phase == IDLE:
-            wait = max(0.0, (self.retry_at or t) - t)
-            detail = (f"{'resume' if self.resume else 'retry'} in {wait:.0f} s" if wait
-                      else "waiting for the gates to settle")
+            rested_at = self.last_end_t + self.cfg.min_start_gap_s if self.last_end_t is not None else t
+            wait = max(0.0, (self.retry_at or t) - t, rested_at - t)
+            what = "resume" if self.resume else "retry" if self.failures else "start"
+            detail = f"{what} in {wait:.0f} s" if wait else "waiting for the gates to settle"
         else:
             detail = ""
         return {
@@ -631,7 +660,9 @@ class ManagerLogic:
                                        if self.retry_at is not None else None),
                         "interruptions": self.interruptions, "max_resumes": self.cfg.max_resumes,
                         "restarts_last_hour": len([x for x in self.restarts if t - x < 3600.0]),
-                        "max_restarts_per_hour": self.cfg.max_restarts_per_hour},
+                        "max_restarts_per_hour": self.cfg.max_restarts_per_hour,
+                        "starts_last_hour": len([x for x in self.starts if t - x < 3600.0]),
+                        "max_starts_per_hour": self.cfg.max_starts_per_hour},
             "auto": {"enabled": AUTO in self.cfg.sources, "source": self.auto_label,
                      "state": self.auto_state, "blocked": self.auto_blocked},
             "gates": {name: r.as_dict() for name, r in (self.results or {}).items()},

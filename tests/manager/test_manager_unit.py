@@ -93,7 +93,7 @@ def test_stop_hook_calls_the_tool_with_its_mandatory_timeout_and_the_state_file(
     with open(os.path.join(REPO, "bin", "radar-manager-stop-hook")) as f:
         text = f.read()
     call = re.search(r'^exec "\$tool" (.*)$', text, re.M).group(1)
-    assert call == '--timeout 30 --state-file "$state"'
+    assert call == '--timeout "$timeout" --state-file "$state"' and re.search(r"^timeout=30$", text, re.M)
     assert "/var/lib/radar-runner/user/sdr-state" in text and "tools/sdr_gpio_safe/amp_safe" in text
     assert os.path.exists(os.path.join(REPO, "tools", "sdr_gpio_safe", "amp_safe"))
     # The same state file as the manager uses.

@@ -30,7 +30,7 @@ class Telemetry:
         self.state, self.text, self.absent = state, text, rail_absent
         self.confirms = 0
 
-    def confirm_shutdown(self, exit_uptime):
+    def confirm_shutdown(self, exit_uptime, urgent=None):
         self.confirms += 1
         return self.state, self.text
 
@@ -363,6 +363,22 @@ def test_turn_on_check_hook_can_refuse_and_the_record_says_unknown_from_the_hook
     assert info["fatal"] and info["kind"] == "turn_on_check" and "no direct signal" in info["failure"]
     assert not info["launched"] and env.amp_safe_calls() == 0
     assert seen == ["unknown"] and env.sdr_state() == "unknown"     # the hook ran a radar of its own
+
+
+def test_turn_on_check_hook_is_not_called_if_unknown_cannot_be_recorded(env, events):
+    called = []
+    ampsafe.SdrState(env.state_dir).set("safe", "before")
+    r = Runner(env.config, events, turn_on_check=lambda run: called.append(1) or (True, ""),
+               amp_telemetry=Telemetry())
+    os.chmod(env.state_dir, 0o500)
+    try:
+        r.start(REQUEST)
+        info = events.wait("ended")
+    finally:
+        os.chmod(env.state_dir, 0o700)
+    # As at the radar launch: a check that runs a radar must not start while the record says "safe".
+    assert info["kind"] == "state" and "cannot record that the SDR state is unknown" in info["failure"]
+    assert called == [] and not info["launched"] and env.sdr_state() == "safe"
 
 
 def test_turn_on_check_hook_that_passes(env, events):
@@ -810,21 +826,67 @@ def test_tool_that_is_not_configured(env, events, runner):
 
 # ----------------------------------------------------------------------- power loss
 
-def test_stop_from_the_power_service_checks_nothing_and_leaves_the_record(env, events):
-    telemetry = Telemetry(True, "amplifier current 0.16 A at 28.0 V")
+def test_clean_stop_from_the_power_service_records_safe_from_the_facts_alone(env, events):
+    telemetry = Telemetry(False, "amplifier current 2.50 A at 28.0 V")     # must not even be asked
     r = Runner(env.config, events, amp_telemetry=telemetry)
     r.start(REQUEST)
     events.wait("started")
     t0 = time.monotonic()
     r.stop("power service: state loss", urgent=True, power=True)
+    while not r.radar_gone():
+        assert time.monotonic() - t0 < 1.5
+        time.sleep(0.005)
+    # The record is written before the radar counts as gone: the power service's amp_safe
+    # hook, which runs right after `radarctl stop --wait`, finds "safe" and does nothing.
+    assert env.sdr_state() == "safe"
     info = events.wait("ended")
-    assert time.monotonic() - t0 < 1.5
-    assert info["amp_safe"] is None and info["amp_safe_command_run"] is False
+    assert info["amp_safe"] is True and info["amp_safe_command_run"] is False
+    assert "clean radar exit; power loss (the stop came from the power service)" in info["amp_safe_detail"]
+    assert telemetry.confirms == 0 and env.amp_safe_calls() == 0
+    assert env.metadata()["end"]["amp_safe"] is True
+    r.shutdown(5)
+
+
+def test_unclean_stop_from_the_power_service_checks_nothing_and_leaves_the_record(env, events):
+    telemetry = Telemetry(True, "amplifier current 0.16 A at 28.0 V")
+    r = Runner(env.config, events, amp_telemetry=telemetry)
+    env.behave(init_s=5.0)                      # the power goes during the SDR set-up
+    r.start(REQUEST)
+    events.wait("collection")
+    while not glob.glob(os.path.join(env.collection_dir(), "uhd_stdout.log")):
+        time.sleep(0.02)
+    r.stop("power service: state loss", urgent=True, power=True)
+    info = events.wait("ended")
+    assert info["signalled_before_start"] and info["amp_safe"] is None and info["amp_safe_command_run"] is False
     assert "power loss (the stop came from the power service)" in info["amp_safe_detail"]
+    assert "nothing checked" in info["amp_safe_detail"]
     assert telemetry.confirms == 0 and env.amp_safe_calls() == 0
     with open(os.path.join(env.state_dir, "sdr-state")) as f:
-        assert f.readline() == "unknown\n"      # as it was: a later check decides
-    assert env.metadata()["end"]["amp_safe"] is None
+        assert f.readline() == "unknown\n"      # as it was: the power service's hook runs the tool
+    r.shutdown(5)
+
+
+def test_power_going_while_a_reading_is_waited_for_ends_the_wait(env, events):
+    class Waiting(Telemetry):
+        def confirm_shutdown(self, exit_uptime, urgent=None):
+            self.confirms += 1
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not urgent():
+                time.sleep(0.01)
+            return None, "cut short" if urgent() else "no reading"
+
+    r = Runner(env.config, events, amp_telemetry=Waiting())
+    env.behave(radar="crash")
+    r.start(REQUEST)
+    events.wait("started")
+    while not r.radar_gone():
+        time.sleep(0.02)
+    t0 = time.monotonic()
+    r.stop("power service: state loss", urgent=True, power=True)
+    info = events.wait("ended")
+    assert time.monotonic() - t0 < 1.0
+    # An unclean exit and now a power loss: the tool is left to the power service's hook.
+    assert info["amp_safe"] is None and env.amp_safe_calls() == 0 and "power loss" in info["amp_safe_detail"]
     r.shutdown(5)
 
 
@@ -837,6 +899,124 @@ def test_28_v_rail_absent_at_the_exit_is_treated_as_a_power_loss(env, events):
     assert info["amp_safe"] is None and "power loss (the 28 V rail reads absent)" in info["amp_safe_detail"]
     assert telemetry.confirms == 0 and env.amp_safe_calls() == 0 and env.sdr_state() == "unknown"
     r.shutdown(5)
+
+
+# ----------------------------------------------------- urgency during the tool sequence
+
+def test_assume_enabled_is_not_retried_once_power_loss_or_shutdown_has_begun(env, events, runner):
+    env.config["manager"]["amp_safe"]["assume_enabled_retries"] = 5
+    env.behave(amp_safe=3, amp_safe_s=0.5)
+    assert runner.make_safe("the state is not known")
+    time.sleep(0.2)                             # the first attempt is in progress
+    runner.hurry = True                         # what the service sets on a power loss and at its exit
+    done = events.wait("safe_done")
+    assert done["status"] == 3 and not done["ok"]
+    assert env.amp_safe_calls() == 1            # the attempt was finished, not killed; no other was made
+
+
+def test_assume_enabled_after_a_radar_exit_is_not_retried_once_the_stop_is_urgent(env, events, runner):
+    env.config["manager"]["amp_safe"]["assume_enabled_retries"] = 5
+    env.behave(radar="crash", amp_safe=3, amp_safe_s=0.5)
+    runner.start(REQUEST)
+    events.wait("started")
+    deadline = time.monotonic() + 10
+    while env.amp_safe_calls() < 1:
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    runner.stop("the manager is stopping", urgent=True)
+    info = events.wait("ended")
+    assert info["amp_safe"] is False and env.amp_safe_calls() == 1
+
+
+def test_delayed_retry_wait_is_cut_short_by_urgency(env, events, runner):
+    env.config["manager"]["amp_safe"].update(unavailable_retries=3, unavailable_delay_s=30.0)
+    env.behave(radar="crash", amp_safe=2)
+    runner.start(REQUEST)
+    events.wait("started")
+    deadline = time.monotonic() + 10
+    while env.amp_safe_calls() < 1:
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    t0 = time.monotonic()
+    runner.stop("the manager is stopping", urgent=True)
+    events.wait("ended", timeout=3)
+    assert time.monotonic() - t0 < 2.0 and env.amp_safe_calls() == 1
+
+
+# ------------------------------------------ the record: another tool run, an unwritable file
+
+def test_a_clean_exit_is_not_recorded_while_another_program_runs_the_tool(env, events):
+    import fcntl
+    lock = os.path.join(env.tmp, "amp_safe_lock")
+    open(lock, "w").close()
+    env.config["manager"]["amp_safe"]["lock_file"] = lock
+    r = Runner(env.config, events, amp_telemetry=Telemetry(True, "amplifier current 0.16 A at 28.0 V"))
+    r.start(REQUEST)
+    events.wait("started")
+    holder = os.open(lock, os.O_RDONLY)         # e.g. the watcher's run of the tool begins
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        r.stop("test stop")
+        info = events.wait("ended")
+    finally:
+        os.close(holder)
+    assert info["amp_safe"] is None and "in progress" in info["amp_safe_detail"]
+    assert env.sdr_state() == "unknown" and env.amp_safe_calls() == 0
+    r.shutdown(5)
+
+
+def test_tool_ok_with_an_unwritten_record_is_remembered_as_safe(env, events, runner):
+    env.behave(amp_safe="ok_unwritten")
+    assert runner.make_safe("the state is not known")
+    done = events.wait("safe_done")
+    assert done["ok"] and done["state"] == "safe" and "the record was not written" in done["detail"]
+    assert runner.sdr_state.get() == "safe" and "kept in memory only" in runner.sdr_state.problem
+    assert env.sdr_state() == "unknown"         # the file, as any other program reads it
+    # A radar launch ends the memory like any other "unknown".
+    info = run_and_stop(env, events, runner, record_s=0.1)
+    assert info["amp_safe"] is True and env.sdr_state() == "safe" and runner.sdr_state.problem == ""
+
+
+# --------------------------------------------- the SDR runs at another rate than asked
+
+def test_orcas_rate_warning_before_the_start_line_is_a_failed_start(env, events):
+    runner = Runner(env.config, events, amp_telemetry=Telemetry(True, "amplifier current 0.16 A at 28.0 V"))
+    env.behave(coerce_rate=True)
+    runner.start(REQUEST)
+    info = events.wait("ended")
+    assert info["fatal"] and info["kind"] == "rate"
+    assert "the SDR does not run at the requested sample rate" in info["failure"]
+    assert "[WARNING]: Requested RX rate (CH0): 56000000.000000 Hz. Actual RX rate: 28000000.000000 Hz." \
+        in info["failure"]
+    # The radar was stopped as soon as it could take the signal: not killed in its set-up, no tool run.
+    assert info["launched"] and info["started"] and not info["signalled_before_start"] and not info["killed"]
+    assert "started" not in events.names()
+    assert env.amp_safe_calls() == 0 and env.metadata()["end"]["how"] == "failed"
+    runner.shutdown(5)
+
+
+def test_stand_in_radar_warns_when_the_rates_do_not_divide_the_clock(env, events, runner):
+    # The limits refuse such a config; with the check out of the way the radar's own warning catches it.
+    with open(env.radar_config) as f:
+        config = yaml.safe_load(f)
+    for section, key in (("RF0", "tx_rate"), ("RF0", "rx_rate"), ("RF1", "tx_rate"), ("RF1", "rx_rate"),
+                         ("GENERATE", "sample_rate")):
+        config[section][key] = 40e6
+    with open(env.radar_config, "w") as f:
+        yaml.safe_dump(config, f)
+    runner.start(REQUEST)
+    info = events.wait("ended")
+    assert info["kind"] == "config" and "clk_rate" in info["failure"] and not info["launched"]
+    import radar_runner.manager.runner as runner_module
+    original = runner_module.limits.check
+    runner_module.limits.check = lambda config, limits_cfg: []
+    try:
+        runner.start(REQUEST)
+        info = events.wait("ended", count=2)
+    finally:
+        runner_module.limits.check = original
+    assert info["kind"] == "rate" and "Requested RX rate (CH0): 40000000.000000 Hz. Actual RX rate: 56000000" \
+        in info["failure"]
 
 
 # -------------------------------------------------- the tool outside a radar run

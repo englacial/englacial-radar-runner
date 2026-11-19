@@ -428,16 +428,18 @@ after an OLA reset (ZED-F9P, HPG 1.51, protocol 27.50):
   stopped or died, if the record `/var/lib/radar-runner/user/sdr-state` does not say `safe`.
 - **Not applied, printed only: the power service's hooks.** The script prints the two lines for
   `[hooks]` in `/etc/radar-runner/power.toml` (`stop_radar`: `radarctl stop --interrupt --wait
-  --timeout 4` with a 5 s limit; `amp_safe`: `tools/sdr_gpio_safe/amp_safe --timeout 20
-  --state-file /var/lib/radar-runner/user/sdr-state` with a 22 s limit; both through
+  --timeout 4` with a 5 s limit; `amp_safe`: `bin/radar-manager-stop-hook --timeout 10
+  /var/lib/radar-runner/user/sdr-state` with a 12 s limit, which runs the tool only if the
+  record does not say `safe` and the SDR is not in its boot loader; both through
   `setpriv`, so that root never runs a file from the user's checkout). Put them in by hand
   when the manager has passed its first start, then `sudo systemctl restart radar-power`
   (on the bench, with nothing at stake: a restart of the power service is itself a change
   to review). Worst case of the shutdown sequence with these limits: commit at about 10 s,
-  then 5 + 1 s, 22 + 1 s, sync 5 s, record 3 s: the power-off command at about 47 s
-  after the loss, against about 58 s of capacitor at room temperature (not measured cold).
-  The normal case is far shorter: the radar is gone in under a second and the tool takes
-  3.5 s when the SDR has been used since power-up.
+  then 5 + 1 s, 12 + 1 s, sync 5 s, record 3 s: the power-off command at about 37 s
+  after the loss and the last resort at 47 s, against about 58 s of capacitor at room
+  temperature (not measured cold). The normal case is far shorter: the radar is gone in
+  under a second, the manager records `safe` and the tool does not run at all (it takes
+  3.5 s when it does). `setup/check.py` checks the installed hooks against this.
 - **Also needed by hand before the first start:** `/etc/radar-runner/radar.yaml` (the ORCA
   config to run) and the unit's limits (`manager.limits` in `/etc/radar-runner/local.yaml`).
 - **Verify:** `setup/check.py` (section "setup.sh: radar manager"); `radarctl status`.

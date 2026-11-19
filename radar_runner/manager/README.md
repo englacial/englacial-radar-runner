@@ -92,6 +92,14 @@ generated at `GENERATE.sample_rate`, is played at `RF0.tx_rate`. So:
 * `RF1.tx_rate` = `RF0.tx_rate`, `RF1.rx_rate` = `RF0.rx_rate`,
   `GENERATE.sample_rate` = `RF0.tx_rate`; chirp and pulse no longer than
   `tx_duration`; the chirp fits in the sample rate;
+* `DEVICE.clk_rate` between 5 and 61.44 MHz, and `RF0`'s rates equal to it
+  divided by a whole number (up to 128). The SDR can run at no other rate: UHD
+  quietly picks the nearest one and ORCA only prints a warning, so a rate of
+  200 MS/s with a 56 MHz clock would run at 56 MS/s with every burst 3.6 times
+  longer. As a second line of defence, ORCA's `[WARNING]: Requested ... rate`
+  line before `[START]` is a failed start and a fault (`rate`);
+* the mixer frequency `RF0.freq + RF0.lo_offset` inside the allowed band (its
+  leakage is transmitted), and the chirp within half the clock rate of it;
 * amplifier pin 2, active low, bank FP0;
 * `RF0.tx_gain` at most `max_tx_gain`;
 * enable duty (real transmit burst / `pulse_rep_int`) at most `max_enable_duty`;
@@ -145,7 +153,10 @@ runs (`--state-file`: `unknown` before, `safe` after an OK). The manager writes
 | The radar was killed, crashed, exited non-zero or never reached running | the tool runs |
 | Either of the two, with an amplifier reading that counts (below) | the current decides: shutdown current is safe, enabled current runs the tool |
 | The radar was signalled before `[START]` | the tool runs, whatever the reading |
-| The stop came from the power service, or the 28 V rail reads absent | nothing is checked, nothing is written: the record stays `unknown` |
+| The stop came from the power service, or the 28 V rail reads absent | no reading is waited for and the tool is not run. A clean exit: `safe` is recorded from that alone, before `radarctl stop --wait` returns. Otherwise the record stays `unknown` and the power service's `amp_safe` hook runs the tool |
+| Power loss or the manager's exit begins while a reading is waited for or the tool runs | the wait ends; the attempt of the tool in progress is finished, no further one is made |
+| Another program's run of the tool is in progress (its lock is held) | the manager does not write `safe`: that run has written `unknown` and records its own outcome |
+| The pin is safe but the record cannot be written (state directory not writable) | `safe` is kept in this manager's memory while the file stays as it is, so the tool is not run again and again; the status shows `sdr_state_problem` |
 | No radar, record `unknown` or missing (also at manager start), SDR not in its boot loader | a reading that counts and shows shutdown current: `safe`. No reading: the tool runs, again every `retry_s` (60 s) until it succeeds |
 | The SDR is still in its boot loader (nothing initialised it since power-up) | safe |
 | Enabled current with no radar process | shown in the status (`amp_enabled_while_idle`); never marked safe; **the safety watcher acts on it**, not the manager |
@@ -159,6 +170,8 @@ running evenly (`loop.last_gap_s` at most 1 s: after a stall the rows that
 piled up come out together), and, for shutdown current, `amp.sample_uptime_s`
 is at least `confirm_settle_s` (2 s) after the end of the last radar or tool
 run. That time is when the row reached the Pi; the ADC measured it earlier.
+A reading taken during a stall means "wait for the next one" (for at most
+`confirm_timeout_s`, 5 s), not "no reading": one stall does not run the tool.
 
 The tool is only ever run by the runner's one thread, never while a radar that
 the manager started is alive; a start asked for meanwhile waits for it. The
@@ -166,7 +179,33 @@ manager's limit for the tool (`timeout_s`, 40 s) is longer than the tool's own
 `--timeout` (30 s; a first contact after power-up took 17 s). The unit's stop
 hook (`bin/radar-manager-stop-hook`) runs the tool after the manager has
 stopped or died, if the record does not say `safe` and the SDR is not in its
-boot loader.
+boot loader. The power service's `amp_safe` hook is the same script with
+`--timeout 10`, so on a power loss the tool runs only when it is needed.
+
+### The power-off sequence
+
+With the two hook lines that `setup/setup.sh` prints (`stop_radar`:
+`radarctl stop --interrupt --wait --timeout 4`, limit 5 s; `amp_safe`:
+`bin/radar-manager-stop-hook --timeout 10`, limit 12 s), in seconds after the
+loss of main power (the power service's own steps are in `power/README.md`):
+
+| | Typical | Worst case (every step at its limit) |
+|---|---|---|
+| Commit | 9.8 | 9.8 |
+| `stop_radar` hook (5 s + 1 s) | radar gone in under 1 s; `safe` recorded | 15.8 |
+| `amp_safe` hook (12 s + 1 s) | record says `safe`: nothing run | 28.8 |
+| `sync` (5 s) | | 33.8 |
+| Guard record (3 s) | | 36.8 |
+| Power-off command | about 11 | 37.2 |
+| Last resort, if still running | | 47.2 |
+
+The capacitor carried the running radar for about 58 s at room temperature
+(not measured cold): 21 s are left after the command and 11 s after the last
+resort in the worst case. When the tool does run (the radar was killed, or
+signalled during its set-up), it takes about 3.5 s with the SDR's firmware
+loaded; with the SDR still in its boot loader the hook does nothing.
+`setup/check.py` adds up the installed hooks' limits and fails above 48 s to
+the last resort.
 
 ## Faults
 
@@ -174,7 +213,9 @@ boot loader.
 |---|---|
 | `start_failures` | a start failed or the radar exited with an error, and the retries (after 10, 30, 90 s) are used up |
 | `resume_limit` | the run was interrupted more than `max_resumes` times without a stable run in between |
-| `restart_limit` | more than `max_restarts_per_hour` (12) automatic restarts (retries and resumes) in an hour; only time resets this count |
+| `restart_limit` | more than `max_restarts_per_hour` (12) automatic restarts (retries and resumes) in an hour |
+| `start_limit` | more than `max_starts_per_hour` (40) starts of any kind in an hour, fresh runs included |
+| `rate` | the SDR does not run at the requested sample rate (ORCA's warning before `[START]`) |
 | `amp_unsafe` | the amplifier pin could not be confirmed safe |
 | `config` | the config failed its limits at the start itself |
 | `turn_on_check` | the turn-on check refused (stage 7; no hook is installed yet) |
@@ -191,12 +232,23 @@ Leaving a fault:
 * A press or `start` while a gate is bad changes nothing: the fault and its
   reason stay.
 * A restart of the manager clears any fault.
+* The two per-hour counts are reset by time only, and by a person clearing a
+  `restart_limit` or `start_limit` fault (button, `start`, `clear-fault`):
+  both lists then start afresh. The automatic source clearing the fault does
+  not reset them.
+
+Every start initialises the SDR, which enables the amplifier for about half a
+second. So no start comes sooner than `min_start_gap_s` (5 s) after the last
+run ended, and `max_starts_per_hour` is 40: one start every 90 s, kept up for
+a whole hour. Stop-and-go driving with the motion trigger stays well below
+that as long as the trigger needs some tens of seconds to call a stop; a
+trigger or a gate that flaps faster is stopped by this limit.
 
 The status keeps the last fault and how it was cleared (`last_fault`).
 
 Settings that would defeat the limits are refused with a warning and the
 default used: a retry delay under 5 s, `stable_run_s` under 60 s,
-`resume_holdoff_s` under 2 s.
+`resume_holdoff_s` under 2 s, `min_start_gap_s` under 2 s.
 
 ## A collection
 
@@ -225,7 +277,9 @@ radarctl override no-amp-telemetry on|off
 
 Exit status 0 done, 1 refused or failed, 2 usage, 3 manager not running.
 `stop --wait` returns as soon as the radar process is gone (the amplifier step
-that may follow is not waited for), and never later than `--timeout`.
+that may follow is not waited for), and never later than `--timeout`. The
+manager answers that question at the moment it is asked, not from its last
+status snapshot.
 `--interrupt` is an urgent stop that keeps the run wanted: it resumes when the
 gates are good again (power came back).
 

@@ -10,6 +10,8 @@ from radar_runner.common import status as S
 from radar_runner.manager import ampsafe, gates as G
 from radar_runner.manager.logic import GateResult
 
+INSTALLED = "/home/englacial/englacial-radar-runner"
+
 MANAGER = common_config.DEFAULTS["manager"]
 
 
@@ -384,10 +386,17 @@ def test_after_exit_actions():
     assert ampsafe.after_exit(EARLY, never, "")[0] == "run"
 
 
-@pytest.mark.parametrize("facts", [CLEAN, KILLED, EARLY])
-def test_after_exit_on_a_power_loss_checks_nothing_and_writes_nothing(facts):
+@pytest.mark.parametrize("facts", [KILLED, EARLY, dict(CLEAN, exit_status=1), dict(CLEAN, reached_running=False)])
+def test_after_exit_on_a_power_loss_after_an_unclean_exit_checks_nothing_and_writes_nothing(facts):
     action, why = ampsafe.after_exit(facts, never, "the stop came from the power service")
     assert action == "leave" and "power loss (the stop came from the power service)" in why
+
+
+def test_after_exit_on_a_power_loss_a_clean_exit_is_safe_from_the_facts_alone():
+    # Reached running, SIGINT, status 0: no telemetry is needed (and none is waited for).
+    action, why = ampsafe.after_exit(CLEAN, never, "the stop came from the power service")
+    assert action == "safe" and "clean radar exit" in why and "no reading waited for" in why
+    assert ampsafe.after_exit(CLEAN, never, "the 28 V rail reads absent")[0] == "safe"
 
 
 def test_exit_codes_of_the_tool_are_named():
@@ -531,13 +540,42 @@ def test_a_reading_from_a_stalled_telemetry_loop_is_no_proof_of_shutdown(env):
     publish_amp(env, 0.156, gap=3.5)
     state, text = amp_telemetry(env).confirm_shutdown(exit_uptime)
     assert state is None and "the telemetry loop has just stalled" in text
-    assert amp_telemetry(env).now(exit_uptime)[0] is None
-    publish_amp(env, 0.156, gap=None)                       # a file without the loop field: the same
+    publish_amp(env, 0.156, gap=None)                       # a file without the loop field: no reading
     assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is None
+    assert amp_telemetry(env).now(exit_uptime - 10.0)[0] is None
     publish_amp(env, 2.5, gap=3.5)                          # enabled current is believed all the same
     assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is False
     publish_amp(env, 0.156, gap=0.26)
     assert amp_telemetry(env).confirm_shutdown(exit_uptime)[0] is True
+
+
+def test_one_stall_means_wait_for_the_next_reading_not_no_reading(env):
+    clock = [100.0]
+    amp = amp_telemetry(env, monotonic=lambda: clock[0])
+    after = now_uptime() - 10.0                             # the last run ended long ago
+    publish_amp(env, 0.156, gap=3.5)
+    state, text = amp.now(after)
+    assert state == ampsafe.PENDING and "waiting for the next reading" in text
+    assert ampsafe.idle_need(ampsafe.UNKNOWN, ampsafe.LOADED, state)[0] == "none"      # the tool does not run
+    clock[0] += 0.5
+    publish_amp(env, 0.156, gap=0.25)                       # the next round is even again
+    assert amp.now(after)[0] is True
+    # A loop that stays stalled is "no reading" after confirm_timeout_s (0.5 s here) ...
+    publish_amp(env, 0.156, gap=3.5)
+    assert amp.now(after)[0] == ampsafe.PENDING
+    clock[0] += 0.6
+    assert amp.now(after)[0] is None
+    # ... and enabled current is believed at once, stall or not.
+    publish_amp(env, 2.5, gap=3.5)
+    assert amp.now(after)[0] is False
+
+
+def test_the_wait_for_a_reading_ends_when_the_stop_becomes_urgent(env):
+    sleeps = []
+    amp = amp_telemetry(env, sleep=sleeps.append)
+    publish_amp(env, 0.156, age=5.0)                        # only a reading from before the exit
+    state, text = amp.confirm_shutdown(now_uptime(), urgent=lambda: len(sleeps) >= 1)
+    assert state is None and "cut short" in text and len(sleeps) == 1
 
 
 def test_confirm_says_nothing_without_the_28_v_rail_or_fresh_telemetry(env):
@@ -576,6 +614,71 @@ def test_sdr_state_record(env):
     assert "no-dir" in ampsafe.SdrState(os.path.join(env.tmp, "no-dir")).set("safe")
 
 
+def test_the_lock_probe_sees_a_running_wrapper_and_nothing_else(env):
+    import fcntl
+    lock = os.path.join(env.tmp, "amp_safe_script")
+    with open(lock, "w") as f:
+        f.write("#!/bin/sh\n")
+    assert ampsafe.tool_running(lock) is False
+    assert ampsafe.tool_running(os.path.join(env.tmp, "missing")) is False      # no tool: none can be running
+    holder = os.open(lock, os.O_RDONLY)                     # as the real wrapper: flock on its own script
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert ampsafe.tool_running(lock) is True
+        assert ampsafe.tool_running(lock) is True           # the probe takes nothing itself
+    finally:
+        os.close(holder)
+    assert ampsafe.tool_running(lock) is False
+    # The lock file is the first word of the command unless a setting names another.
+    cfg = common_config.DEFAULTS["manager"]["amp_safe"]
+    assert ampsafe.tool_lock_path(cfg) == cfg["command"][0] and cfg["command"][0].endswith("sdr_gpio_safe/amp_safe")
+    assert ampsafe.tool_lock_path(dict(cfg, lock_file="/x/y")) == "/x/y"
+    # The real wrapper locks itself (read from its source; it is never run here).
+    with open(cfg["command"][0].replace(INSTALLED, common_config.REPO)) as f:
+        source = f.read()
+    assert "SCRIPT = os.path.realpath(__file__)" in source and "fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)" in source
+
+
+def test_the_record_is_not_marked_safe_while_another_run_of_the_tool_is_in_progress(env):
+    import fcntl
+    lock = os.path.join(env.tmp, "amp_safe_script")
+    open(lock, "w").close()
+    state = ampsafe.SdrState(env.state_dir, lock)
+    state.set("unknown", "amp_safe: sdr_gpio_safe is starting")         # what the other wrapper wrote
+    holder = os.open(lock, os.O_RDONLY)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        done, text = state.mark_safe("telemetry shows shutdown current")
+        assert not done and "in progress" in text and state.get() == "unknown"
+    finally:
+        os.close(holder)
+    assert state.mark_safe("telemetry shows shutdown current") == (True, "") and state.get() == "safe"
+
+
+def test_safe_is_remembered_in_memory_when_the_record_cannot_be_written(env):
+    state = ampsafe.SdrState(env.state_dir)
+    state.set("unknown", "radar launched")
+    os.chmod(env.state_dir, 0o500)                          # the state directory is not writable
+    try:
+        done, error = state.mark_safe("clean radar exit")
+        assert done and "Permission denied" in error
+        assert state.get() == "safe" and state.known_safe   # for this manager ...
+        assert "could not be written" in state.problem and "kept in memory only" in state.problem
+        assert "the file says: " in state.why()
+        assert ampsafe.SdrState(env.state_dir).get() == "unknown"      # ... not for another program
+        assert ampsafe.idle_need(state.get(), ampsafe.LOADED, None)[0] == "none"    # the tool is not asked for again
+    finally:
+        os.chmod(env.state_dir, 0o700)
+    # Anybody writing the record ends the memory: the file decides again.
+    ampsafe.SdrState(env.state_dir).set("unknown", "amp_safe: sdr_gpio_safe is starting")
+    assert state.get() == "unknown" and state.problem == ""
+    state.remember_safe("x")
+    state.set("unknown", "radar launched")                  # and so does this manager's own "unknown"
+    assert state.get() == "unknown"
+    state.remember_safe("x")
+    assert state.set("safe", "ok") == "" and state.problem == "" and state.get() == "safe"
+
+
 def test_sdr_state_is_replaced_never_edited_in_place(env):
     state = ampsafe.SdrState(env.state_dir)
     state.set("unknown", "x")
@@ -597,7 +700,7 @@ def test_record_written_by_the_real_wrapper_format_is_read(env):
 
 # --------------------------------------------------------------- the stop hook script
 
-def stop_hook(env, tool_status, product=None):
+def stop_hook(env, tool_status, product=None, options=()):
     """Run bin/radar-manager-stop-hook with a stand-in tool. Returns (exit status, calls of the tool)."""
     import subprocess
     from radar_runner.common import config as common_config
@@ -609,7 +712,7 @@ def stop_hook(env, tool_status, product=None):
     if product is not None:
         env.sdr(speed=480 if product == "WestBridge" else 5000, product=product)
     hook = os.path.join(common_config.REPO, "bin", "radar-manager-stop-hook")
-    result = subprocess.run([hook, os.path.join(env.state_dir, "sdr-state"), tool, env.sysfs], timeout=20)
+    result = subprocess.run([hook, *options, os.path.join(env.state_dir, "sdr-state"), tool, env.sysfs], timeout=20)
     try:
         with open(calls) as f:
             return result.returncode, f.read().splitlines()
@@ -629,6 +732,17 @@ def test_stop_hook_runs_the_tool_with_the_state_file_when_the_record_is_not_safe
     assert code == 0 and calls == [f"--timeout 30 --state-file {state.path}"]
     code, calls = stop_hook(env, 3)                         # the tool's status is passed on
     assert code == 3 and len(calls) == 2
+
+
+def test_stop_hook_as_the_power_service_hook_passes_its_timeout_and_runs_only_when_needed(env):
+    state = ampsafe.SdrState(env.state_dir)
+    state.set("unknown", "radar launched, collection x")
+    code, calls = stop_hook(env, 0, options=("--timeout", "10"))
+    assert code == 0 and calls == [f"--timeout 10 --state-file {state.path}"]
+    state.set("safe", "clean radar exit; power loss")      # what the manager records after a clean stop
+    assert stop_hook(env, 0, options=("--timeout", "10"))[1] == calls           # no further call
+    state.set("unknown", "radar launched, collection y")
+    assert stop_hook(env, 0, product="WestBridge", options=("--timeout", "10"))[1] == calls
 
 
 def test_stop_hook_with_no_record_runs_the_tool(env):

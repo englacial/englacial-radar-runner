@@ -47,7 +47,8 @@ class Env:
         m["tick_s"] = 0.02
         m["gate_interval_s"] = 0.05
         m["status_interval_s"] = 0.1
-        m["run"].update(retry_delays_s=[0.2, 0.3], resume_holdoff_s=0.2, stable_run_s=60.0)
+        m["run"].update(retry_delays_s=[0.2, 0.3], resume_holdoff_s=0.2, stable_run_s=60.0, min_start_gap_s=0.05,
+                        max_starts_per_hour=600)        # the tests start far more often than a unit may
         m["gates"]["data"].update(mount_point="", root=self.root, start_min_free_gb=0.001, stop_min_free_gb=0.0005)
         m["gates"]["sdr"]["sysfs_dir"] = self.sysfs
         m["limits"]["max_tx_gain"] = 72.0       # the bench config in the fixture runs at 72
@@ -136,7 +137,7 @@ def env(tmp_path):
 
 
 # The smallest run settings the tests may use (the real minimums are in logic.MINIMUMS).
-TEST_MINIMUMS = {"retry_delay_s": 0.0, "resume_holdoff_s": 0.0, "stable_run_s": 0.0}
+TEST_MINIMUMS = {"retry_delay_s": 0.0, "resume_holdoff_s": 0.0, "stable_run_s": 0.0, "min_start_gap_s": 0.0}
 
 
 class Events:

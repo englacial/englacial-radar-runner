@@ -444,3 +444,74 @@ def test_continuous_or_counted():
     assert L.continuous(config) is True
     config["CHIRP"]["num_pulses"] = 10000
     assert L.continuous(config) is False
+
+
+# ------------------------------------------------- the clock and what the SDR really runs at
+
+def all_rates(config, rate):
+    for section, key in (("RF0", "tx_rate"), ("RF0", "rx_rate"), ("RF1", "tx_rate"), ("RF1", "rx_rate"),
+                         ("GENERATE", "sample_rate")):
+        config[section][key] = rate
+
+
+def rate_problems(rate, clk):
+    def change(config):
+        all_rates(config, rate)
+        config["DEVICE"]["clk_rate"] = clk
+    return problems(change)
+
+
+@pytest.mark.parametrize("rate, clk", [
+    (200e6, 56e6),      # the SDR would run at 56 MS/s: bursts 3.6 times longer, duty about 0.5
+    (35e6, 56e6),       # not a whole divider: coerced to 28 or 56 MS/s
+    (40e6, 56e6),       # runs faster than asked: the band widens 1.4 times
+    (56e6, 28e6),       # faster than the clock
+    (56e6, 112e6),      # a clock the SDR does not have
+    (56e6, 61.45e6),
+    (2e6, 4e6),         # clock below the SDR's range
+    (0.1e6, 56e6),      # a divider of 560
+])
+def test_rates_the_sdr_would_coerce_are_refused(rate, clk):
+    found = rate_problems(rate, clk)
+    assert any("clk_rate" in p for p in found), found
+
+
+@pytest.mark.parametrize("rate, clk", [(56e6, 56e6), (28e6, 56e6), (14e6, 56e6), (61.44e6, 61.44e6),
+                                       (30.72e6, 61.44e6)])
+def test_rates_that_divide_the_clock_pass_the_clock_rule(rate, clk):
+    assert not any("clk_rate" in p for p in rate_problems(rate, clk))
+
+
+def test_the_bench_config_still_passes():
+    assert L.check(good(), LIMITS) == []
+
+
+def test_a_missing_or_unreadable_clock_rate_is_refused():
+    assert any("clk_rate" in p for p in problems(lambda c: c["DEVICE"].pop("clk_rate")))
+    assert any("clk_rate" in p for p in problems(setter("DEVICE", "clk_rate", "fast")))
+
+
+def test_the_mixer_frequency_must_be_in_the_band():
+    assert problems(setter("RF0", "lo_offset", 0.0)) == []
+    assert problems(lambda c: c["RF0"].pop("lo_offset")) == []           # ORCA's default is 0
+    found = problems(setter("RF0", "lo_offset", -70e6))                 # mixer at 220 MHz
+    assert any("mixer frequency 220 MHz" in p for p in found), found
+    found = problems(setter("RF0", "lo_offset", 111e6))                 # mixer at 401 MHz
+    assert any("mixer frequency" in p for p in found), found
+    assert any("lo_offset" in p for p in problems(setter("RF0", "lo_offset", "x")))
+
+
+def test_the_chirp_must_be_within_half_the_clock_of_the_mixer():
+    # Chirp 285-315 MHz; mixer at 290 + 40 = 330 MHz with a 56 MHz clock reaches down to 302 MHz only.
+    found = problems(setter("RF0", "lo_offset", 40e6))
+    assert any("half the clock rate" in p for p in found), found
+    assert problems(setter("RF0", "lo_offset", 15e6)) == []             # 305 MHz: 285-315 is within 28 MHz
+
+
+def test_the_derived_config_carries_the_clock_and_offset_as_numbers():
+    config = good()
+    config["DEVICE"]["clk_rate"] = "56e6"
+    config["RF0"]["lo_offset"] = "0"
+    derived = L.derive(config, "data/x", 100)
+    assert derived["DEVICE"]["clk_rate"] == 56e6 and type(derived["DEVICE"]["clk_rate"]) is float
+    assert derived["RF0"]["lo_offset"] == 0.0 and type(derived["RF0"]["lo_offset"]) is float

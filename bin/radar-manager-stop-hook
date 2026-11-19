@@ -1,15 +1,28 @@
 #!/bin/sh
-# Stop hook of radar-manager.service (ExecStopPost): runs after every stop of
-# the unit, clean or not, once all its processes are gone, so no radar is alive.
+# Make the amplifier safe, but only if that is needed. Used twice:
+#   * as the stop hook of radar-manager.service (ExecStopPost): runs after every
+#     stop of the unit, clean or not, once all its processes are gone;
+#   * as the power service's amp_safe hook (with --timeout 10), after its
+#     stop_radar hook.
 #
 # If the SDR's amplifier pin is not known to be safe (radar_runner/manager/ampsafe.py:
 # the first line of the record is not "safe"), and the SDR has been initialised
 # since it was powered (it is not in its boot loader), run the make-amplifier-safe
 # tool. The tool keeps the record itself (--state-file). This is the case when the
-# manager died or was killed while a radar or the tool ran. After a clean stop
-# the record says "safe" and nothing is done.
+# manager died or was killed while a radar or the tool ran, or when the radar did
+# not exit cleanly. After a clean stop the record says "safe" and nothing is done:
+# every run of the tool enables the amplifier for about half a second.
 #
-#   radar-manager-stop-hook [state file] [tool] [sysfs USB directory]
+#   radar-manager-stop-hook [--timeout SECONDS] [state file] [tool] [sysfs USB directory]
+#
+# --timeout is passed to the tool (default 30: a first contact after power-up took
+# 17 s; 10 is enough once the SDR has its firmware, the only case in which the tool
+# runs here). The caller's own limit must be longer than it.
+timeout=30
+if [ "$1" = --timeout ]; then
+    timeout=$2
+    shift 2
+fi
 here=$(dirname "$(readlink -f "$0")")
 state=${1:-/var/lib/radar-runner/user/sdr-state}
 tool=${2:-$here/../tools/sdr_gpio_safe/amp_safe}
@@ -21,4 +34,4 @@ for dev in "$sysfs"/*; do
     # Boot loader: nothing has initialised the SDR since power-up, its pin floats high.
     [ "$(cat "$dev/product" 2>/dev/null)" = WestBridge ] && exit 0
 done
-exec "$tool" --timeout 30 --state-file "$state"
+exec "$tool" --timeout "$timeout" --state-file "$state"

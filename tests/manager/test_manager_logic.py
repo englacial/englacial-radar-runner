@@ -29,6 +29,8 @@ class Sim:
         cfg.setdefault("stable_run_s", 300.0)
         cfg.setdefault("manual_timeout_s", 0.0)
         cfg.setdefault("max_restarts_per_hour", 1000)       # its own tests set it
+        cfg.setdefault("max_starts_per_hour", 1000)         # likewise
+        cfg.setdefault("min_start_gap_s", 0.0)              # likewise
         self.logic = ManagerLogic(LogicConfig(sources=tuple(sources), **cfg))
         self.t = 0.0
         self.bad = {}           # gate name -> GateResult
@@ -817,7 +819,7 @@ def test_snapshot_is_plain_json_in_every_state():
     snap = s.logic.snapshot()
     assert snap["retries"] == {"failed_starts": 1, "max_retries": 3, "retry_in_s": 10.0,
                                "interruptions": 0, "max_resumes": 2, "restarts_last_hour": 0,
-                               "max_restarts_per_hour": 1000}
+                               "max_restarts_per_hour": 1000, "starts_last_hour": 1, "max_starts_per_hour": 1000}
     assert snap["leds"] == {"ready_yellow": "breathing", "running_green": "off"}
     json.dumps(snap)
 
@@ -900,30 +902,144 @@ def test_restart_cap_counts_retries_of_failed_starts_too():
     assert s.state == L.FAULT and s.logic.fault["kind"] == "restart_limit"
 
 
-def test_restart_cap_is_not_reset_by_a_new_run_or_a_cleared_fault_only_by_time():
-    s = Sim(max_restarts_per_hour=1).running()
-    s.gates(telemetry="lost")
-    s.call("ended", OK)
-    s.gates().advance(10)                                   # the one allowed restart
-    s.call("started")
+def interrupted_once(s):
+    """A running radar is stopped by a gate and the gate recovers: one automatic restart is due."""
     s.gates(telemetry="lost")
     s.call("ended", OK)
     s.gates().advance(10)
+
+
+def test_a_person_clearing_a_restart_limit_fault_starts_the_hour_afresh():
+    for clear in ("toggle", "start", "clear_fault"):
+        s = Sim(max_restarts_per_hour=1).running()
+        interrupted_once(s)                                 # the one allowed restart
+        s.call("started")
+        interrupted_once(s)
+        assert s.logic.fault["kind"] == "restart_limit"
+        s.call(clear, L.BUTTON if clear == "toggle" else L.COMMAND)
+        assert s.logic.restarts == [] and s.logic.starts[1:] == []      # at most the start just made
+        if clear == "clear_fault":
+            s.call("start", L.BUTTON)
+        s.call("started")
+        interrupted_once(s)
+        assert s.state == L.STARTING and s.logic.fault is None          # one restart is allowed again
+        s.call("started")
+        interrupted_once(s)
+        assert s.logic.fault["kind"] == "restart_limit"                 # ... and only one
+
+
+def test_the_automatic_source_clearing_a_restart_limit_fault_does_not_reset_the_count():
+    s = Sim(sources=(L.BUTTON, L.COMMAND, L.AUTO), max_restarts_per_hour=1).gates()
+    s.call("auto", L.MOVING)
+    s.call("started")
+    interrupted_once(s)
+    s.call("started")
+    interrupted_once(s)
     assert s.logic.fault["kind"] == "restart_limit"
-    assert s.call("toggle", L.BUTTON) == (True, "starting")           # a person may start it again ...
+    s.call("auto", L.STATIONARY)
+    s.call("auto", L.MOVING)                                # clears the fault and starts a fresh run
+    assert s.logic.fault is None and s.state == L.STARTING
     s.call("started")
-    s.gates(telemetry="lost")
-    s.call("ended", OK)
-    s.gates().advance(10)
-    assert s.logic.fault["kind"] == "restart_limit"         # ... but the next automatic restart is refused again
-    s.call("clear_fault", L.COMMAND)
-    s.advance(3600)                                         # an hour later the count is empty
-    s.call("start", L.BUTTON)
+    interrupted_once(s)
+    assert s.logic.fault["kind"] == "restart_limit"         # the hour's list was kept
+    s.call("auto", L.STATIONARY)
+    s.advance(3600)                                         # only time empties it
+    s.call("auto", L.MOVING)
     s.call("started")
-    s.gates(telemetry="lost")
-    s.call("ended", OK)
-    s.gates().advance(10)
+    interrupted_once(s)
     assert s.state == L.STARTING
+
+
+# ------------------------------------------------ every start counts; a pause between starts
+
+def test_fresh_runs_are_counted_by_the_starts_per_hour_cap():
+    # An automatic trigger in stop-and-go driving: every run is a fresh one, none is a restart.
+    s = Sim(sources=(L.BUTTON, L.COMMAND, L.AUTO), max_starts_per_hour=5, max_restarts_per_hour=1).gates()
+    starts = 0
+    for _ in range(20):
+        s.call("auto", L.MOVING)
+        if s.state == L.FAULT:
+            break
+        starts += 1
+        s.call("started")
+        s.advance(20)
+        s.call("auto", L.STATIONARY)
+        s.call("ended", OK)
+        s.advance(20)
+    assert starts == 5 and s.logic.fault["kind"] == "start_limit"
+    assert "5 starts within an hour (limit 5)" in s.logic.fault["reason"]
+    assert s.logic.snapshot()["retries"]["starts_last_hour"] == 5
+    # The trigger cannot start it again within the hour ...
+    s.call("auto", L.STATIONARY)
+    s.call("auto", L.MOVING)
+    assert s.kinds().count("start") == 5 and s.logic.fault["kind"] == "start_limit"
+    # ... time can,
+    s.call("auto", L.STATIONARY)
+    s.advance(3600)
+    s.call("auto", L.MOVING)
+    assert s.kinds() == ["start"]
+
+
+def test_a_person_is_not_kept_out_by_the_starts_per_hour_cap_for_more_than_one_press():
+    s = Sim(max_starts_per_hour=2).gates()
+    for _ in range(2):
+        s.call("toggle", L.BUTTON)
+        s.call("started")
+        s.call("toggle", L.BUTTON)
+        s.call("ended", OK)
+    assert s.call("toggle", L.BUTTON) == (True, "starting")
+    assert s.logic.fault["kind"] == "start_limit"           # the third start within the hour
+    s.take()
+    assert s.call("toggle", L.BUTTON) == (True, "starting") # the press clears the fault and the list
+    assert s.kinds() == ["start"] and s.logic.fault is None
+
+
+def test_restarts_are_counted_as_starts_too():
+    s = Sim(max_starts_per_hour=3, max_restarts_per_hour=100, max_resumes=10).running()
+    for _ in range(2):
+        interrupted_once(s)
+        s.call("started")
+    interrupted_once(s)
+    assert s.logic.fault["kind"] == "start_limit"
+
+
+def test_no_start_sooner_than_the_gap_after_the_last_run_ended():
+    s = Sim(min_start_gap_s=5.0).running()
+    s.call("stop", L.BUTTON)
+    s.take()
+    s.advance(1)
+    s.call("ended", OK)
+    assert s.call("start", L.BUTTON) == (True, "starting")  # accepted and remembered ...
+    assert s.kinds() == [] and s.state == L.STARTING        # ... but not started yet
+    assert s.logic.snapshot()["detail"] == "start in 5 s"
+    s.advance(4)
+    assert s.kinds() == []
+    s.advance(1)
+    assert s.kinds() == ["start"]
+
+
+def test_the_gap_also_holds_for_the_automatic_source_and_for_a_first_start_there_is_none():
+    s = Sim(sources=(L.BUTTON, L.COMMAND, L.AUTO), min_start_gap_s=5.0).gates()
+    s.call("auto", L.MOVING)
+    assert s.kinds() == ["start"]                           # nothing ran before: no wait
+    s.call("started")
+    s.call("auto", L.STATIONARY)
+    s.call("ended", OK)
+    s.take()
+    s.call("auto", L.MOVING)
+    assert s.kinds() == []
+    s.advance(5)
+    assert s.kinds() == ["start"]
+
+
+def test_start_cap_and_gap_settings_are_checked():
+    cfg, warnings = LogicConfig.from_config(manager_cfg(max_starts_per_hour=0))
+    assert len(warnings) == 1 and "max_starts_per_hour must be between 1 and 600" in warnings[0]
+    cfg, warnings = LogicConfig.from_config(manager_cfg(min_start_gap_s=1.0))
+    assert len(warnings) == 1 and "min_start_gap_s must be between 2 and 600 s" in warnings[0]
+    assert cfg == LogicConfig() and cfg.max_starts_per_hour == 40 and cfg.min_start_gap_s == 5.0
+    cfg, warnings = LogicConfig.from_config(manager_cfg(min_start_gap_s=2.0, max_starts_per_hour=600))
+    assert warnings == [] and cfg.min_start_gap_s == 2.0 and cfg.max_starts_per_hour == 600
 
 
 def test_a_first_start_is_not_a_restart():

@@ -38,6 +38,11 @@ its start line is treated as killed in mid-set-up: the pin is not known safe.
 An urgent stop has the radar process gone `orca.urgent_stop_budget_s` after it
 was asked for, whatever state the radar is in.
 
+A "[WARNING]: Requested ... rate" line before the start line means that the SDR
+does not run at the rate the config asks for, so every limit was computed for
+another radar: the start has failed (a fault, kind "rate"), and the radar is
+stopped as soon as it can take the signal.
+
 One thread, started once and kept for the life of the manager, runs every
 sequence and every run of the tool, and is the parent of the radar process.
 That matters twice: the tool can never run while a radar of this manager is
@@ -65,6 +70,7 @@ log = logging.getLogger("manager.runner")
 
 STDOUT_LOG, STDERR_LOG, PREPARE_LOG, AMP_SAFE_LOG = "uhd_stdout.log", "uhd_stderr.log", "prepare.log", "amp_safe.log"
 FLOOD_PREFIXES = ("[ERROR]", "[TX] (Chirp")     # per-pulse reports: not worth a flush each
+RATE_WARNING = "[WARNING]: Requested"           # rf_settings.cpp: "... RX rate (CH0): X Hz. Actual RX rate: Y Hz."
 
 
 class OutputLog:
@@ -234,7 +240,7 @@ class _Run:
 
 class Runner:
     def __init__(self, config, post, *, wall=time.time, turn_on_check=None, boot_number=coll.boot_count,
-                 amp_telemetry=None, uptime=boottime_s):
+                 amp_telemetry=None, uptime=boottime_s, sdr_state=None):
         self.cfg = config["manager"]
         self.state_dir = config["paths"]["state_dir"]
         self.post = post
@@ -242,7 +248,11 @@ class Runner:
         self._uptime = uptime
         self._boot_number = boot_number
         self.amp_telemetry = amp_telemetry or ampsafe.AmpTelemetry(config)
-        self.sdr_state = ampsafe.SdrState(self.state_dir)
+        self.sdr_state = sdr_state or ampsafe.SdrState(self.state_dir,
+                                                       ampsafe.tool_lock_path(self.cfg["amp_safe"]))
+        # Set by the service while power is being lost or the manager is exiting:
+        # no waiting for readings, no further attempts of the tool.
+        self.hurry = False
         self.sdr_gate = gates.SdrGate(self.cfg["gates"]["sdr"])
         self.making_safe = False    # a run of the tool outside a radar run is queued or in progress
         # Uptime at which the last radar or tool run ended; a shutdown-current
@@ -324,6 +334,7 @@ class Runner:
 
     def shutdown(self, timeout_s):
         """Stop whatever runs, urgently, and wait until all is done. True if idle in time."""
+        self.hurry = True
         self.stop("the manager is stopping", urgent=True)
         return self._idle.wait(timeout_s)
 
@@ -357,7 +368,7 @@ class Runner:
                           "status": None}
                 try:
                     ok, detail, status = self._tool(os.path.join(self.state_dir, AMP_SAFE_LOG),
-                                                    patient=lambda: False)
+                                                    patient=lambda: False, urgent=lambda: self.hurry)
                     result.update(ok=ok, state=self.sdr_state.get(), detail=detail, status=status)
                 except Exception:
                     log.exception("internal error while making the amplifier safe")
@@ -553,7 +564,9 @@ class Runner:
         if self.turn_on_check is not None:
             if run.stop.is_set():
                 return
-            self._record_state(ampsafe.UNKNOWN, f"turn-on check, collection {run.name}")
+            error = self.sdr_state.set(ampsafe.UNKNOWN, f"turn-on check, collection {run.name}")
+            if error:
+                return run.fail("state", f"cannot record that the SDR state is unknown: {error}")
             passed, text = self.turn_on_check(run)
             if not passed:
                 return run.fail("turn_on_check", f"turn-on check failed: {text}", fatal=True)
@@ -566,6 +579,9 @@ class Runner:
         if line.startswith(self.cfg["orca"]["start_line"]):
             run.started_at = now
             run.started.set()
+        elif not run.started.is_set() and line.startswith(RATE_WARNING) and " rate " in line:
+            # ORCA carries on at the rate the SDR chose: bursts, duty and band are not what was checked.
+            run.fail("rate", f"the SDR does not run at the requested sample rate: {line[:200]}", fatal=True)
         elif line.startswith("[OPEN FILE] "):
             run.open_file = os.path.basename(line[12:].strip())
         elif line.startswith("[CLOSE FILE] "):
@@ -630,8 +646,8 @@ class Runner:
                     os.unlink(self.sdr_state.path)
                 except OSError:
                     pass
-            else:
-                self._record_state(*before)
+            elif before[0] == ampsafe.SAFE:
+                self.sdr_state.mark_safe(before[1])     # not while another program's tool run is in progress
             run.launching = False
             return run.fail("launch", f"cannot start the radar ({argv[0]}): {e.strerror or e}")
         run.proc = proc
@@ -695,6 +711,10 @@ class Runner:
                 run.signalled_before_start = True
                 self._stop_radar(run)
                 break
+        if run.power:
+            # A power loss: the one write of the record comes before `radarctl
+            # stop --wait` (the power service's hook) sees the radar gone.
+            self._after_radar(run)
         with self._lock:
             run.radar_over = True
         self.last_activity_uptime = self._uptime()
@@ -761,34 +781,48 @@ class Runner:
         """After every radar exit, however it happened, and only then: is the pin safe? (ampsafe.py)
 
         `run.amp_safe` becomes True if the pin is known to be safe afterwards,
-        False if not, and stays None if nothing was checked (power loss).
+        False if not, and stays None if nothing was decided (a power loss after
+        an exit that was not clean; a tool run of another program in progress).
         """
+        if run.amp_safe is not None or run.amp_safe_detail:
+            return                      # decided already (a power loss: see _radar)
         exit_uptime = self._uptime()
         facts = {"reached_running": run.started.is_set(), "killed": run.killed,
                  "exit_status": run.exit_status, "failure": run.failure,
                  "signalled_before_start": run.signalled_before_start}
-        power = ""
-        if run.power:
-            power = "the stop came from the power service"
-        elif self.amp_telemetry.rail_absent():
-            power = "the 28 V rail reads absent"
-        action, why = ampsafe.after_exit(facts, lambda: self.amp_telemetry.confirm_shutdown(exit_uptime), power)
-        if action == "leave":
+
+        def urgent():
+            return run.urgent_at is not None or self.hurry
+
+        def power():
+            if run.power:
+                return "the stop came from the power service"
+            return "the 28 V rail reads absent" if self.amp_telemetry.rail_absent() else ""
+
+        action, why = ampsafe.after_exit(
+            facts, lambda: self.amp_telemetry.confirm_shutdown(exit_uptime, urgent), power())
+        if action == "run" and run.power:       # the power went while a reading was waited for
+            action, why = ampsafe.after_exit(facts, None, power())
+        if action == "safe":
+            done, text = self.sdr_state.mark_safe(why)
+            if done:
+                run.amp_safe, run.amp_safe_detail = True, f"tool not run: {why}" + (f" ({text})" if text else "")
+                log.info("amplifier safe, %s", run.amp_safe_detail)
+            else:
+                run.amp_safe_detail = f"{why}; not recorded: {text}"
+                log.warning("amplifier pin: %s", run.amp_safe_detail)
+        elif action == "leave":
             run.amp_safe_detail = why
             log.warning("amplifier pin not checked after the radar exit: %s", why)
-        elif action == "safe":
-            run.amp_safe, run.amp_safe_detail = True, f"tool not run: {why}"
-            log.info("amplifier safe, %s", run.amp_safe_detail)
-            self._record_state(ampsafe.SAFE, why)
         else:
             run.amp_safe_ran = True
             log_path = os.path.join(run.directory, AMP_SAFE_LOG) if run.directory else None
-            ok, detail, _ = self._tool(log_path, patient=lambda: run.urgent_at is None)
+            ok, detail, _ = self._tool(log_path, patient=lambda: True, urgent=urgent)
             run.amp_safe, run.amp_safe_detail = ok, f"{detail} ({why})"
             if not ok:
                 log.error("AMPLIFIER NOT CONFIRMED SAFE after the radar exited: %s", run.amp_safe_detail)
 
-    def _tool(self, log_path, patient):
+    def _tool(self, log_path, patient, urgent):
         """Run the make-amplifier-safe tool. Returns (ok, text, exit status).
 
         Only ever called from the runner's thread, with no radar of this
@@ -800,9 +834,15 @@ class Runner:
         `assume_enabled_retries` times. NOT_FOUND, BUSY and TIMEOUT can mean
         that the SDR is coming back after a radar was killed: while
         `patient()` says so, the tool is tried again up to
-        `unavailable_retries` times, `unavailable_delay_s` apart. It stops
-        saying so when the stop becomes urgent (the manager is exiting: the
-        unit's stop hook takes over).
+        `unavailable_retries` times, `unavailable_delay_s` apart.
+
+        Once `urgent()` says so (a power loss or the manager's exit has
+        begun), the attempt in progress is finished (the tool is never
+        killed before its own limit) and no other is made: the power
+        service's hook, or the unit's stop hook, takes over.
+
+        If the tool says OK but its wrapper could not write the record, `safe`
+        is remembered in memory (ampsafe.SdrState.remember_safe).
         """
         cfg = self.cfg["amp_safe"]
         command = [str(a) for a in cfg["command"]]
@@ -820,6 +860,8 @@ class Runner:
             _, text, status = self._command(None, command, None, cfg["timeout_s"], "make amplifier safe", log_path)
             runs += 1
             self.last_activity_uptime = self._uptime()
+            if urgent():
+                break
             if status == ampsafe.ASSUME_ENABLED and urgent_left:
                 urgent_left -= 1
                 log.error("URGENT: the make-amplifier-safe tool initialised the SDR and could not verify the pin: "
@@ -829,18 +871,21 @@ class Runner:
                 later_left -= 1
                 log.warning("make-amplifier-safe tool: %s; trying again in %g s", ampsafe.describe(status),
                             cfg["unavailable_delay_s"])
-                time.sleep(cfg["unavailable_delay_s"])
+                wake = time.monotonic() + cfg["unavailable_delay_s"]
+                while time.monotonic() < wake and not urgent():
+                    time.sleep(0.05)
+                if urgent():
+                    break
                 continue
             break
         detail = f"tool run {runs} time{'s' if runs != 1 else ''}: {ampsafe.describe(status)}"
+        if status == ampsafe.OK and self.sdr_state.get() != ampsafe.SAFE:
+            self.sdr_state.remember_safe("the tool reported OK but its record still says unknown")
+            log.error("%s", self.sdr_state.problem)
+            detail += "; the record was not written"
         if status is None or status == ampsafe.KILLED_BY_CALLER:
             detail += f": {text}"
         return status == ampsafe.OK, detail, status
-
-    def _record_state(self, state, why):
-        error = self.sdr_state.set(state, why)
-        if error:
-            log.warning("cannot record the SDR state: %s", error)
 
     def _finish(self, run):
         """Write the end of the collection's metadata."""

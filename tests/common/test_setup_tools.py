@@ -273,3 +273,70 @@ def test_check_script_rejects_unknown_options():
     r = subprocess.run(["/usr/bin/python3", "-B", os.path.join(REPO, "setup", "check.py"), "--fix"],
                        capture_output=True, text=True, timeout=60, cwd="/")
     assert r.returncode != 0 and "usage: setup/check.py [--receiver]" in r.stderr and r.stdout == ""
+
+
+# ---- check.py: the radar's hooks in the power service's config (a pure function, taken from the source)
+
+def power_hook_findings(power, state_file="/var/lib/radar-runner/user/sdr-state"):
+    import ast
+    with open(os.path.join(REPO, "setup", "check.py")) as f:
+        tree = ast.parse(f.read())
+    wanted = [node for node in tree.body
+              if (isinstance(node, ast.FunctionDef) and node.name == "power_hook_findings")
+              or (isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "POWER_OFF_BUDGET_S")]
+    assert len(wanted) == 2
+    scope = {"os": os}
+    exec(compile(ast.Module(body=wanted, type_ignores=[]), "check.py", "exec"), scope)
+    return {name: (ok, observed) for ok, name, observed, _ in scope["power_hook_findings"](power, state_file)}
+
+
+SETPRIV = ["/usr/bin/setpriv", "--reuid=englacial", "--regid=englacial", "--init-groups", "--reset-env"]
+STOP_RADAR = SETPRIV + ["/usr/bin/python3", "radarctl.py", "stop", "--interrupt", "--wait", "--timeout", "4"]
+HOOK = "/home/englacial/englacial-radar-runner/bin/radar-manager-stop-hook"
+STATE = "/var/lib/radar-runner/user/sdr-state"
+
+
+def test_check_accepts_the_hook_lines_that_setup_prints():
+    found = power_hook_findings({"hooks": {"stop_radar": STOP_RADAR, "stop_radar_timeout_s": 5.0,
+                                           "amp_safe": SETPRIV + [HOOK, "--timeout", "10", STATE],
+                                           "amp_safe_timeout_s": 12.0}})
+    assert all(ok for ok, _ in found.values()), found
+    assert found["power-off sequence fits the capacitor"][1] == (
+        "worst case: hooks 19 s, power-off command 37.2 s after the loss, last resort at 47.2 s")
+
+
+def test_check_reports_hooks_that_are_not_set_and_the_time_without_them():
+    found = power_hook_findings({})
+    assert found["power service hook stop_radar"][0] is None and found["power service hook amp_safe"][0] is None
+    assert found["power-off sequence fits the capacitor"] == (
+        True, "worst case: hooks 0 s, power-off command 18.2 s after the loss, last resort at 28.2 s")
+
+
+def test_check_finds_a_hook_that_reads_another_record_or_always_runs_the_tool_or_takes_too_long():
+    hooks = {"stop_radar": STOP_RADAR, "stop_radar_timeout_s": 5.0,
+             "amp_safe": SETPRIV + [HOOK, "--timeout", "10", "/var/lib/radar-runner/sdr-state"],
+             "amp_safe_timeout_s": 12.0}
+    found = power_hook_findings({"hooks": hooks})
+    assert found["power service hook amp_safe reads the manager's record"] == (False, "/var/lib/radar-runner/sdr-state")
+    # A state directory moved in the manager's config must be followed by the hook.
+    hooks["amp_safe"] = SETPRIV + [HOOK, "--timeout", "10", STATE]
+    assert not power_hook_findings({"hooks": hooks}, "/srv/state/sdr-state")[
+        "power service hook amp_safe reads the manager's record"][0]
+    # The hook script without a path uses its default, which is the default state directory.
+    hooks["amp_safe"] = SETPRIV + [HOOK, "--timeout", "10"]
+    assert power_hook_findings({"hooks": hooks})["power service hook amp_safe reads the manager's record"][0]
+    # The tool called directly (the earlier form): the record is found, but it runs every time, and 22 s is too long.
+    hooks.update(amp_safe=SETPRIV + ["/x/tools/sdr_gpio_safe/amp_safe", "--timeout", "20", "--state-file", STATE],
+                 amp_safe_timeout_s=22.0)
+    found = power_hook_findings({"hooks": hooks})
+    assert found["power service hook amp_safe reads the manager's record"][0]
+    assert found["power service hook amp_safe runs the tool only when needed"] == (False, "calls the tool every time")
+    assert found["power-off sequence fits the capacitor"][0] is False
+    assert "last resort at 57.2 s" in found["power-off sequence fits the capacitor"][1]
+    # A limit that is not longer than the command's own timeout.
+    hooks.update(amp_safe=SETPRIV + [HOOK, "--timeout", "10", STATE], amp_safe_timeout_s=10.0)
+    assert power_hook_findings({"hooks": hooks})["power service hook amp_safe"][0] is False
+    # The power service's own settings count.
+    hooks["amp_safe_timeout_s"] = 12.0
+    slow = power_hook_findings({"hooks": hooks, "shutdown": {"ride_through_s": 20.0}})
+    assert slow["power-off sequence fits the capacitor"][0] is False

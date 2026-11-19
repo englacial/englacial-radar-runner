@@ -8,8 +8,9 @@ success; with --state-file it writes "unknown" to that file before it starts and
 
 Control file key "amp_safe": an exit status (3 = ASSUME_ENABLED, 2 = NOT_FOUND, 6 = BUSY,
 4 = TIMEOUT, ...), "hang" (sleep 60 s after writing "unknown"), "lock" (another caller holds
-the tool: exit 4 without starting it), or a list of these used one per call, the last one for
-every later call (e.g. [2, 2, 0]). As with the real wrapper, a call that never starts the tool
+the tool: exit 4 without starting it), "ok_unwritten" (exit 0, but the record could not be
+brought up to date: it still says "unknown"), or a list of these used one per call, the last
+one for every later call (e.g. [2, 2, 0]). Key "amp_safe_s": how long each run takes (default 0). As with the real wrapper, a call that never starts the tool
 (lock, 5 FAILED, 8 STATE_FILE, 64 USAGE) leaves the record alone.
 Appends one line per call to the file named by FAKE_AMP_SAFE_LOG, if set.
 """
@@ -65,6 +66,10 @@ if behaviour in (5, 8, 64):
 record("unknown", "amp_safe started")
 if behaviour == "hang":
     time.sleep(60)
+time.sleep(float(control.get("amp_safe_s", 0)))
+if behaviour == "ok_unwritten":
+    print("amp_safe: OK (exit 0): GPIO_0 high, verified; state file NOT updated, it still says unknown")
+    sys.exit(0)
 if behaviour == 0:
     record("safe", "amp_safe: GPIO_0 high, verified")
     print("amp_safe: GPIO_0 high, verified")

@@ -26,7 +26,7 @@ from radar_runner.manager.service import Manager
 DEFAULTS = common_config.DEFAULTS
 TELEMETRY = S.status_path("telemetry", DEFAULTS["paths"]["run_dir"])
 POWER = DEFAULTS["paths"]["power_status_file"]
-TEST_MINIMUMS = {"retry_delay_s": 0.0, "resume_holdoff_s": 0.0, "stable_run_s": 0.0}
+TEST_MINIMUMS = {"retry_delay_s": 0.0, "resume_holdoff_s": 0.0, "stable_run_s": 0.0, "min_start_gap_s": 0.0}
 
 
 def live():

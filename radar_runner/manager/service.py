@@ -36,7 +36,8 @@ class Manager(Service):
         self.config_warnings += refused
         self.logic = L.ManagerLogic(logic_cfg)
         self.overrides = gates.Overrides(config["paths"]["state_dir"])
-        self.sdr_state = ampsafe.SdrState(config["paths"]["state_dir"])
+        self.sdr_state = ampsafe.SdrState(config["paths"]["state_dir"],
+                                          ampsafe.tool_lock_path(self.cfg["amp_safe"]))
         self.amp_telemetry = ampsafe.AmpTelemetry(config)
         self.sdr_gate = gates.SdrGate(self.cfg["gates"]["sdr"])
         self.enabled_idle = ""                  # telemetry shows enabled current with no radar: the text
@@ -57,7 +58,9 @@ class Manager(Service):
 
     def setup(self):
         self.gate_list = self._given["gates"] or gates.build(self.config, self.overrides)
-        self.runner = self._given["runner"] or Runner(self.config, self._from_runner)
+        # One record object for both: what the runner learns (the tool said OK
+        # but the record was not written) the idle rule here must know.
+        self.runner = self._given["runner"] or Runner(self.config, self._from_runner, sdr_state=self.sdr_state)
         if self._given["panel"] is not None:
             self.panel = self._given["panel"]
         elif self.cfg["panel"]["enabled"]:
@@ -91,7 +94,9 @@ class Manager(Service):
     def _handle_request(self, request):
         """Called in the socket thread: hand the request to the loop and wait for its answer."""
         if request.get("cmd") == "status":
-            return {"ok": True, "message": "", "status": self._status}
+            # radar_gone is asked for now, not taken from the last snapshot:
+            # `radarctl stop --wait` must not wait for the loop's next round.
+            return {"ok": True, "message": "", "status": dict(self._status, radar_gone=self.runner.radar_gone())}
         slot = {"done": threading.Event(), "reply": None}
         self._events_in.put(("request", request, slot))
         if not slot["done"].wait(REPLY_TIMEOUT_S):
@@ -153,6 +158,7 @@ class Manager(Service):
         if results.get("telemetry") is not None and results["telemetry"].kind == "override" and self.runner.busy:
             self.runner.add_flag("no_amp_telemetry")
         self.logic.gates(now, results)
+        self.runner.hurry = self.logic.power_fail or self.logic.closing
 
     def _sdr_presence(self):
         found = self.sdr_gate.find()
@@ -183,8 +189,9 @@ class Manager(Service):
         self.enabled_idle = text if reading is False else ""        # True, PENDING and None are not "enabled"
         action, why = ampsafe.idle_need(self.sdr_state.get(), self._sdr_presence(), reading)
         if action == "mark_safe":
-            error = self.sdr_state.set(ampsafe.SAFE, why)
-            self._record({"event": "sdr_state", "state": ampsafe.SAFE, "why": why, "error": error})
+            done, error = self.sdr_state.mark_safe(why)     # not done: a tool run is in progress elsewhere
+            if done:
+                self._record({"event": "sdr_state", "state": ampsafe.SAFE, "why": why, "error": error})
         elif action == "run" and now >= self._next_tool:
             self._next_tool = now + cfg["retry_s"]
             if self.runner.make_safe(why):
@@ -289,6 +296,8 @@ class Manager(Service):
             "overrides": self.overrides.snapshot(),
             "sdr_state": self.sdr_state.get(),              # "safe" or "unknown" (ampsafe.py)
             "sdr_state_why": self.sdr_state.why(),
+            # "" or why the record could not be written; "safe" is then only in this manager's memory
+            "sdr_state_problem": self.sdr_state.problem,
             "making_amp_safe": bool(getattr(self.runner, "making_safe", False)),
             # "" or the reading: enabled current with no radar process. The safety watcher acts on it.
             "amp_enabled_while_idle": self.enabled_idle,

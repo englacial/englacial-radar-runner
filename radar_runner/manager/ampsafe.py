@@ -26,6 +26,13 @@ unknown. Who writes it:
     `safe` after an OK. The manager does not write around a tool run;
   * the manager: `unknown` before the turn-on-check hook and before every
     radar launch; `safe` when it finds the pin safe without the tool (below).
+    It never writes `safe` while a run of the tool by any program is in
+    progress (it probes the wrapper's lock first): that run has written
+    `unknown` and may yet be killed in the middle of the initialisation.
+If the record cannot be written (the tool said OK, or the manager found the
+pin safe), this manager remembers `safe` in memory, for as long as the file
+stays as it is, so that the tool is not run again and again; the status shows
+the problem. Other programs still read `unknown`.
 Other programs can read it:
 
     [ "$(head -n1 /var/lib/radar-runner/user/sdr-state 2>/dev/null)" = safe ]
@@ -43,7 +50,8 @@ Known safe without the tool means one of:
     until then, so it died in the middle of the SDR set-up) is never trusted.
 A reading counts only while the telemetry service's loop runs evenly
 (`loop.last_gap_s` at most `max_loop_gap_s`): after a stall the rows that piled
-up come out together and their times say little.
+up come out together and their times say little. A stall means "wait for the
+next reading" (for at most `confirm_timeout_s`), not "no reading".
 
 Enabled current seen with no radar process is the safety watcher's business:
 it owns the rule "amplifier draws enabled current with no radar: run the tool".
@@ -51,12 +59,20 @@ The manager never marks the pin safe while it sees such current, shows it in
 its status, and otherwise leaves it alone.
 
 On a power loss (the stop came from the power service, or the 28 V rail reads
-absent) nothing is checked and nothing is written after the radar exit: the
-current says nothing without the rail, and the time belongs to the shutdown.
+absent) no reading is waited for and the tool is not run: the current says
+nothing without the rail, and the time belongs to the shutdown. If the radar
+exited cleanly, `safe` is recorded from that alone (one write, before `radarctl
+stop --wait` returns), so that the power service's hook need not run the tool;
+otherwise the record is left as it is and that hook runs it.
+
+Urgency: when a power loss or the manager's own exit begins while the manager
+waits for a reading or runs the tool, it stops waiting, finishes the attempt
+in progress (the tool is never killed early) and makes no further attempt.
 
 The decisions are the pure functions `known_safe_after_exit`, `after_exit` and
 `idle_need`; runner.py and service.py only carry them out.
 """
+import fcntl
 import os
 import time
 
@@ -116,12 +132,17 @@ def known_safe_after_exit(facts, read):
 def after_exit(facts, read, power_lost):
     """What to do after a radar exit. Returns (action, why).
 
-    "leave"  power loss: check nothing, write nothing
+    "leave"  power loss after an exit that was not clean: check nothing, write nothing
     "safe"   the pin is known to be safe: record it
     "run"    run the tool
+
+    On a power loss `read` is not called.
     """
     if power_lost:
-        return "leave", f"power loss ({power_lost}): nothing checked, the record is left as it is"
+        reason = unclean(facts)
+        if reason:
+            return "leave", f"power loss ({power_lost}) and {reason}: nothing checked, the record is left as it is"
+        return "safe", f"clean radar exit; power loss ({power_lost}): no reading waited for"
     known, why = known_safe_after_exit(facts, read)
     return ("safe" if known else "run"), why
 
@@ -170,6 +191,38 @@ def describe(status):
     return f"status {status} ({EXIT_MEANING.get(status, 'not a status of the tool')})"
 
 
+def tool_lock_path(amp_safe_cfg):
+    """The file the tool's wrapper locks while it runs: the wrapper script itself."""
+    given = amp_safe_cfg.get("lock_file", "-")
+    if given not in ("-", ""):
+        return given
+    command = amp_safe_cfg["command"]
+    return str(command[0]) if command else ""
+
+
+def tool_running(lock_path):
+    """True if some program's run of the tool holds the wrapper's lock right now. Never blocks.
+
+    A shared lock is asked for: it fails only against a running wrapper (which
+    holds the exclusive lock), not against another probe. A file that cannot
+    be opened means that no tool can be running.
+    """
+    try:
+        fd = os.open(lock_path, os.O_RDONLY)
+    except (OSError, TypeError, ValueError):
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
 def tool_timeout(command):
     """The value after --timeout in the tool's command line, or None."""
     args = [str(a) for a in command]
@@ -190,12 +243,13 @@ class AmpTelemetry:
         self._gate = StatusFileGate("telemetry", status_file(gate_cfg, "telemetry", config["paths"]["run_dir"]),
                                     gate_cfg, "amplifier telemetry", read)
         self._read, self._uptime, self._monotonic, self._sleep = read, uptime, monotonic, sleep
+        self._stalled_since = None      # monotonic time since which every reading came from a stalled loop
 
     def _sample(self):
         """(sample uptime, current, voltage, loop even) if the telemetry is fresh and complete, else None.
 
-        `loop even` is False if the telemetry service's loop has just stalled
-        (or does not say): the reading is then no proof of shutdown.
+        `loop even` is False if the telemetry service's loop has just stalled,
+        None if it does not say: the reading is then no proof of shutdown.
         """
         if self._gate.problem():
             return None
@@ -213,7 +267,7 @@ class AmpTelemetry:
             gap = _lookup(r.data, self.cfg["loop_gap_field"])
         except KeyError:
             gap = None
-        even = type(gap) in (int, float) and 0 <= gap <= self.cfg["max_loop_gap_s"]
+        even = (0 <= gap <= self.cfg["max_loop_gap_s"]) if type(gap) in (int, float) else None
         return values + [even]
 
     def rail_absent(self):
@@ -229,6 +283,8 @@ class AmpTelemetry:
         text = f"amplifier current {current:.2f} A at {voltage:.1f} V"
         if current >= self.cfg["enabled_current_a"]:
             return False, text
+        if even is None:
+            return None, f"{text}, but the telemetry service does not report its loop"
         if not even:
             return None, f"{text}, but the telemetry loop has just stalled"
         return True, text
@@ -243,11 +299,20 @@ class AmpTelemetry:
         have reached the Pi; the ADC measured it before that, so an older row
         may show the state before the run ended. While such a sample can
         still be expected (`confirm_timeout_s` more), the answer is PENDING.
+        Shutdown current read while the telemetry loop was stalled is PENDING
+        too, until the stall has lasted `confirm_timeout_s`.
         """
         sample = self._sample()
         if sample is None:
             return None, "no fresh amplifier reading"
         state, text = self._judge(sample)
+        if state is None and sample[3] is False and sample[2] >= self.cfg["min_voltage_v"]:
+            if self._stalled_since is None:
+                self._stalled_since = self._monotonic()
+            if self._monotonic() - self._stalled_since < self.cfg["confirm_timeout_s"]:
+                return PENDING, f"{text}; waiting for the next reading"
+            return None, text
+        self._stalled_since = None
         settle = self.cfg["confirm_settle_s"]
         if state is True and sample[0] < after_uptime + settle:
             if self._uptime() < after_uptime + settle + self.cfg["confirm_timeout_s"]:
@@ -255,11 +320,16 @@ class AmpTelemetry:
             return None, f"{text}, but not read {settle:g} s after the last run ended"
         return state, text
 
-    def confirm_shutdown(self, exit_uptime):
-        """Wait for a reading taken after a radar exit. Returns (True/False/None, text)."""
+    def confirm_shutdown(self, exit_uptime, urgent=None):
+        """Wait for a reading taken after a radar exit. Returns (True/False/None, text).
+
+        `urgent()` turning true (a power loss, the manager's exit) ends the wait.
+        """
         cfg = self.cfg
         deadline = self._monotonic() + cfg["confirm_timeout_s"]
         while True:
+            if urgent is not None and urgent():
+                return None, "the wait for a reading was cut short: the stop became urgent"
             sample = self._sample()
             if sample is not None and sample[0] >= exit_uptime + cfg["confirm_settle_s"]:
                 state, text = self._judge(sample)
@@ -271,18 +341,62 @@ class AmpTelemetry:
 
 
 class SdrState:
-    """<state_dir>/sdr-state: is the SDR's amplifier pin known to be safe? Missing or damaged = unknown."""
+    """<state_dir>/sdr-state: is the SDR's amplifier pin known to be safe? Missing or damaged = unknown.
 
-    def __init__(self, state_dir):
+    `lock_path` is the file that the tool's wrapper locks (`tool_lock_path`).
+    `problem` is "" or why the record could not be brought up to date; the
+    state is then remembered here (`remember_safe`) while the file stays as it is.
+    """
+
+    def __init__(self, state_dir, lock_path=""):
         self.path = os.path.join(state_dir, STATE_FILE)
+        self.lock_path = lock_path
+        self.problem = ""
+        self._remembered = None     # identity of the file when `safe` was remembered in memory
 
-    def get(self):
+    def _identity(self):
+        try:
+            st = os.stat(self.path)
+            return (st.st_ino, st.st_mtime_ns, st.st_size)
+        except OSError:
+            return ("missing",)
+
+    def _file_state(self):
         try:
             with open(self.path, "rb") as f:
                 first = f.readline(64).strip()
         except OSError:
             return UNKNOWN
         return SAFE if first == b"safe" else UNKNOWN
+
+    def get(self):
+        if self._file_state() == SAFE:
+            self._remembered, self.problem = None, ""
+            return SAFE
+        if self._remembered is not None:
+            if self._remembered == self._identity():
+                return SAFE
+            self._remembered, self.problem = None, ""       # somebody wrote the record since
+        return UNKNOWN
+
+    def remember_safe(self, problem):
+        """The pin is safe but the record could not say so: keep it in memory while the file stays as it is."""
+        self._remembered = self._identity()
+        self.problem = f"the record {self.path} could not be written ({problem}); `safe` is kept in memory only"
+
+    def mark_safe(self, why):
+        """Record `safe`, unless a run of the tool is in progress. Returns (done, text).
+
+        Not done: a tool run (of any program) holds the wrapper's lock; it
+        has written `unknown` and the outcome is its to record. Done with a
+        text: the file could not be written and `safe` is remembered.
+        """
+        if self.lock_path and tool_running(self.lock_path):
+            return False, "a run of the make-amplifier-safe tool is in progress: the record is left to it"
+        error = self.set(SAFE, why)
+        if error:
+            self.remember_safe(error)
+        return True, error
 
     @property
     def known_safe(self):
@@ -293,14 +407,16 @@ class SdrState:
         try:
             with open(self.path, "rb") as f:
                 f.readline(64)
-                return f.read(300).decode("utf-8", "replace").strip()
+                text = f.read(300).decode("utf-8", "replace").strip()
         except OSError:
-            return "no record"
+            text = "no record"
+        return f"{self.problem}; the file says: {text}" if self._remembered is not None else text
 
     def set(self, state, why=""):
         """Record `safe` or `unknown`, durably, before returning. Returns "" or the error text."""
         tmp = self.path + ".tmp"
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self._remembered = None
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             try:
@@ -314,6 +430,7 @@ class SdrState:
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            self.problem = ""
             return ""
         except OSError as e:
             return f"{self.path}: {e.strerror}"
