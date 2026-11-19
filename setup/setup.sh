@@ -515,6 +515,60 @@ step_telemetry_service() {
     esac
 }
 
+# (k) The radar manager (stage 4): its unit and the radarctl command.
+# The unit is installed but NEVER enabled or started here: the first start is
+# done by hand with the radar under supervision (radar_runner/manager/README.md,
+# "First start with the real radar"). A running manager is never restarted or
+# stopped. The power service's hooks are printed, not applied.
+step_manager() {
+    step "Radar manager unit and radarctl (installed; not enabled, not started)"
+    local unit=/etc/systemd/system/radar-manager.service link=/usr/local/bin/radarctl
+    local target=$UNIT_REPO/bin/radarctl enabled active have
+    [ "$REPO" = "$UNIT_REPO" ] || [ -n "$DESTDIR" ] ||
+        die "the unit file expects this repository at $UNIT_REPO, but it is at $REPO"
+    put_file "$REPO/systemd/radar-manager.service" "$unit" 0644
+    [ "$CHANGED" -eq 0 ] || RELOAD_NEEDED=1
+    enabled=$(systemctl is-enabled radar-manager.service 2>/dev/null || true)
+    active=$(systemctl is-active radar-manager.service 2>/dev/null || true)
+    if [ "$CHANGED" -eq 1 ] && [ "$active" = active ]; then
+        note "the running manager keeps the old unit until it is restarted: systemctl restart radar-manager"
+        note "(a restart stops a running radar)"
+    fi
+    have=$(readlink "$DESTDIR$link" 2>/dev/null || true)
+    if [ "$have" = "$target" ]; then
+        ok "$link points to $target"
+    else
+        [ -z "$have" ] || log "           $link points to $have"
+        [ -z "$have" ] && [ -e "$DESTDIR$link" ] && die "$link exists and is not a link: remove it or move it away"
+        change "link $link -> $target"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            install -d -m 0755 "$(dirname "$DESTDIR$link")"
+            ln -sfn "$target" "$DESTDIR$link"
+        fi
+    fi
+    case "$enabled/$active" in
+        enabled/active) ok "radar-manager.service is enabled and running (not restarted)" ;;
+        *) note "radar-manager.service is ${enabled:-not enabled}, ${active:-not running}: left as it is."
+           note "It is NOT enabled and NOT started by this script. The first start is done by hand, with the"
+           note "radar under supervision: radar_runner/manager/README.md, \"First start with the real radar\"." ;;
+    esac
+    note "The power service's hooks are not changed by this script. When the manager has passed its first"
+    note "start, put these lines under [hooks] in /etc/radar-runner/power.toml and restart radar-power:"
+    cat <<EOF
+             stop_radar = ["/usr/bin/setpriv", "--reuid=$SERVICE_USER", "--regid=$SERVICE_USER", "--init-groups", "--reset-env",
+                           "/usr/bin/python3", "-B", "-E", "-s", "$UNIT_REPO/radar_runner/manager/radarctl.py",
+                           "stop", "--interrupt", "--wait", "--timeout", "4"]
+             stop_radar_timeout_s = 5.0
+             amp_safe = ["/usr/bin/setpriv", "--reuid=$SERVICE_USER", "--regid=$SERVICE_USER", "--init-groups", "--reset-env",
+                         "$UNIT_REPO/bin/radar-manager-stop-hook",
+                         "--timeout", "10", "/var/lib/radar-runner/user/sdr-state"]
+             amp_safe_timeout_s = 12.0
+EOF
+    note "(each hook's limit is longer than its command's own --timeout. The amp_safe hook runs the tool only"
+    note "if the record does not say safe and the SDR has its firmware; the tool then needs a few seconds."
+    note "Worst case, every step at its limit: power-off command 37 s after the loss, last resort at 47 s)"
+}
+
 # (j) Time. chrony takes time from gpsd and, when the internet is up, from
 # NTP; fake-hwclock saves the clock every minute and at shutdown and restores
 # it at boot (the Pi's clock has no battery). Both replace systemd-timesyncd,
@@ -700,6 +754,7 @@ step_watchdog
 step_power_service
 step_gpsd
 step_telemetry_service
+step_manager
 [ "$OPT_NVME" -eq 0 ] || optional_nvme_by_label
 [ "$OPT_HOLD" -eq 0 ] || optional_hold_packages
 step_time           # last: the only step that needs the internet

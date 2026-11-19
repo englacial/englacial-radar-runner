@@ -1,0 +1,88 @@
+# 2 h soak: 300 MHz / 30 MHz / 10 us chirp / 5 % RF duty (PRI 200 us), tx_gain 72, VVA 5 V. 2026-11-18.
+# not yet approved. Chirp 285-315 MHz (RF0.freq 290 MHz + lo_offset_sw 10 MHz). Run with pa_run.py.
+GENERATE:
+  sample_rate: 56000000.0
+  chirp_type: linear
+  chirp_bandwidth: 30000000.0
+  lo_offset_sw: 10000000.0
+  window: hamming
+  chirp_length: 1e-05
+  pulse_length: 1.3e-05
+  out_file: chirp.bin
+  show_plot: false
+DEVICE:
+  device_args: num_recv_frames=700,num_send_frames=700,recv_frame_size=11000,send_frame_size=11000
+  subdev: A:A
+  clk_ref: internal
+  clk_rate: 56000000.0
+  tx_channels: '0'
+  rx_channels: '0'
+  cpu_format: fc32
+  otw_format: sc12
+GPIO:
+  gpio_bank: FP0
+  pwr_amp_pin: "2"
+  pwr_amp_active_low: true
+  ref_out: -1
+RF0:
+  rx_rate: 56000000.0
+  tx_rate: 56000000.0
+  freq: 290000000.0
+  lo_offset: 0
+  rx_gain: 40.0
+  tx_gain: 72.0
+  bw: 56000000.0
+  tx_ant: TX/RX
+  rx_ant: RX2
+  transmit: true
+  tuning_args: ''
+RF1:
+  rx_rate: 56000000.0
+  tx_rate: 56000000.0
+  freq: 450000000.0
+  lo_offset: 0.0
+  rx_gain: 10
+  tx_gain: 10
+  bw: 56000000.0
+  tx_ant: TX/RX
+  rx_ant: RX2
+  transmit: false
+  tuning_args: ''
+CHIRP:
+  time_offset: 1
+  tx_duration: 1.3e-05
+  rx_duration: 4.2e-05
+  tr_on_lead: 0.0
+  tr_off_trail: 0.0
+  pulse_rep_int: 0.0002
+  tx_lead: 1.5e-06
+  num_pulses: -1
+  num_presums: 1000
+  phase_dithering: true
+FILES:
+  chirp_loc: chirp.bin
+  output_dir: hil_scratch/run300_d05_soak
+  save_loc: rx_samps.bin
+  gps_loc: gps_log.txt
+  max_chirps_per_file: -1
+RUN_MANAGER:
+  final_save_loc: null
+  save_partial_files: false
+  save_gps: false
+PLOT:
+  rx_samps: rx_samps.bin
+  orig_chirp: chirp.bin
+  sample_rate: 56000000.0
+  sig_speed: 168500000.0
+  direct_start: 0
+  echo_start: 1
+ENVIRONMENTAL_FACTORS:
+  scattering_max: 1
+  scattering_current: 0.5
+  specular_reflection_coeff_max: 1
+  specular_reflection_coeff_current: 0.5
+  antenna_gain: 6
+  tilt_of_plane: 0
+  reference_power: -66
+  power_loss: 35
+  max_rx_gain: 76
