@@ -309,14 +309,14 @@ def condition_states(reads, cfg, tracked=()):
                                or GPS_TITLES.get(gps.get("health")) or "GPS: no fix",
                                f"GPS {gps.get('health')}: {gps.get('reason') or 'no fix'}. The radar still runs; "
                                "its data lacks positions.", cfg["gps_s"])
-        logs = d.get("logging") or {}
+        logs = d.get("logging") if isinstance(d.get("logging"), dict) else {}
         bad = logs.get("location") != "primary" or logs.get("writer", "running") != "running"
         out["logging"] = State(bad, DEFAULT, "sensor logs not on the data drive",
                                f"Sensor logs: location {logs.get('location')}, writer {logs.get('writer')}"
                                + (f" ({logs.get('reason')})" if logs.get("reason") else "")
                                + ". Is the data drive there and writable?", cfg["logging_fallback_s"])
-        pi = _get(d, "sources", "pi") or {}
-        values = pi.get("values") or {}
+        pi = _get(d, "sources", "pi") if isinstance(_get(d, "sources", "pi"), dict) else {}
+        values = pi.get("values") if isinstance(pi.get("values"), dict) else {}
         soc = _num(values.get("soc_temp_c"))
         throttled = pi.get("throttled_now") if isinstance(pi.get("throttled_now"), list) else []
         hot = bool(throttled) or (soc is not None and soc >= cfg["pi_temp_c"])
