@@ -57,6 +57,12 @@ if tool == "systemctl":
     if verb == "daemon-reload":
         if os.path.exists(destdir + "/etc/systemd/system.conf.d/radar-runner-watchdog.conf"):
             state["watchdog"] = "30s"
+        # systemd starts gpsd with the command line it read at the last reload, not the file's;
+        # "gpsd_override": another drop-in that sets it.
+        drop_in = destdir + "/etc/systemd/system/gpsd.service.d/radar-runner.conf"
+        if os.path.exists(drop_in):
+            with open(drop_in) as f:
+                state["gpsd_loaded"] = state.get("gpsd_override") or [line.split("=", 1)[1].strip() for line in f if line.startswith("ExecStart=/")][-1]
         done(0, record=True)
     if verb == "add-wants":
         link = destdir + "/etc/systemd/system/" + args[1] + ".wants/" + args[2]
@@ -74,10 +80,7 @@ if tool == "systemctl":
     if verb == "restart" and unit in ("gpsd.service", "chrony.service", "fake-hwclock-save.timer"):
         if unit == "gpsd.service":
             state["active"].append(unit)
-            drop_in = destdir + "/etc/systemd/system/gpsd.service.d/radar-runner.conf"
-            if os.path.exists(drop_in):
-                with open(drop_in) as f:
-                    state["gpsd_args"] = [line.split("=", 1)[1].strip() for line in f if line.startswith("ExecStart=/")][-1]
+            state["gpsd_args"] = state.get("gpsd_loaded", "/usr/sbin/gpsd")
         done(0, record=True)
     if verb == "start" and unit in ("chrony.service", "systemd-timesyncd.service", "fake-hwclock-save.timer"):
         if unit == "chrony.service" and state.get("chrony_wont_start"):
@@ -89,7 +92,10 @@ if tool == "systemctl":
     done(1, record=True)        # anything else (stop, restart of another unit, ...) is not expected
 
 if tool == "ps":
-    done(0 if "gpsd.service" in state["active"] else 1, state["gpsd_args"] if "gpsd.service" in state["active"] else None)
+    line = state["gpsd_args"] if "gpsd.service" in state["active"] else None
+    if line and "-ww" not in args and os.environ.get("COLUMNS"):     # as procps does
+        line = line[:int(os.environ["COLUMNS"])]
+    done(0 if line else 1, line)
 
 if tool == "apt-get":
     # The plan and the result of installing chrony and fake-hwclock in place of systemd-timesyncd.

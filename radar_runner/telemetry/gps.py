@@ -23,8 +23,10 @@ receiver's side of it.
 3D fix. On 2026-11-19, after a power cut, gpsd delivered fix times with mode 0
 for 77 minutes while the receiver had a fix: it had not identified the receiver
 (empty `subtype` in its DEVICES report), and the receiver sent it no position
-message (setup/gps_receiver.py has what gpsd does and what is inferred). gpsd
-clears the fix at every cycle, so mode 0 with fix times means no position
+message (setup/gps_receiver.py has what gpsd did and what is inferred). gpsd
+has run passive since 2026-11-20 and no longer configures the receiver, which
+removes the way in that is believed responsible; this watch stays as the
+safety net. gpsd clears the fix at every cycle, so mode 0 with fix times means no position
 message arrives, and mode 1 a position message without a fix. While there is no
 position, or the last report did not show an identified receiver, `?DEVICES;`
 is asked every DEVICES_EVERY_S, and `identified` gives the answer. Both

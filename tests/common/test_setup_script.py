@@ -181,7 +181,7 @@ def test_apply_on_a_fresh_system(system):
     assert {"gpsd.service", TELEMETRY, "chrony.service", "fake-hwclock-save.timer"} <= set(state["enabled"])
     assert {"gpsd.service", TELEMETRY, "chrony.service", "fake-hwclock-save.timer"} <= set(state["active"])
     assert "systemd-timesyncd" not in state["installed"] and {"chrony", "fake-hwclock"} <= set(state["installed"])
-    assert " -n /dev/serial/by-id/usb-u-blox" in state["gpsd_args"]
+    assert " -n -p /dev/serial/by-id/usb-u-blox" in state["gpsd_args"]
     assert not [p for p in system.tree() if ".radar-setup." in p]                         # no temporary files
     assert "a reboot is needed for:" in r.stdout
     for reason in ("logind: InhibitDelayMaxSec=5", "journald limits"):
@@ -488,7 +488,7 @@ def test_gpsd_is_enabled_given_its_receiver_and_restarted_once(system):
     assert filecmp.cmp(os.path.join(FILES, GPSD_DROP_IN), system.path(GPSD_DROP_IN), shallow=False)
     assert system.path("/etc/default/gpsd").read_text() == 'DEVICES=""\nGPSD_OPTIONS=""\nUSBAUTO="true"\n'   # untouched
     r = system.run()
-    assert "gpsd.service is enabled (runs from boot)" in r.stdout and "gpsd is running with -n" in r.stdout
+    assert "gpsd.service is enabled (runs from boot)" in r.stdout and "gpsd is running with -n -p and the receiver" in r.stdout
     assert system.log.count("systemctl restart gpsd.service") == 1
 
 
@@ -508,7 +508,69 @@ def test_gpsd_running_without_n_is_restarted_even_if_the_file_is_in_place(system
     assert system.run().returncode == 0
     system.set(gpsd_args="/usr/sbin/gpsd", log=[])          # e.g. an earlier run was interrupted before the restart
     r = system.run()
-    assert r.returncode == 0 and system.log == ["systemctl restart gpsd.service", "systemctl daemon-reload"]
+    # Reloaded before every restart; the last reload is the one at the end of every run.
+    assert r.returncode == 0 and system.log == ["systemctl daemon-reload", "systemctl restart gpsd.service",
+                                                "systemctl daemon-reload"]
+
+
+DEVICE_PATH = "/dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver-if00"
+
+
+def test_gpsd_without_p_is_restarted_with_the_new_drop_in(system):
+    """A unit set up before passive mode: gpsd -n with the receiver, the drop-in without -p."""
+    assert system.run().returncode == 0
+    old = system.path(GPSD_DROP_IN).read_text().replace(f"gpsd -n -p {DEVICE_PATH}", f"gpsd -n {DEVICE_PATH}")
+    system.path(GPSD_DROP_IN).write_text(old)
+    system.set(gpsd_args=f"/usr/sbin/gpsd -n {DEVICE_PATH}", log=[])
+    r = system.run()
+    # The new file read before the restart; the last reload is the one at the end of every run.
+    assert r.returncode == 0 and system.log == ["systemctl daemon-reload", "systemctl restart gpsd.service",
+                                                "systemctl daemon-reload"]
+    assert filecmp.cmp(os.path.join(FILES, GPSD_DROP_IN), system.path(GPSD_DROP_IN), shallow=False)
+    assert system.state["gpsd_args"] == f"/usr/sbin/gpsd -n -p {DEVICE_PATH}"
+
+
+def test_gpsd_restart_reloads_the_new_file_first(system):
+    """An earlier run installed the new drop-in and stopped before any reload: systemd still holds
+    the old command line, and a restart without a reload would start it again."""
+    assert system.run().returncode == 0
+    system.set(gpsd_args=f"/usr/sbin/gpsd -n {DEVICE_PATH}", gpsd_loaded=f"/usr/sbin/gpsd -n {DEVICE_PATH}", log=[])
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert system.log[:2] == ["systemctl daemon-reload", "systemctl restart gpsd.service"]
+    assert system.state["gpsd_args"] == f"/usr/sbin/gpsd -n -p {DEVICE_PATH}"
+    assert f"gpsd is running with -n -p and the receiver (/usr/sbin/gpsd -n -p {DEVICE_PATH})" in r.stdout
+
+
+def test_gpsd_still_running_another_command_line_after_the_restart_fails_the_step(system):
+    assert system.run().returncode == 0
+    system.set(gpsd_args="/usr/sbin/gpsd", gpsd_override=f"/usr/sbin/gpsd -n {DEVICE_PATH}", log=[])
+    r = system.run()
+    assert r.returncode == 1
+    assert (f'setup: FAILED in step "gpsd: owns the GPS receiver, runs without clients, passive": gpsd was restarted '
+            f'but runs "/usr/sbin/gpsd -n {DEVICE_PATH}", not "/usr/sbin/gpsd -n -p {DEVICE_PATH}"') in r.stderr
+
+
+def test_gpsd_command_line_is_read_whole_with_columns_set(system):
+    """ps cuts its lines to $COLUMNS; the 95 characters of gpsd's must not look like a difference."""
+    assert system.run().returncode == 0
+    system.set(log=[])
+    r = system.run(COLUMNS="80")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "systemctl restart gpsd.service" not in system.log
+    assert f"gpsd is running with -n -p and the receiver (/usr/sbin/gpsd -n -p {DEVICE_PATH})" in r.stdout
+
+
+def test_gpsd_running_as_wanted_is_not_restarted_for_a_comment(system):
+    """As on the bench after the passive-mode trial: the same command line, other comments."""
+    assert system.run().returncode == 0
+    system.path(GPSD_DROP_IN).write_text("# BENCH TRIAL\n" + system.path(GPSD_DROP_IN).read_text())
+    system.set(log=[])
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert filecmp.cmp(os.path.join(FILES, GPSD_DROP_IN), system.path(GPSD_DROP_IN), shallow=False)
+    assert system.log == ["systemctl daemon-reload"]
+    assert f"gpsd is running with -n -p and the receiver (/usr/sbin/gpsd -n -p {DEVICE_PATH})" in r.stdout
 
 
 def test_gpsd_not_installed_and_hotplug_switched_off_are_reported(system):

@@ -42,8 +42,7 @@ FIX_STATUS = {0: "receiver identified by gpsd, settings correct", 1: "a setting 
               4: "wrong options", -9: "stopped: took too long"}
 RETRY_FLOOR_S = 30.0    # the shortest wait between two runs of the receiver command for want of a position
 _NO_POSITION_TEXT = {
-    "gpsd_unidentified": "gpsd has not identified the receiver (no version reply seen), and then it may have "
-                         "switched the position messages off",
+    "gpsd_unidentified": "gpsd has not identified the receiver (no version reply seen)",
     "no_position_messages": "fix times arrive but gpsd reports mode 0: the receiver sends gpsd no position "
                             "message (NAV-PVT off)",
     "no_data": "no new fix time from the receiver either (its output, or the receiver itself)",
@@ -188,11 +187,13 @@ class Telemetry(Service):
     def _ola_started(self, mono, configured):
         """Note when the OLA has just been configured: the receiver command is due a little later.
 
-        Each time the OLA starts it turns NMEA output on the receiver's unused UART1 back on (in the
-        receiver's RAM; seen 2026-11-19). With the OLA's 10 Hz rate that overflows the receiver's
-        transmit buffer and gpsd loses messages. setup/gps_receiver.py turns it off again, in RAM
-        only, through gpsd. Only this bookkeeping is in the OLA's step; the command is started in
-        _step_receiver, so that nothing about it can disturb the amplifier readings.
+        Each time the OLA starts it configures the receiver and saves the receiver's RAM settings
+        to its battery-backed memory and flash (measured 2026-11-20), so a wrong value in RAM then
+        is also what the receiver powers up with. setup/gps_receiver.py checks NAV-PVT and UART1
+        NMEA output in RAM and corrects them there, through gpsd. (UART1 NMEA coming back on in
+        RAM, seen 2026-11-19, was gpsd's doing; gpsd now runs passive.) Only this bookkeeping is
+        in the OLA's step; the command is started in _step_receiver, so that nothing about it can
+        disturb the amplifier readings.
         """
         if configured and not self._ola_was_configured:
             self._fix_due = mono + self.cfg["gps"].get("receiver_fix_delay_s", 15.0)
