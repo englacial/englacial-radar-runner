@@ -724,6 +724,9 @@ Hostname, machine ID, SSH host keys and the Tailscale login. `check.py` prints
 them as `identity:` lines; the same value on two systems means a card was
 cloned without giving the copy its own identity.
 
+A second unit made from this unit's card image gets its own identity, and loses the settings and
+state measured on this unit, with `setup/new_unit_image.py` (`setup/NEW_UNIT.md`).
+
 ## Rebuild from the stock Ubuntu image: what is still done by hand
 
 In this order, before `setup/setup.sh`:
