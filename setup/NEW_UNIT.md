@@ -33,8 +33,11 @@ system logs, snapd's device identity).
 
 The tool stops at the first unexpected state, before it changes anything, and in a dry run
 writes nothing. Paths are resolved inside the image: an absolute symlink in the image points into
-the image, never at the computer's own files. It refuses the computer's own root and any tree on
-the disk the computer runs from.
+the image, never at the computer's own files. It refuses the computer's own root, and a tree
+that is on the same file system as, or on the same whole disk, btrfs device or ZFS pool as, any of
+the computer's `/`, `/boot`, `/boot/efi`, `/boot/firmware`, `/usr`, `/var` and `/home` (from
+the device numbers and the kernel's mount table). It cannot see further than that, for example
+into a network file system or a disk image the computer itself runs from.
 
 ## Procedure
 

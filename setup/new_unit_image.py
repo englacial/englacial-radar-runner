@@ -272,6 +272,53 @@ def host_system_devices():
     return devs, disks
 
 
+MOUNTINFO = "/proc/self/mountinfo"
+HOST_MOUNTS = ("/", "/boot", "/boot/efi", "/boot/firmware", "/usr", "/var", "/home")
+PSEUDO_SOURCES = {"none", "tmpfs", "overlay", "proc", "sysfs", "devtmpfs", "rootfs"}
+
+
+def mount_table():
+    """(mount point, fstype, source) of every mount, from the kernel's mountinfo."""
+    unescape = lambda s: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)     # noqa: E731
+    table = []
+    try:
+        with open(MOUNTINFO) as f:
+            for line in f:
+                fields = line.split()
+                if "-" in fields:
+                    sep = fields.index("-")
+                    table.append((unescape(fields[4]), fields[sep + 1], unescape(fields[sep + 2])))
+    except OSError as e:
+        raise Stop(f"cannot read {MOUNTINFO}: {e.strerror}")
+    return table
+
+
+def mount_of(path, table):
+    """The mount that holds `path`: the longest mount point above it (the last one if stacked)."""
+    best = None
+    for mp, fstype, source in table:
+        if path == mp or path.startswith(mp.rstrip("/") + "/"):
+            if best is None or len(mp) >= len(best[0]):
+                best = (mp, fstype, source)
+    return best
+
+
+def source_keys(fstype, source):
+    """What makes two mounts the same storage: the source (one btrfs device for every subvolume),
+    the ZFS pool, and the whole disks under a block device."""
+    if source in PSEUDO_SOURCES:
+        return set()
+    keys = {f"source:{source}"}
+    if fstype == "zfs":
+        keys.add(f"zfs:{source.split('/')[0]}")
+    if source.startswith("/dev/"):
+        try:
+            keys |= {f"disk:{d}" for d in _disks(os.stat(source).st_rdev)}
+        except OSError:
+            pass
+    return keys
+
+
 def refuse_host_tree(top, what, host=None):
     real = os.path.realpath(top)
     if real == "/":
@@ -283,6 +330,18 @@ def refuse_host_tree(top, what, host=None):
     shared = _disks(dev) & disks
     if shared:
         raise Stop(f"{what} {top} is on the disk this computer booted from ({', '.join(sorted(shared))})")
+    # File systems with anonymous device numbers (btrfs subvolumes, ZFS, overlays): compare sources.
+    table = mount_table()
+    mine = mount_of(real, table)
+    host_keys = set()
+    for p in HOST_MOUNTS:
+        m = mount_of(p, table)
+        if m is not None and m != mine:
+            host_keys |= source_keys(m[1], m[2])
+    if mine is not None and mine[0] in HOST_MOUNTS:
+        raise Stop(f"{what} {top} is on {mine[0]}, a file system this computer runs from")
+    if mine is not None and source_keys(mine[1], mine[2]) & host_keys:
+        raise Stop(f"{what} {top} is on {mine[2]}, the storage this computer runs from")
 
 
 def check_looks_like_unit(root, boot):

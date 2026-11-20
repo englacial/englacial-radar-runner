@@ -797,3 +797,32 @@ def test_scan_for_the_old_hostname_stays_in_the_image(shm, capsys):
     os.symlink(host, os.path.join(root, "etc/linked-dir"))      # a link inside a walked directory
     assert run(root, boot) == 0
     assert "host-only-file" not in capsys.readouterr().out
+
+
+def mountinfo(tmp, *mounts):
+    """A /proc/self/mountinfo with these (mount point, fstype, source) lines."""
+    lines = [f"{i + 20} 1 0:{i + 30} / {mp.replace(' ', chr(92) + '040')} rw,relatime shared:1 - {fs} {src} rw"
+             for i, (mp, fs, src) in enumerate(mounts)]
+    path = os.path.join(tmp, "mountinfo")
+    write(path, "\n".join(lines) + "\n")
+    return path
+
+
+@pytest.mark.parametrize("host_root, tree_mount", [
+    (("/", "btrfs", "/dev/sda2"), ("/dev/shm", "btrfs", "/dev/sda2")),               # another subvolume
+    (("/", "zfs", "rpool/ROOT/ubuntu"), ("/dev/shm", "zfs", "rpool/data/images")),    # another dataset
+])
+def test_refuses_a_tree_on_a_host_file_system_with_an_anonymous_device(unit, shm, monkeypatch,
+                                                                       host_root, tree_mount):
+    root, boot = unit
+    monkeypatch.setattr(nui, "MOUNTINFO", mountinfo(shm, host_root, ("/home", "ext4", "/dev/sdb1"), tree_mount))
+    with pytest.raises(nui.Stop, match="runs from"):
+        nui.refuse_host_tree(root, "--root", host=(set(), set()))
+
+
+def test_a_tree_on_another_file_system_passes_the_mount_check(unit, shm, monkeypatch):
+    root, boot = unit
+    monkeypatch.setattr(nui, "MOUNTINFO", mountinfo(shm, ("/", "btrfs", "/dev/sda2"),
+                                                    ("/dev/shm", "tmpfs", "tmpfs"),
+                                                    ("/media/my card", "ext4", "/dev/sdc2")))
+    nui.refuse_host_tree(root, "--root", host=(set(), set()))
