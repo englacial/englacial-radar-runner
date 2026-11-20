@@ -772,6 +772,28 @@ def test_sends_stuck_in_dns_lookups_for_ten_minutes_make_the_service_exit_for_a_
     assert any(n.startswith("p4-") for n in rig.queued())      # the alert waits on disk for the next process
 
 
+@pytest.mark.parametrize("exit_for", ["dns", "failed rounds"])
+def test_an_exit_that_asks_for_a_restart_is_not_a_clean_stop(tmp_path, server, exit_for):
+    # A power cut in the restart gap must not be reported as a clean stop at the next boot.
+    rig = Rig(tmp_path, server.url, loop_interval_s=0.1)
+    svc = rig.start()
+    rig.tick(3)
+    if exit_for == "dns":
+        svc.exit_status = 1                     # as _reap sets it
+        svc.request_stop()
+        rig.stop()
+    else:
+        def broken(now):
+            raise RuntimeError("broken")
+        svc._settle = broken                    # every round fails
+        assert svc.run() == 1
+        rig.service = None
+    assert rig.state()["clean_stop"] is False
+    rig.reboot()
+    rig.tick(3)
+    assert "ended without a clean stop" in summaries(server)[-1]["message"]
+
+
 # ---- the boot summary in real boots
 
 def summaries(server):

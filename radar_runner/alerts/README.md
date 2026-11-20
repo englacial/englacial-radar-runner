@@ -307,7 +307,7 @@ reported as restarted; its status file going stale still is.
 
 | What | Then |
 |---|---|
-| It crashes, or a part of its round raises | A part that raises is logged and shown under `errors`, and the rest of the round goes on; one event that cannot be judged is skipped. Ten failed rounds in a row: exit, systemd restarts it after 10 s. Queue and positions are on disk |
+| It crashes, or a part of its round raises | A part that raises is logged and shown under `errors`, and the rest of the round goes on; one event that cannot be judged is skipped. Ten failed rounds in a row: exit, systemd restarts it after 10 s. Queue and positions are on disk. Neither this exit nor the one below is recorded as a clean stop (a power cut before the restart would otherwise look like a shutdown at the next boot) |
 | It hangs | no watchdog ping for 60 s: SIGKILL and restart |
 | The queue is full | the drop rule above; counted |
 | The SD card cannot be written | alerts cannot be queued: logged, `queue.error` in the status. Sending what is queued goes on |

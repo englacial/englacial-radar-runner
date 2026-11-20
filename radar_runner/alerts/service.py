@@ -196,6 +196,7 @@ class Alerts(Service):
         self._removal_retry_at = 0.0
         self._stale_full_since = None
         self.exit_status = 0
+        self._failed_rounds = 0     # rounds in a row that raised (the loop exits for a restart at max_failures)
         self.counters = {"queued": 0, "sent": 0, "held_back": 0, "rejected": 0, "events": 0,
                          "voltage_trips_in_power_loss": 0, "inbox": 0}
         self.recent = []
@@ -341,7 +342,9 @@ class Alerts(Service):
             self.sending["send"].cancel()
             self.log.info("stopping: the send of %s was cut off; it stays queued", self.sending["name"])
         now = self._uptime()
-        self._save_state(now, clean_stop=True)
+        # An exit that asks systemd for a restart (stuck sends, or failed rounds) is not a clean stop:
+        # a power cut in the restart gap must not look like a shutdown at the next boot.
+        self._save_state(now, clean_stop=self.exit_status == 0 and self._failed_rounds < self.max_failures)
         data = self._status(now)
         data["running"] = False
         self.publish(data)
@@ -363,6 +366,7 @@ class Alerts(Service):
             return []
 
     def tick(self):
+        self._failed_rounds += 1    # until this round has come to its end
         now = self._uptime()
         self._reads = {name: status_files.read_status(path, self.config["status"]["stale_after_s"],
                                                       wall=self._wall, uptime=self._uptime, boot_id=self.boot_id)
@@ -381,7 +385,9 @@ class Alerts(Service):
         if self._dirty or self._saved_at is None or now - self._saved_at >= HEARTBEAT_S:
             self._save_state(now)
         self._guarded("send", self._send)
-        return self._status(self._uptime())
+        status = self._status(self._uptime())
+        self._failed_rounds = 0
+        return status
 
     def _boot_number(self):
         tel = self._reads.get("telemetry")
