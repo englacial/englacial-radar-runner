@@ -78,6 +78,7 @@ class Rig:
         a = cfg["alerts"]
         a["unit_name"] = "test-unit"
         a["summary_after_s"] = 0.0
+        a["summary_settle_s"] = 0.0
         a["ntfy"].update(server=self.server_url, topic=TOPIC, token=TOKEN, timeout_s=2.0, retry_s=1.0,
                          retry_max_s=8.0)
         for key, value in self.changes.items():

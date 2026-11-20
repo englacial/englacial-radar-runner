@@ -232,9 +232,18 @@ text in the alerts, with "clock not set" when telemetry says so.
 
 ## The boot summary
 
-Once per boot, at `summary_after_s` (3 min) of uptime, so that the other
-services have started. Priority 3. A restart of the service in the same boot
-does not send another. Contents:
+Once per boot, at `summary_after_s` (3 min) of uptime, and only once the
+status files of telemetry, the watcher, the manager and the power service have
+been fresh and past their start (telemetry reading the Pi, neither the watcher
+nor the manager stopping) for `summary_settle_s` (30 s) without a break, as
+seen by this service: a summary sent at a later start, in the middle of a
+restart of the others, waits for them. It waits at most `summary_wait_max_s`
+(10 min) after this service's start; then it goes out with a first line saying
+what was missing ("unknown" then means not reported, not a fault). Priority 3.
+A restart of the service in the same boot does not send another. A collection
+without an end is "recording now" when the manager's status names it as its
+current run, "no end recorded yet" when the manager's state is not known, and
+"cut off" only otherwise. Contents:
 
 * boot number, uptime, whether the clock is set;
 * the boot before: how long it ran (at least: the state file is updated every

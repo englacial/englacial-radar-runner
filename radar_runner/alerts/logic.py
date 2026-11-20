@@ -516,7 +516,7 @@ def _gb(value):
 
 def boot_summary(f):
     """The summary alert. `f` is a dict of facts gathered by the service (see Alerts._summary_facts)."""
-    lines = []
+    lines = [f["unsettled"]] if f.get("unsettled") else []
     boot = f.get("boot")
     clock = {1: "clock set", 0: "CLOCK NOT SET"}.get(f.get("clock_synced"), "clock state unknown")
     lines.append(f"Boot {boot if boot is not None else '?'}, up {_duration(f.get('uptime_s'))}, {clock}.")
