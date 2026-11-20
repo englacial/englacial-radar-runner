@@ -181,9 +181,12 @@ that way: a connect or handshake ends at the 10 s socket timeout, a lookup when
 the resolver gives up; the send runs on in its thread meanwhile (the loop and a
 stop do not wait for it), and no new send starts while two are left like that.
 Sent means a complete 2xx answer: the end of the headers and the whole body
-(Content-Length matched, or the end of a chunked body). A connection that
-closes before that, or a send that was cut off before its answer was whole, is
-never counted as sent.
+(Content-Length matched, the end of a chunked body, or a body that ends where
+the server closes the connection). A connection that closes before that, a 2xx
+without Content-Length that closes before any body (it cannot be told from one
+cut off in the headers), or a send that was cut off before its answer was
+whole, is never counted as sent. A body over 64 kB is not read to its end but
+counts as sent: the server took the alert.
 
 | Answer | Then |
 |---|---|
@@ -242,8 +245,18 @@ restart of the others, waits for them. It waits at most `summary_wait_max_s`
 what was missing ("unknown" then means not reported, not a fault). Priority 3.
 A restart of the service in the same boot does not send another. A collection
 without an end is "recording now" when the manager's status names it as its
-current run, "no end recorded yet" when the manager's state is not known, and
-"cut off" only otherwise. Contents:
+current run, "no end recorded yet" when the manager's state is not known or
+when the collection is from this boot (the `boot_id` in its `collection.json`)
+and the manager is starting, running or stopping without naming a collection,
+and "cut off" only otherwise. That covers the first second of a run (the
+manager names the collection once the runner's event is in), but also the wait
+before a retry or a resume: a run of this boot left open by a crash of the
+manager, while the manager waits to start again, cannot be told from a run
+that is starting and is called "no end recorded yet (...; a run is starting)".
+How long a run of this boot has been recording comes from the uptime stamps in
+its `collection.json` ("recording now (for 2 min)"), as the clock may not have
+been set at its start; for a collection not known to be from this boot, or
+without such a stamp, its start time of day. Contents:
 
 * boot number, uptime, whether the clock is set;
 * the boot before: how long it ran (at least: the state file is updated every
@@ -262,7 +275,9 @@ current run, "no end recorded yet" when the manager's state is not known, and
   and the number of config warnings;
 * active alerts, and the queue: waiting, dropped, held back.
 
-A day without a summary is itself a sign of trouble.
+A field of the other services' status of an odd type is shown as text. A
+summary that cannot be put together all the same goes out short (boot, uptime
+and the error), once. A day without a summary is itself a sign of trouble.
 
 ## Event logs
 
@@ -299,7 +314,7 @@ reported as restarted; its status file going stale still is.
 
 | What | Then |
 |---|---|
-| It crashes, or a part of its round raises | A part that raises is logged and shown under `errors`, and the rest of the round goes on; one event that cannot be judged is skipped. Ten failed rounds in a row: exit, systemd restarts it after 10 s. Queue and positions are on disk |
+| It crashes, or a part of its round raises | A part that raises is logged and shown under `errors`, and the rest of the round goes on; one event that cannot be judged is skipped. Ten failed rounds in a row: exit, systemd restarts it after 10 s. Queue and positions are on disk. Neither this exit nor the one below is recorded as a clean stop (a power cut before the restart would otherwise look like a shutdown at the next boot) |
 | It hangs | no watchdog ping for 60 s: SIGKILL and restart |
 | The queue is full | the drop rule above; counted |
 | The SD card cannot be written | alerts cannot be queued: logged, `queue.error` in the status. Sending what is queued goes on |

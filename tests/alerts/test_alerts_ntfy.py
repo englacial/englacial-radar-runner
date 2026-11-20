@@ -140,6 +140,42 @@ def test_a_send_is_cancelled_at_once(server):
     assert s.done.wait(2.0) and time.monotonic() - t < 1.0 and s.result.kind == ntfy.RETRY
 
 
+def test_a_send_reading_an_answer_ended_by_the_close_is_cancelled_at_once():
+    # http.client gives up its hold of the socket for such an answer: the cancel must still reach it.
+    def drip(conn):
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+        for _ in range(100):
+            time.sleep(0.2)
+            try:
+                conn.sendall(b"x")
+            except OSError:
+                return
+    url, sock = raw_server(drip)
+    s = ntfy.Send(url, "t", TOKEN, ALERT).start()
+    time.sleep(1.0)
+    t = time.monotonic()
+    s.cancel()
+    ended = s.done.wait(3.0)
+    sock.close()
+    assert ended and time.monotonic() - t < 1.5 and s.result.kind == ntfy.RETRY
+
+
+def test_a_long_chunked_answer_is_read_only_up_to_the_limit():
+    # A chunk far longer than the limit, then the connection held open: read without a limit, the send
+    # would wait for the end and time out; read up to the limit, it is taken as sent at once.
+    def endless(conn):
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n100000\r\n" + b"x" * 200000)
+        time.sleep(30)
+    url, sock = raw_server(endless)
+    t = time.monotonic()
+    r = send(url, timeout=3.0)
+    elapsed = time.monotonic() - t
+    sock.close()
+    assert r.kind == ntfy.SENT and elapsed < 1.5, (r, elapsed)
+
+
 def test_redirects_are_not_followed(server):
     # A redirect would carry the token to another address.
     server.mode = "redirect"
@@ -184,11 +220,27 @@ def test_an_unconfigured_server_or_topic_sends_nothing(server):
     (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"id\"\r\n", False),  # chunked, cut
     (b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{\"id\": 12}", True),               # whole
     (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3\r\n: 1\r\n1\r\n}\r\n0\r\n\r\n", True),
+    (b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"id\": \"m1\"}", True),                # ended by the close
+    (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"id\": \"m1\"}", True),
+    (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n", False),      # no body: cannot tell from a cut
+    (b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + b"x" * 100000, True),               # over-long: taken
+    (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + b"10000\r\n" + b"x" * 65536 + b"\r\n"
+     + b"10000\r\n" + b"x" * 65536 + b"\r\n0\r\n\r\n", True),
+    (b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n" + b"x" * 100000, True),
+    (b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n" + b"x" * 1000, False),           # over-long, cut short
 ])
 def test_only_a_whole_answer_counts_as_sent(answer, sent):
     def reply(conn):
+        import socket
         conn.recv(65536)
         conn.sendall(answer)
+        conn.shutdown(socket.SHUT_WR)       # an orderly close: unread request bytes would make it a reset
+        conn.settimeout(5.0)
+        try:
+            while conn.recv(65536):
+                pass
+        except OSError:
+            pass
         conn.close()
     url, sock = raw_server(reply)
     r = send(url, timeout=3.0)

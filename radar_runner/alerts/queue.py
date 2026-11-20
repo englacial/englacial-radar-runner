@@ -78,12 +78,16 @@ class DiskQueue:
         self.seq = max([seq for _, seq, _ in self.names()] + [self.seq])
 
     def names(self):
-        """[(priority, seq, name)] of the queued files, in sending order."""
+        """[(priority, seq, name)] of the queued files, in sending order; [] if the directory cannot be listed."""
+        return self.listing() or []
+
+    def listing(self):
+        """As names(), but None if the directory cannot be listed: not to be taken for an empty queue."""
         try:
             listing = os.listdir(self.dir)
         except OSError as e:
             self.error = f"{self.dir}: {e.strerror or e}"
-            return []
+            return None
         found = []
         for name in listing:
             m = NAME_RE.match(name)

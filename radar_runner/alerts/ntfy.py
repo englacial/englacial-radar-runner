@@ -20,8 +20,12 @@ has to fit into an HTTP header. The token goes in `Authorization: Bearer`.
   cancelled send is never reported as sent unless its whole answer had been
   read before the cancel.
 * Sent means a 2xx answer that is complete: the end of the headers and the
-  whole body (its Content-Length, or the end of a chunked body). A connection
-  that closes before that is a retry, never "sent".
+  whole body (its Content-Length, the end of a chunked body, or a body that
+  ends where the server closes the connection). A connection that closes
+  before that is a retry, never "sent"; so is a 2xx without Content-Length
+  whose connection closes before any body (it cannot be told from one cut off
+  in the headers). A body longer than MAX_REPLY counts as sent: the server
+  took the alert, and it is not posted again for ever.
 
 The result says what to do with the alert: sent (delete it), retry (keep it,
 back off; the link, the server or the token is the problem), or rejected (the
@@ -109,6 +113,7 @@ class Send:
         self.cancelled = False
         self._complete = False      # the whole answer was read before any cancel
         self._conn = None
+        self._sock = None           # the connection's socket, for cancel()
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True, name="alerts-send")
 
@@ -123,8 +128,7 @@ class Send:
             if self._complete:
                 return
             self.cancelled = True
-            conn = self._conn
-        sock = getattr(conn, "sock", None)
+            sock = self._sock
         if sock is not None:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -176,15 +180,27 @@ class Send:
             self._conn = conn
         try:
             conn.connect()          # DNS lookup, TCP, TLS
-            if self.cancelled:
-                return Result(RETRY, text="cancelled")
+            with self._lock:
+                # Kept here: for an answer that ends with the connection, http.client hands the socket
+                # over to the response and clears conn.sock.
+                self._sock = conn.sock
+                if self.cancelled:
+                    return Result(RETRY, text="cancelled")
             conn.request("POST", (parts.path or "").rstrip("/") + "/", body=body, headers=headers)
             response = conn.getresponse()
             status = response.status
-            # Only a body of known length, or a chunked one, shows that the answer arrived whole (and
-            # with it the end of the headers): read to its end; a short one raises IncompleteRead.
-            whole = response.chunked or (response.length is not None and response.length <= MAX_REPLY)
-            reply = response.read() if whole else response.read(MAX_REPLY)
+            # The answer is whole once its body has arrived, and with it the end of the headers. A body
+            # of known length is read to its end (a short one raises IncompleteRead); any other, at most
+            # MAX_REPLY + 1 bytes: the end of a chunked body, or an answer that ends where the server
+            # closes the connection and has a body (http.client takes a connection closed within the
+            # headers for their end, with an empty body). A longer body shows the headers ended: the
+            # server took the alert, the rest is not read.
+            if response.length is not None and response.length <= MAX_REPLY:
+                reply, whole = response.read(), True
+            else:
+                reply = response.read(MAX_REPLY + 1)
+                whole = (len(reply) > MAX_REPLY or (response.chunked and response.isclosed())
+                         or (response.length is None and not response.chunked and reply != b""))
             with self._lock:
                 if self.cancelled:
                     return Result(RETRY, text="cancelled")

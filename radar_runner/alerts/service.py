@@ -86,6 +86,13 @@ def _path(base, name):
     return os.path.join(base, name)         # a full path stays as it is
 
 
+def _texts(value):
+    """A list field of another service's status as texts; anything else that is set, as one text."""
+    if isinstance(value, list):
+        return [str(x) for x in value]
+    return [str(value)] if value else []
+
+
 def scan_collections(root):
     """The newest collection under `root`: {"count", "last": {...}} (raises OSError)."""
     found = []
@@ -120,10 +127,14 @@ def scan_collections(root):
                 pass
     how = (str(end.get("how") or "ended") if end else
            "cut off (no end recorded: power cut or crash)" if meta else "no collection.json")
-    began = started or (meta.get("created") if isinstance(meta.get("created"), dict) else {})
+    created = meta.get("created") if isinstance(meta.get("created"), dict) else {}
+    began = started or created
     began = began.get("time_utc") if isinstance(began.get("time_utc"), str) else ""
-    return {"count": len(found), "last": {"name": name, "how": how, "open": bool(meta) and end is None,
-                                          "started_utc": began,
+    uptimes = {key: x.get("uptime_s") if type(x.get("uptime_s")) in (int, float) else None
+               for key, x in (("started_uptime_s", started or {}), ("created_uptime_s", created))}
+    boot_id = meta.get("boot_id") if isinstance(meta.get("boot_id"), str) else None
+    return {"count": len(found), "last": {"name": name, "boot_id": boot_id, "how": how, "open": bool(meta) and end is None,
+                                          "started_utc": began, **uptimes,
                                           "reason": str(end.get("reason") or "") if end else "",
                                           "recorded_s": recorded, "data_gb": size / 1e9}}
 
@@ -193,6 +204,7 @@ class Alerts(Service):
         self._removal_retry_at = 0.0
         self._stale_full_since = None
         self.exit_status = 0
+        self._failed_rounds = 0     # rounds in a row that raised (the loop exits for a restart at max_failures)
         self.counters = {"queued": 0, "sent": 0, "held_back": 0, "rejected": 0, "events": 0,
                          "voltage_trips_in_power_loss": 0, "inbox": 0}
         self.recent = []
@@ -201,6 +213,9 @@ class Alerts(Service):
         self._saved_at = None
         self._state_error = ""
         self._scan = None
+        self._scan_thread = None
+        self._scan_wanted = None    # uptime at which the summary first waited for a scan
+        self._scan_earlier = None   # a scan's answer, read again as the manager's state changed meanwhile
         self._reads = {}
         self._followed = set()      # event logs read once already by this process
         self._settled_since = None  # uptime since which the other services' status has been usable
@@ -337,7 +352,9 @@ class Alerts(Service):
             self.sending["send"].cancel()
             self.log.info("stopping: the send of %s was cut off; it stays queued", self.sending["name"])
         now = self._uptime()
-        self._save_state(now, clean_stop=True)
+        # An exit that asks systemd for a restart (stuck sends, or failed rounds) is not a clean stop:
+        # a power cut in the restart gap must not look like a shutdown at the next boot.
+        self._save_state(now, clean_stop=self.exit_status == 0 and self._failed_rounds < self.max_failures)
         data = self._status(now)
         data["running"] = False
         self.publish(data)
@@ -359,6 +376,7 @@ class Alerts(Service):
             return []
 
     def tick(self):
+        self._failed_rounds += 1    # until this round has come to its end
         now = self._uptime()
         self._reads = {name: status_files.read_status(path, self.config["status"]["stale_after_s"],
                                                       wall=self._wall, uptime=self._uptime, boot_id=self.boot_id)
@@ -377,7 +395,9 @@ class Alerts(Service):
         if self._dirty or self._saved_at is None or now - self._saved_at >= HEARTBEAT_S:
             self._save_state(now)
         self._guarded("send", self._send)
-        return self._status(self._uptime())
+        status = self._status(self._uptime())
+        self._failed_rounds = 0
+        return status
 
     def _boot_number(self):
         tel = self._reads.get("telemetry")
@@ -427,7 +447,9 @@ class Alerts(Service):
             if not isinstance(request, dict):
                 continue
             self.counters["inbox"] += 1
-            priority = L.BY_NAME.get(request.get("priority"), L.DEFAULT)
+            # A priority that is not a name (a list) is the default, like an unknown name.
+            wanted = request.get("priority")
+            priority = L.BY_NAME.get(wanted, L.DEFAULT) if isinstance(wanted, str) else L.DEFAULT
             test_id = str(request.get("id") or "")[:40]
             text = str(request.get("text") or "")
             alert = L.Alert("test", priority, f"test alert ({L.PRIORITY_NAMES[priority]})",
@@ -509,8 +531,14 @@ class Alerts(Service):
             return []
         settled = self._settled_since is not None and now - self._settled_since >= self.cfg["summary_settle_s"]
         if not settled and now - self._started_at < self.cfg["summary_wait_max_s"]:
+            # A scan from before the break may be out of date by the time the status settles again.
+            self._scan = self._scan_wanted = self._scan_earlier = None
             return []           # a restart of the other services under way: wait until it is over
-        if self._scan is None:
+        if self._scan_wanted is None:
+            self._scan_wanted = now
+        # One scan thread at a time: a new scan starts only once the one before has ended (a drive
+        # that hangs). A scan that was dropped writes only into its own result.
+        if self._scan is None and (self._scan_thread is None or not self._scan_thread.is_alive()):
             result = {}
 
             def scan():
@@ -518,22 +546,44 @@ class Alerts(Service):
                     result["value"] = scan_collections(self.collections_root)
                 except OSError as e:
                     result["value"] = {"error": f"cannot list {self.collections_root} ({e.strerror or e})"}
-            thread = threading.Thread(target=scan, daemon=True, name="alerts-scan")
-            self._scan = {"thread": thread, "result": result, "started": now}
-            thread.start()
+            self._scan_thread = threading.Thread(target=scan, daemon=True, name="alerts-scan")
+            self._scan_thread.start()
+            self._scan = {"result": result, "manager": self._manager_run()}
         scan = self._scan
-        if "value" not in scan["result"] and now - scan["started"] < SCAN_TIMEOUT_S:
-            return []           # wait for the drive, at most SCAN_TIMEOUT_S
-        collections = scan["result"].get("value") or {
+        done = scan is not None and "value" in scan["result"]
+        if done and self._scan_earlier is None and scan["manager"] != self._manager_run():
+            # A run began or ended while the drive was read: read it once more, so that the collection is
+            # judged by the manager's status of the same moment (the first answer if the second is late).
+            self._scan_earlier, self._scan = scan["result"]["value"], None
+            return []
+        if not done and now - self._scan_wanted < SCAN_TIMEOUT_S:
+            return []           # wait for the drive, at most SCAN_TIMEOUT_S from when the scan was wanted
+        collections = (scan["result"]["value"] if done else self._scan_earlier) or {
             "error": f"the data drive did not answer within {SCAN_TIMEOUT_S:g} s"}
-        facts = self._summary_facts(now, collections)
-        if not settled:
-            facts["unsettled"] = (f"Sent before the other services had settled ({L._duration(now - self._started_at)} "
-                                  f"after this service started): {'; '.join(self._unsettled_now) or 'unsteady'}. "
-                                  "\"unknown\" below means not reported yet, not a fault of the radar.")
+        try:
+            facts = self._summary_facts(now, collections)
+            if not settled:
+                facts["unsettled"] = (f"Sent before the other services had settled "
+                                      f"({L._duration(now - self._started_at)} after this service started): "
+                                      f"{'; '.join(self._unsettled_now) or 'unsteady'}. \"unknown\" below means "
+                                      "not reported yet, not a fault of the radar.")
+            alert = L.boot_summary(facts)
+        except Exception as e:
+            # The one message per boot that says the unit is alive: a short one rather than none, and
+            # rather than trying again every round.
+            self.log.exception("cannot put the boot summary together; a short one goes out")
+            boot = self.boot if self.boot is not None else "?"
+            alert = L.Alert("summary", L.DEFAULT, f"boot {boot} summary",
+                            f"Boot {boot}, up {L._duration(now)}. The rest of the summary could not be put together "
+                            f"({type(e).__name__}: {str(e)[:200]}); the alerts service's log has more.",
+                            limited=False, tags=["summary"])
         self.summary_sent = True
         self._dirty = True
-        return [(L.boot_summary(facts), None)]
+        return [(alert, None)]
+
+    def _manager_run(self):
+        man = self._reads.get("manager")
+        return (man.data.get("state"), man.data.get("collection")) if man is not None and man.ok else None
 
     def _summary_facts(self, now, collections):
         r = self._reads
@@ -543,12 +593,26 @@ class Alerts(Service):
             # No end in collection.json: being recorded, or cut off. The manager's status tells which.
             started = last.get("started_utc", "")
             started = f"started {started[11:19]} UTC" if len(started) >= 19 else "start time not known"
-            if man.ok and man.data.get("state") in ("starting", "running", "stopping") \
-                    and man.data.get("collection") == last.get("name"):
-                last["how"] = f"recording now ({started})"
+            # A run of this boot (its boot ID): how long, from the uptime stamps (the clock at its start
+            # may not have been set yet). The time of day otherwise, or when there is no uptime stamp.
+            this_boot = bool(self.boot_id) and last.get("boot_id") == self.boot_id
+
+            def ago(key):
+                up = last.get(key)
+                return now - up if this_boot and type(up) in (int, float) and 0 <= up <= now else None
+            recording, created = ago("started_uptime_s"), ago("created_uptime_s")
+            since = (f"for {L._duration(recording)}" if recording is not None else
+                     f"created {L._duration(created)} ago" if created is not None else started)
+            run = man.ok and man.data.get("state") in ("starting", "running", "stopping")
+            if run and man.data.get("collection") == last.get("name"):
+                last["how"] = f"recording now ({since})"
+            elif run and man.data.get("collection") is None and this_boot:
+                # The runner has made the directory; the manager names it once the runner's event is in.
+                last["how"] = f"no end recorded yet ({since}; a run is starting)"
             elif not man.ok:
                 last["how"] = f"no end recorded yet ({started}; the radar manager's state is not known)"
         values = L._get(tel.data, "sources", "pi", "values") if tel.ok else None
+        values = values if isinstance(values, dict) else {}
         previous = dict(self.previous) if self.previous else None
         last_shutdown = L._get(pwr.data, "guard", "last_shutdown") if pwr.data else None
         if previous is not None and isinstance(last_shutdown, dict) and last_shutdown != self.power_last_shutdown:
@@ -564,7 +628,7 @@ class Alerts(Service):
             elif isinstance(d.get("last_fault"), dict):
                 line += f" (last fault {d['last_fault'].get('kind')})"
             if d.get("not_ready"):
-                line += "; not ready: " + "; ".join(str(x) for x in d["not_ready"])
+                line += "; not ready: " + "; ".join(_texts(d["not_ready"]))
             services.append(line + ".")
         else:
             services.append(f"Radar manager: not running ({man.state}).")
@@ -574,9 +638,9 @@ class Alerts(Service):
         else:
             services.append(f"Safety watcher: NOT RUNNING ({wat.state}).")
         if tel.ok:
-            problems = tel.data.get("problems") or []
-            services.append("Telemetry: " + (tel.data.get("state") or "?")
-                            + (": " + ", ".join(map(str, problems)) if problems else "") + ".")
+            problems = _texts(tel.data.get("problems"))
+            services.append(f"Telemetry: {tel.data.get('state') or '?'}"
+                            + (": " + ", ".join(problems) if problems else "") + ".")
         else:
             services.append(f"Telemetry: NOT RUNNING ({tel.state}).")
         if pwr.ok:
@@ -588,7 +652,7 @@ class Alerts(Service):
                             + (f"; warnings: {', '.join(sorted(warnings))}" if warnings else "") + ".")
         else:
             services.append(f"Power service: NOT RUNNING ({pwr.state}).")
-        config_warnings = sum(len(x.data.get("config_warnings") or []) for x in (tel, wat, man) if x.ok)
+        config_warnings = sum(len(_texts(x.data.get("config_warnings"))) for x in (tel, wat, man) if x.ok)
         config_warnings += len(self.config_warnings)
         if config_warnings:
             services.append(f"Config warnings: {config_warnings} (setup/check.py lists them).")
@@ -596,9 +660,9 @@ class Alerts(Service):
         if self.disk.crossed:
             active.append(f"data drive below {min(self.disk.crossed):g} GB")
         return {"boot": self.boot, "uptime_s": now,
-                "clock_synced": L._get(tel.data, "clock", "synced") if tel.ok else None,
+                "clock_synced": self._clock_set(),
                 "previous": previous,
-                "disk": {"nvme_free_gb": (values or {}).get("nvme_free_gb"), "sd_free_gb": (values or {}).get("sd_free_gb")},
+                "disk": {"nvme_free_gb": values.get("nvme_free_gb"), "sd_free_gb": values.get("sd_free_gb")},
                 "collections": collections, "services": services, "active": active,
                 "queue": {"length": len(self.queue.names()), "dropped": self.queue.dropped,
                           "held": self.limiter.held_total}}
@@ -606,8 +670,10 @@ class Alerts(Service):
     # ---- queueing
 
     def _clock_set(self):
+        """Telemetry's clock.synced, or None: an odd value (a list) must not keep an alert out of the queue."""
         tel = self._reads.get("telemetry")
-        return L._get(tel.data, "clock", "synced") if tel is not None and tel.ok else None
+        synced = L._get(tel.data, "clock", "synced") if tel is not None and tel.ok else None
+        return synced if type(synced) in (int, float, bool) else None
 
     def _enqueue(self, now, alert, when):
         when = when or {}
@@ -733,11 +799,13 @@ class Alerts(Service):
     def _reap(self):
         """Sends given up on that have ended since (a DNS lookup); and files that could not be deleted."""
         now = self._uptime()
-        queued = {name for _, _, name in self.queue.names()}
-        for records in (self.held, self.rejections, self.unreadable):
-            for name in [n for n in records if n not in queued]:
-                del records[name]
-        self.unremovable &= queued
+        listing = self.queue.listing()
+        if listing is not None:     # a listing that failed (a failing card) says nothing about what is gone
+            queued = {name for _, _, name in listing}
+            for records in (self.held, self.rejections, self.unreadable):
+                for name in [n for n in records if n not in queued]:
+                    del records[name]
+            self.unremovable &= queued
         if len(self.stale) < MAX_STALE:
             self._stale_full_since = None
         elif self._stale_full_since is None:

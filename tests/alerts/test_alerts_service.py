@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from alerts_rig import BOOT_B, LAT, LON, POSITION_STRINGS, TOKEN, TOPIC, Rig
+from alerts_rig import BOOT_A, BOOT_B, LAT, LON, POSITION_STRINGS, TOKEN, TOPIC, Rig
 from fake_ntfy import FakeNtfy, closed_port
 from radar_runner.alerts import logic as L
 
@@ -403,6 +403,18 @@ def test_test_alerts_from_the_inbox_go_through_the_queue(tmp_path, server):
     assert any(r.get("test_id") == "abc123" and r["result"] == "sent" for r in status["recent"])
 
 
+def test_a_test_alert_request_with_an_odd_priority_loses_no_request(tmp_path, server):
+    rig = Rig(tmp_path, server.url)
+    rig.start()
+    inbox = rig.state_dir / "alerts-inbox"
+    (inbox / "1-1.json").write_text(json.dumps({"id": "good", "priority": "high"}))     # taken first
+    (inbox / "2-1.json").write_text(json.dumps({"id": "odd", "priority": ["urgent"]}))
+    status = rig.tick(3)
+    test = sorted((b["priority"], b["message"].split(",")[0]) for b in server.bodies() if "test alert" in b["title"])
+    assert test == [(3, "Test alert from alertctl"), (4, "Test alert from alertctl")]
+    assert "inbox" not in status["errors"] and os.listdir(inbox) == []
+
+
 def test_the_status_file_says_what_the_service_does(tmp_path, server):
     rig = Rig(tmp_path, server.url)
     rig.start()
@@ -556,6 +568,36 @@ def test_a_sent_alert_that_cannot_be_deleted_is_sent_once(tmp_path, server, monk
     monkeypatch.setattr(os, "unlink", real_unlink)          # the card is back
     status = rig.tick(70)
     assert status["sent_not_deleted"] == [] and rig.queued() == [] and len(server.bodies()) == 2
+
+
+def test_a_failed_listing_of_the_queue_does_not_forget_what_was_sent(tmp_path, server, monkeypatch):
+    rig = Rig(tmp_path, closed_port())
+    rig.start()
+    rig.tick(2)
+    rig.watcher_event(event="stuck", severity="urgent", text="AMPLIFIER STUCK ENABLED: 2.5 A")
+    rig.tick(3)
+    queue_dir = str(rig.state_dir / "alerts-queue")
+    real_unlink, real_listdir = os.unlink, os.listdir
+
+    def read_only(path, *a, **k):
+        if str(path).startswith(queue_dir):
+            raise OSError(30, "Read-only file system")
+        return real_unlink(path, *a, **k)
+    monkeypatch.setattr(os, "unlink", read_only)
+    rig.service.ntfy["server"] = server.url
+    rig.service.next_send_at = 0
+    rig.tick(20)
+    assert len(server.bodies()) == 2 and len(rig.service.unremovable) == 2
+
+    def failing(path=".", *a, **k):
+        if str(path) == queue_dir:
+            raise OSError(5, "Input/output error")
+        return real_listdir(path, *a, **k)
+    monkeypatch.setattr(os, "listdir", failing)         # the failing card: one listing fails
+    rig.tick()
+    monkeypatch.setattr(os, "listdir", real_listdir)
+    status = rig.tick(20)
+    assert len(server.bodies()) == 2 and len(status["sent_not_deleted"]) == 2
 
 
 def test_an_inbox_request_that_cannot_be_deleted_is_not_sent_again_and_again(tmp_path, server, monkeypatch):
@@ -742,22 +784,118 @@ def test_sends_stuck_in_dns_lookups_for_ten_minutes_make_the_service_exit_for_a_
     assert any(n.startswith("p4-") for n in rig.queued())      # the alert waits on disk for the next process
 
 
+@pytest.mark.parametrize("exit_for", ["dns", "failed rounds"])
+def test_an_exit_that_asks_for_a_restart_is_not_a_clean_stop(tmp_path, server, exit_for):
+    # A power cut in the restart gap must not be reported as a clean stop at the next boot.
+    rig = Rig(tmp_path, server.url, loop_interval_s=0.1)
+    svc = rig.start()
+    rig.tick(3)
+    if exit_for == "dns":
+        import threading
+        from radar_runner.alerts import service as alerts_service
+
+        class Stuck:                            # sends whose DNS lookup never returns
+            done = threading.Event()
+            result = None
+
+            def cancel(self):
+                pass
+        svc.stale = [{"send": Stuck(), "name": f"p3-00000000000{i}.json", "item": {}, "since": 0.0} for i in range(2)]
+        rig.tick(int(alerts_service.STALE_EXIT_S) + 5)
+        assert svc._stop.is_set() and svc.exit_status == 1      # _reap asks for the exit
+        rig.stop()
+    else:
+        def broken(now):
+            raise RuntimeError("broken")
+        svc._settle = broken                    # every round fails
+        assert svc.run() == 1
+        rig.service = None
+    assert rig.state()["clean_stop"] is False
+    rig.reboot()
+    rig.tick(3)
+    assert "ended without a clean stop" in summaries(server)[-1]["message"]
+
+
+@pytest.mark.parametrize("synced", [[], {}])
+def test_an_odd_clock_field_keeps_no_alert_out_of_the_queue(tmp_path, server, synced):
+    rig = Rig(tmp_path, server.url)
+    rig.telemetry["clock"]["synced"] = synced
+    rig.start()
+    rig.watcher_event(event="stuck", severity="urgent", text="AMPLIFIER STUCK ENABLED: 2.5 A")
+    status = rig.tick(3)
+    assert sorted(titles(server)) == ["test-unit: AMPLIFIER STUCK ENABLED", "test-unit: boot 42 summary"]
+    assert "queue" not in status["errors"] and "clock state unknown" in summaries(server)[0]["message"]
+
+
+def test_odd_fields_in_the_other_services_status_do_not_keep_the_summary_from_going_out(tmp_path, server):
+    rig = Rig(tmp_path, server.url)
+    rig.telemetry.update(state={"x": 1}, problems=7, config_warnings=3)
+    rig.telemetry["sources"]["pi"]["values"] = [900.0]
+    rig.manager = {"state": "not_ready", "not_ready": 5, "fault": None, "config_warnings": "one"}
+    rig.watcher["config_warnings"] = ["a", "b"]
+    rig.start()
+    status = rig.tick(3)
+    [s] = summaries(server)
+    assert status["errors"] == {} and "not ready: 5" in s["message"] and "Telemetry: {'x': 1}: 7." in s["message"]
+    assert "Config warnings: 4" in s["message"]
+
+
+@pytest.mark.parametrize("change, title", [
+    (lambda t: t["sources"]["pi"].update(values=[900.0]), "GPS: no data from the receiver"),
+    (lambda t: t["sources"].update(pi=["ok"]), "GPS: no data from the receiver"),
+    (lambda t: t.update(logging="primary"), "GPS: no data from the receiver"),
+    (lambda t: t["sources"]["gps"].update(no_position=["x"]), "GPS: no data from the receiver"),
+    (lambda t: t["sources"]["gps"].update(health={"a": 1}), "GPS: no fix"),
+])
+def test_odd_parts_of_the_telemetry_status_do_not_stop_the_conditions(tmp_path, server, change, title):
+    rig = Rig(tmp_path, server.url, **{"conditions.gps_s": 5.0})
+    rig.telemetry["sources"]["gps"].update(health="stale", reason="no data")
+    change(rig.telemetry)
+    rig.start()
+    status = rig.tick(10)
+    assert "conditions" not in status["errors"] and f"test-unit: {title}" in titles(server)
+
+
+def test_a_summary_that_cannot_be_put_together_still_goes_out_once(tmp_path, server, monkeypatch):
+    def broken(facts):
+        raise ValueError("odd facts")
+    monkeypatch.setattr(L, "boot_summary", broken)
+    rig = Rig(tmp_path, server.url)
+    rig.start()
+    status = rig.tick(5)
+    [s] = summaries(server)
+    assert s["title"] == "test-unit: boot 42 summary" and "could not be put together (ValueError: odd facts)" in s["message"]
+    assert status["summary_sent"] is True
+
+
 # ---- the boot summary in real boots
 
 def summaries(server):
     return [b for b in server.bodies() if "summary" in b["title"]]
 
 
-def test_a_collection_being_recorded_is_not_called_cut_off(tmp_path, server):
+@pytest.mark.parametrize("meta, wording", [
+    # The clock at the start of the run may not have been set yet: the uptime stamps tell how long.
+    ({"boot_id": BOOT_A, "created": {"time_utc": "1970-01-01T00:01:10Z", "uptime_s": 860.0},
+      "recording_started": {"time_utc": "1970-01-01T00:01:12Z", "uptime_s": 870.0}}, "recording now (for 2 min)"),
+    ({"boot_id": BOOT_A, "created": {"time_utc": "1970-01-01T00:01:10Z", "uptime_s": 870.0}},
+     "recording now (created 2 min ago)"),
+    ({"boot_id": BOOT_A, "created": {"time_utc": "2026-11-20T05:46:29Z"}}, "recording now (started 05:46:29 UTC)"),
+    # Uptime stamps of another boot, or of a boot not known, say nothing about this one.
+    ({"boot_id": BOOT_B, "created": {"time_utc": "2026-11-20T05:46:29Z", "uptime_s": 870.0}},
+     "recording now (started 05:46:29 UTC)"),
+    ({"created": {"time_utc": "2026-11-20T05:46:29Z", "uptime_s": 870.0}}, "recording now (started 05:46:29 UTC)"),
+])
+def test_a_collection_being_recorded_is_not_called_cut_off(tmp_path, server, meta, wording):
     rig = Rig(tmp_path, server.url)
     col = rig.collections / "b00042_s001_20261120T054629Z"
     col.mkdir()
-    (col / "collection.json").write_text(json.dumps({"created": {"time_utc": "2026-11-20T05:46:29Z"}, "end": None}))
-    rig.manager = {"state": "starting", "not_ready": [], "collection": "b00042_s001_20261120T054629Z"}
+    (col / "collection.json").write_text(json.dumps(dict(meta, end=None)))
+    rig.manager = {"state": "running", "not_ready": [], "collection": "b00042_s001_20261120T054629Z"}
     rig.start()
     rig.tick(3)
     [s] = summaries(server)
-    assert "b00042_s001_20261120T054629Z, recording now (started 05:46:29 UTC)" in s["message"]
+    assert f"b00042_s001_20261120T054629Z, {wording}" in s["message"]
     assert "cut off" not in s["message"]
 
 
@@ -772,6 +910,25 @@ def test_an_open_collection_when_no_run_is_under_way(tmp_path, server, manager, 
     (col / "collection.json").write_text(json.dumps({"recording_started": {"time_utc": "2026-11-20T05:46:29Z"},
                                                      "end": None}))
     rig.manager = manager
+    rig.start()
+    rig.tick(3)
+    assert wording in summaries(server)[0]["message"]
+
+
+@pytest.mark.parametrize("boot_id, wording", [
+    (BOOT_A, "no end recorded yet (created 2 min ago; a run is starting)"),
+    (BOOT_B, "cut off (no end recorded: power cut or crash)"),          # from a boot before
+    (None, "cut off (no end recorded: power cut or crash)"),            # not known to be from this boot
+])
+def test_a_collection_just_created_by_a_run_that_is_starting_is_not_called_cut_off(tmp_path, server, boot_id, wording):
+    # The runner has made the directory; the manager names it only once the runner's event has come.
+    rig = Rig(tmp_path, server.url)
+    rig.telemetry.pop("boot_count")                 # the boot number not known: only the boot ID tells
+    col = rig.collections / "b00042_s001_20261120T054629Z"
+    col.mkdir()
+    (col / "collection.json").write_text(json.dumps({"boot_id": boot_id, "end": None,
+                                                     "created": {"time_utc": "2026-11-20T05:46:29Z", "uptime_s": 870.0}}))
+    rig.manager = {"state": "starting", "not_ready": [], "collection": None}
     rig.start()
     rig.tick(3)
     assert wording in summaries(server)[0]["message"]
@@ -809,6 +966,114 @@ def test_a_summary_that_cannot_wait_any_longer_says_what_was_missing(tmp_path, s
     first = s["message"].split("\n")[0]
     assert first.startswith("Sent before the other services had settled (10 min after this service started)")
     assert "telemetry status" in first and "not a fault of the radar" in first
+
+
+def test_a_scan_from_before_a_break_in_the_settle_is_not_used(tmp_path, server, monkeypatch):
+    import threading
+    import time
+    from radar_runner.alerts import service as alerts_service
+    rig = Rig(tmp_path, server.url)
+    name = "b00042_s001_20261120T054629Z"
+    col = rig.collections / name
+    col.mkdir()
+    (col / "collection.json").write_text(json.dumps({"recording_started": {"uptime_s": 900.0}, "end": None}))
+    rig.manager = {"state": "running", "not_ready": [], "collection": name}
+    gate, real_scan = threading.Event(), alerts_service.scan_collections
+
+    def slow_scan(root):
+        found = real_scan(root)
+        gate.wait(10)
+        return found
+    monkeypatch.setattr(alerts_service, "scan_collections", slow_scan)
+    rig.start()
+    rig.tick()                                  # settled: the scan starts, and sees the run open
+    rig.watcher["running"] = False              # the watcher restarts before the scan is used
+    rig.tick()
+    (col / "collection.json").write_text(json.dumps({"recording_started": {"uptime_s": 900.0},
+                                                     "end": {"uptime_s": 1003.0, "how": "stopped"}}))
+    rig.manager = {"state": "ready", "not_ready": [], "collection": None}
+    gate.set()
+    time.sleep(0.5)                             # the old scan has ended
+    rig.watcher["running"] = True
+    rig.tick(3)
+    [s] = summaries(server)
+    assert f"{name}, stopped" in s["message"] and "cut off" not in s["message"]
+
+
+def test_a_slow_scan_still_running_when_the_status_settles_again_is_followed_by_a_fresh_one(
+        tmp_path, server, monkeypatch):
+    import threading
+    import time
+    from radar_runner.alerts import service as alerts_service
+    rig = Rig(tmp_path, server.url)
+    (rig.collections / "b00042_s001_20261120T054629Z").mkdir()
+    gate, real_scan = threading.Event(), alerts_service.scan_collections
+
+    def slow_scan(root):
+        gate.wait(10)
+        return real_scan(root)
+    monkeypatch.setattr(alerts_service, "scan_collections", slow_scan)
+    rig.start()
+    rig.tick()                                  # the scan starts; the drive is slow
+    rig.watcher["running"] = False
+    rig.tick()                                  # dropped
+    rig.watcher["running"] = True
+    rig.tick(3)                                 # wanted again: the old scan still runs
+    gate.set()
+    time.sleep(0.5)
+    rig.tick(3)
+    [s] = summaries(server)
+    assert "b00042_s001_20261120T054629Z" in s["message"] and "did not answer" not in s["message"]
+
+
+def test_a_run_that_ends_while_the_drive_is_read_is_not_called_cut_off(tmp_path, server, monkeypatch):
+    import threading
+    import time
+    from radar_runner.alerts import service as alerts_service
+    rig = Rig(tmp_path, server.url)
+    name = "b00042_s001_20261120T054629Z"
+    col = rig.collections / name
+    col.mkdir()
+    (col / "collection.json").write_text(json.dumps({"recording_started": {"uptime_s": 900.0}, "end": None}))
+    rig.manager = {"state": "running", "not_ready": [], "collection": name}
+    gate, real_scan = threading.Event(), alerts_service.scan_collections
+
+    def slow_scan(root):
+        found = real_scan(root)
+        gate.wait(10)
+        return found
+    monkeypatch.setattr(alerts_service, "scan_collections", slow_scan)
+    rig.start()
+    rig.tick()                                  # the scan sees the run open
+    (col / "collection.json").write_text(json.dumps({"recording_started": {"uptime_s": 900.0},
+                                                     "end": {"uptime_s": 1003.0, "how": "stopped"}}))
+    rig.manager = {"state": "ready", "not_ready": [], "collection": None}
+    rig.tick()                                  # the run has ended meanwhile
+    gate.set()
+    time.sleep(0.5)
+    rig.tick(3)
+    [s] = summaries(server)
+    assert f"{name}, stopped" in s["message"] and "cut off" not in s["message"]
+
+
+def test_scans_of_a_drive_that_hangs_do_not_pile_up_while_the_status_flaps(tmp_path, server, monkeypatch):
+    import threading
+    from radar_runner.alerts import service as alerts_service
+    hang = threading.Event()
+    monkeypatch.setattr(alerts_service, "scan_collections", lambda root: hang.wait(30))
+    rig = Rig(tmp_path, server.url)
+    rig.start()
+    for _ in range(5):
+        rig.tick()
+        rig.watcher["running"] = False
+        rig.tick()
+        rig.watcher["running"] = True
+    scans = [t for t in threading.enumerate() if t.name == "alerts-scan" and t.is_alive()]
+    rig.tick(12)
+    hang.set()
+    assert len(scans) == 1
+    [s] = summaries(server)
+    assert "did not answer" in s["message"]
 
 
 def test_a_normal_boot_still_sends_the_summary_at_three_minutes(tmp_path, server):
