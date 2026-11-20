@@ -514,6 +514,8 @@ Done when:
 * The fault table rows for a missing SDR, missing NVMe, lost telemetry, stale watcher and full disk behave as written
 * A 2 h run with all services active stays within the HIL late-command baseline
 
+Tested on the bench, 2026-11-20 (final configuration, tx_gain 70): the manager's first-start list in `radar_runner/manager/README.md` is complete: start and stop by command and by the button; a stop during set-up; the radar killed and restarted; a data file closed at 1,500 records and the next one continued without loss; telemetry stopped while recording (radar stopped in the same second, run resumed by itself 10 s after telemetry returned); the manager service stopped while recording (radar gone within a second). The power service's two hooks are installed and the manager is enabled at boot. One power cut with the radar transmitting: loss detected 0.36 s after the cut, radar stopped at 0.72 s, power-off command at 9.0 s, journal closed at 12.6 s, collection intact (the last two records hold no loopback: the amplifier loses its 28 V at the cut while the SDR runs on from the Pi), and after power-up the manager came up ready by itself with nothing transmitting and no amplifier enable. Still to do against the list above: the counts (50 cycles, 20 power cuts with the radar running), the missing-SDR, missing-NVMe and full-disk rows, and the 2 h run.
+
 ## Stage 5: Alerts
 
 Builds: posts to ntfy with a queue on disk, alerts for every fault table row that calls for one, and the boot summary.

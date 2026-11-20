@@ -69,6 +69,9 @@ Empower 1094 amplifier and control board:
 * Output at this setting, peak chirp power at the amplifier output (power detector, +/-1 dB): tx_gain 60 = +29.4 dBm, 66 = +35.6 dBm, 70 = +39.6 dBm (about 9-10 W). tx_gain 70 is the cap (`manager.limits.max_tx_gain` in `/etc/radar-runner/local.yaml`); 72 would give about 14 W
 * Power reference: the ZX47-40-S+ detector is about 46.6 dB below the amplifier output (40 dB attenuator and two splitters, nominal); datasheet in `hardware_reference/datasheets/`
 * 12 V input at tx_gain 70 (scope, 110 s continuous record, 2026-11-20; raw clamp readings, the clamp's zero offset of about 0.18 A not subtracted): idle 1.76 A / 24.1 W; transmitting 2.18 A / 29.7 W, essentially constant (no per-pulse current reaches the input); peaks 2.51 A / 34.2 W instantaneous, 2.41 A / 32.8 W over 2 ms, 2.21 A / 30.1 W over 1 s; bus 13.64 V transmitting, minimum 13.42 V
+* 12 V input at power-up (scope, 2026-11-20): inrush peak 73 A (+/-11 A), above 50 A for 100 us and above 10 A for 230 us, 10.9 mC (input capacitance of roughly 790 uF ahead of the power board's switch, charged straight from the supply); then a soft-start of about 5 ms at 0.3-1.3 A and a boot peak of 3.2 A (10 ms mean); about 3.0 J in the first 100 ms. No amplifier enable at power-up: the control board's pull-up holds the shutdown input while the SDR's pin is undriven
+* For about the first 10 minutes after a power-up from a long off period the UPS recharges its supercapacitor: first in bursts (50-160 Hz fluctuation on the 12 V input, peaks up to 3.06 A / 41.5 W while transmitting), then steadily at about +0.31 A (4 W)
+* When the 12 V supply is cut, the amplifier (28 V from the 12 V) loses power at once, while the Pi (UPS) and the SDR (USB from the Pi) run on for about 12 s; the manager stops the radar 0.7 s after the cut
 * See `hardware_reference/empower_1094/`
 
 Pi GPIO connections:
