@@ -574,6 +574,24 @@ def test_an_inbox_request_that_cannot_be_deleted_is_not_sent_again_and_again(tmp
     status = rig.tick(20)
     assert [b for b in server.bodies() if "test alert" in b["title"]] == []
     assert "Permission denied" in status["inbox"]["problem"]
+    monkeypatch.setattr(os, "unlink", real_unlink)          # the directory is put right
+    status = rig.tick(3)
+    assert len([b for b in server.bodies() if "test alert" in b["title"]]) == 1
+    assert status["inbox"]["problem"] == "" and os.listdir(inbox) == []
+
+
+def test_records_of_queue_files_that_are_gone_are_pruned_and_inbox_leftovers_removed(tmp_path, server):
+    rig = Rig(tmp_path, server.url)
+    (rig.state_dir / "alerts-inbox").mkdir(parents=True)
+    (rig.state_dir / "alerts-inbox" / ".123-4.json.tmp").write_text("{")     # an alertctl killed half way
+    svc = rig.start()
+    assert not (rig.state_dir / "alerts-inbox" / ".123-4.json.tmp").exists()
+    svc.held["p3-000000000099.json"] = 1e12
+    svc.rejections["p3-000000000099.json"] = {"count": 1, "accepts": 0, "at": 0.0}
+    svc.unreadable["p3-000000000099.json"] = 1e12
+    svc.unremovable.add("p3-000000000099.json")
+    rig.tick(2)
+    assert not (svc.held or svc.rejections or svc.unreadable or svc.unremovable)
 
 
 def test_an_unreadable_queue_file_does_not_hold_up_the_others(tmp_path, server, monkeypatch):

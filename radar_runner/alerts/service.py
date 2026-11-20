@@ -257,6 +257,9 @@ class Alerts(Service):
             pass
         try:
             os.makedirs(self.inbox_dir, mode=0o755, exist_ok=True)
+            for name in os.listdir(self.inbox_dir):
+                if name.startswith(".") and name.endswith(".tmp"):      # an alertctl killed half way
+                    os.unlink(os.path.join(self.inbox_dir, name))
         except OSError as e:
             self.errors["inbox"] = f"{e.strerror or e}"
         st = self._load_state()
@@ -390,7 +393,10 @@ class Alerts(Service):
             names = sorted(n for n in os.listdir(self.inbox_dir) if n.endswith(".json") and not n.startswith("."))
         except FileNotFoundError:
             return out
-        for name in [n for n in names if n not in self.inbox_stuck][:INBOX_PER_ROUND]:
+        self.inbox_stuck &= set(names)
+        if not self.inbox_stuck:
+            self.inbox_problem = ""
+        for name in names[:INBOX_PER_ROUND]:
             path = os.path.join(self.inbox_dir, name)
             try:
                 with open(path, "rb") as f:
@@ -403,11 +409,13 @@ class Alerts(Service):
                 pass
             except OSError as e:
                 # Queued only once taken out of the inbox: one that cannot be deleted (a directory made
-                # by root) would otherwise be queued again every round.
+                # by root) would otherwise be queued again every round. Tried again every round.
+                if name not in self.inbox_stuck:
+                    self.inbox_problem = f"cannot delete {path}: {e.strerror or e}; the request waits"
+                    self.log.error("%s", self.inbox_problem)
                 self.inbox_stuck.add(name)
-                self.inbox_problem = f"cannot delete {path}: {e.strerror or e}; the request is not sent"
-                self.log.error("%s", self.inbox_problem)
                 continue
+            self.inbox_stuck.discard(name)
             if not isinstance(request, dict):
                 continue
             self.counters["inbox"] += 1
@@ -680,6 +688,11 @@ class Alerts(Service):
     def _reap(self):
         """Sends given up on that have ended since (a DNS lookup); and files that could not be deleted."""
         now = self._uptime()
+        queued = {name for _, _, name in self.queue.names()}
+        for records in (self.held, self.rejections, self.unreadable):
+            for name in [n for n in records if n not in queued]:
+                del records[name]
+        self.unremovable &= queued
         if len(self.stale) < MAX_STALE:
             self._stale_full_since = None
         elif self._stale_full_since is None:

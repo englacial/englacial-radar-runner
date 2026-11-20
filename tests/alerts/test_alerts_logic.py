@@ -395,3 +395,10 @@ def test_urgent_alerts_do_not_count_towards_the_hourly_limit_of_the_others():
         assert lim.admit(1.0, alert(key=f"u{i}", priority=L.URGENT))
     assert all(lim.admit(2.0, alert(key=f"d{i}", priority=L.DEFAULT)) for i in range(3))
     assert not lim.admit(3.0, alert(key="d9", priority=L.DEFAULT))
+
+
+def test_a_telemetry_status_without_a_gps_source_says_so():
+    d = telemetry()
+    del d["sources"]["gps"]
+    s = L.condition_states(reads(telemetry=ok(d)), COND)["gps"]
+    assert s.active and s.title == "GPS: telemetry has no GPS source" and "None" not in s.text

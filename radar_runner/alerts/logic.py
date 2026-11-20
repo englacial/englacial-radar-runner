@@ -298,12 +298,17 @@ def condition_states(reads, cfg, tracked=()):
 
     if tel is not None and tel.ok:
         d = tel.data
-        gps = _get(d, "sources", "gps") or {}
-        problem = gps.get("health") != "ok" or bool(gps.get("reason"))
-        out["gps"] = State(problem, DEFAULT, GPS_TITLES.get(gps.get("no_position"))
-                           or GPS_TITLES.get(gps.get("health")) or "GPS: no fix",
-                           f"GPS {gps.get('health')}: {gps.get('reason') or 'no fix'}. The radar still runs; "
-                           "its data lacks positions.", cfg["gps_s"])
+        gps = _get(d, "sources", "gps")
+        if not isinstance(gps, dict):
+            out["gps"] = State(True, DEFAULT, "GPS: telemetry has no GPS source",
+                               "The telemetry status has no GPS source at all (its version or settings?). "
+                               "The radar still runs; its data lacks positions.", cfg["gps_s"])
+        else:
+            problem = gps.get("health") != "ok" or bool(gps.get("reason"))
+            out["gps"] = State(problem, DEFAULT, GPS_TITLES.get(gps.get("no_position"))
+                               or GPS_TITLES.get(gps.get("health")) or "GPS: no fix",
+                               f"GPS {gps.get('health')}: {gps.get('reason') or 'no fix'}. The radar still runs; "
+                               "its data lacks positions.", cfg["gps_s"])
         logs = d.get("logging") or {}
         bad = logs.get("location") != "primary" or logs.get("writer", "running") != "running"
         out["logging"] = State(bad, DEFAULT, "sensor logs not on the data drive",
