@@ -49,7 +49,8 @@ int main(int argc, char* argv[]) {
         std::printf("PPS SEEN: %d edges in %d s; spacing differs from 1 s by at most %.1f us "
                     "(against the SDR's internal clock)\n", edges, seconds, worst * 1e6);
         std::printf("time set at a PPS edge: last edge now reads %.9f s (1000 or 1001 expected)\n", set);
-        return (set == 1000.0 || set == 1001.0) ? 0 : 2;
+        // The reading is quantised to the SDR's clock, so it can differ from the whole second by under a microsecond.
+        return (std::fabs(set - 1000.0) < 1e-6 || std::fabs(set - 1001.0) < 1e-6) ? 0 : 2;
     } catch (const std::exception& e) {
         std::printf("ERROR: %s\n", e.what());
         return 2;

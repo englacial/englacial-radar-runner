@@ -6,13 +6,14 @@ Lines beginning with "#" should be ignored. They are "commented-out" old configu
 
 SDR:
 * rPi USB 3 -> CoolGear CG-30ACTSSL-05M with copper braid -> B206mini (SDR). Pi enclosure wrapped in copper foil (2026-11-17). On USB 3 the GPS keeps a fix with ~10 dB more L1 noise; see `~/radar-testbench/gps_jam/README.md`
-* SDR TX -> short cable -> Empower 1094 PA (28 V on; VVA/J8 at 3.452 V from a fixed divider since 2026-11-20, see "Empower 1094 amplifier and control board") -> short cable -> 40 dB attenuator (100 W) -> Z99SC-62-S+ splitter A
+* SDR TX -> short cable -> Empower 1094 PA (28 V on; VVA/J8 at 3.452 V from a fixed divider since 2026-11-20, see "Empower 1094 amplifier and control board") -> short cable -> 20 dB attenuator (20 W) -> 30 dB attenuator (5W) -> Z99SC-62-S+ splitter A
   * Splitter A output 1 -> Splitter B input (Z99SC-62-S+)
-  * Splitter output 2 -> 30 dB attenuator (1 W) -> 50 m loopback cable -> short cable -> VLFX-450+ low-pass filter -> ZFLM-252-1WL-S+ limiter -> ZX60-P103LN+ LNA (powered) -> ZFLM-252-1WL-S+ limiter -> 10 dB attenuator -> SDR RX
+  * Splitter output 2 -> 30 dB attenuator (1 W) -> 30 ft loopback cable (cheap amazon, not characterized, not the LMR-100) -> short cable -> VLFX-450+ low-pass filter -> ZFLM-252-1WL-S+ limiter -> ZX60-P103LN+ LNA (powered) -> ZFLM-252-1WL-S+ limiter -> 10 dB attenuator -> SDR RX
 * Splitter B:
   * Splitter B output 1 -> Logic MSO Blue via 50 ohm pass-through terminator
   * Splitter B output 2 -> ZX47-40-S+ power detector (powered) -> Logic MSO Red (direct, no 50 ohm terminator)
 * The scope (run by a peer Claude session, `configure-scope-gpio-capture`) also measures the current and voltage into the system
+* PPS output from ZED-F9P at 3.3V logic goes into REF input on SDR
 * All devices, including the Pi, run from one 12 V supply (the PA's 28 V comes from it through a regulator). Emergency shutdown = power off the whole system
 * Datasheets for the front-end parts and the 1094 are in `hardware_reference/datasheets/`
 * HIL fixture for this chain: `~/radar-testbench/fixtures/loopback_50m_pa_rx_frontend.yaml` (not yet updated: it still describes the amplifier gain at VVA 5 V, about 24 dB, and the 30 dB attenuator ahead of splitter A)
