@@ -607,6 +607,8 @@ class FakeSystem:
             return 0, "\n".join(f"{d}: []: ({self.image})" for d in self.attached)
         if argv[0] == "losetup" and "--find" in argv:
             self.attached.append("/dev/loop9")
+            if self.trouble == "operator_loop":             # someone else's losetup in another terminal
+                self.attached.append("/dev/loop5")
             if self.trouble == "interrupt_in_losetup":      # attached, but --show never returned
                 raise KeyboardInterrupt
             return 0, "/dev/loop9"
@@ -661,6 +663,7 @@ def fake_system(shm, monkeypatch):
         monkeypatch.setattr(nui, "run_cmd", fake.run_cmd)
         monkeypatch.setattr(nui.subprocess, "run", fake.run)
         monkeypatch.setattr(nui.time, "sleep", lambda s: None)
+        monkeypatch.setattr(nui.os, "sync", lambda: fake.calls.append(["os.sync"]))
         monkeypatch.setattr(nui, "probe", lambda dev: {"TYPE": "vfat", "LABEL": "system-boot"}
                             if dev.endswith("p1") else {"TYPE": "ext4", "LABEL": "writable"})
         monkeypatch.setattr(nui, "run_tree", fake_core)
@@ -765,7 +768,7 @@ def test_broken_pipe_in_the_wrapper_still_cleans_up(fake_system, monkeypatch, ca
     assert nui.main(["image", image, "--hostname", NEW]) == 4
     assert fake.mounted == set() and fake.attached == []
     err = capsys.readouterr().err
-    assert "partly changed" in err and "image unmounted and detached" in err
+    assert "nothing in the image was changed" in err and "image unmounted and detached" in err   # core faked
 
 
 @pytest.mark.parametrize("name, text", [
@@ -897,3 +900,87 @@ def test_procedure_document():
         if words == f"do not remove or expire {OLD}":
             words = "do not remove or expire `englacial-radar-1`"
         assert words.lower() in doc.lower(), words
+
+
+# ------------------------------------------------------------------ third review round
+
+def test_sdr_record_that_is_not_a_file_stops_before_any_change(unit, capsys):
+    root, boot = unit
+    path = os.path.join(root, "var/lib/radar-runner/user/sdr-state")
+    os.unlink(path)
+    os.mkfifo(path)
+    before = snapshot(root, boot)
+    assert run(root, boot) == 2
+    assert "sdr-state" in capsys.readouterr().err
+    assert snapshot(root, boot) == before
+
+
+def test_stop_during_the_changes_says_partly_changed(unit, monkeypatch, capsys):
+    root, boot = unit
+    real = nui.Tree.write
+
+    def write_or_stop(self, inside, *a, **k):
+        if inside == "/etc/fstab":
+            raise nui.Stop("/etc/fstab: exists and is not a regular file; not replaced")
+        return real(self, inside, *a, **k)
+    monkeypatch.setattr(nui.Tree, "write", write_or_stop)
+    assert run(root, boot) == 5
+    err = capsys.readouterr().err
+    assert "partly changed" in err and "fresh copy" in err
+
+
+def test_any_other_error_during_the_changes_ends_cleanly(unit, monkeypatch, capsys):
+    root, boot = unit
+    monkeypatch.setattr(nui.Tree, "remove", lambda self, inside: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert run(root, boot) == 1
+    err = capsys.readouterr().err
+    assert "RuntimeError" in err and "partly changed" in err
+
+
+def test_any_other_error_before_the_changes_says_nothing_changed(unit, monkeypatch, capsys):
+    root, boot = unit
+    monkeypatch.setattr(nui.Unit, "plan_fstab", lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
+    before = snapshot(root, boot)
+    assert run(root, boot) == 1
+    err = capsys.readouterr().err
+    assert "RuntimeError" in err and "nothing" in err and "partly" not in err
+    assert snapshot(root, boot) == before
+
+
+def test_broken_pipe_in_a_dry_run_says_nothing_changed(unit, monkeypatch, capsys):
+    root, boot = unit
+    monkeypatch.setattr(sys, "stdout", BrokenAfter(5))
+    assert run(root, boot, "--dry-run") == 4
+    err = capsys.readouterr().err
+    assert "nothing" in err and "partly" not in err
+
+
+def test_broken_pipe_in_the_final_report_says_the_run_completed(unit, monkeypatch, capsys):
+    root, boot = unit
+    real = nui.Unit.report
+
+    def report(self):
+        sys.stdout = BrokenAfter(0)
+        return real(self)
+    monkeypatch.setattr(nui.Unit, "report", report)
+    monkeypatch.setattr(sys, "stdout", sys.stdout)       # restored after the test
+    assert run(root, boot) == 4
+    err = capsys.readouterr().err
+    assert "done" in err and "partly" not in err
+    assert json.loads(read(root, nui.MARKER))["state"] == "done"
+
+
+def test_absolute_dbus_link_of_the_real_unit_resolves_inside_the_image(shm, capsys):
+    """The real unit has /var/lib/dbus/machine-id -> /etc/machine-id. Checked by resolving the path
+    and by a dry run (which writes nothing), so that no fault could reach a real /etc/machine-id."""
+    root, boot = make_unit(os.path.join(shm, "unit"))
+    link = os.path.join(root, "var/lib/dbus/machine-id")
+    os.unlink(link)
+    os.symlink("/etc/machine-id", link)
+    tree = nui.Tree(root, "root")
+    assert tree.path("/var/lib/dbus/machine-id", follow_last=True) == os.path.join(os.path.realpath(root),
+                                                                                   "etc/machine-id")
+    assert run(root, boot, "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "/var/lib/dbus/machine-id is a link to /etc/machine-id" in out
+    assert "would: /var/lib/dbus/machine-id" not in out

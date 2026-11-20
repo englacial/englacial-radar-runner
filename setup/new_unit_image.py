@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 
 TOOL = "setup/new_unit_image.py"
@@ -81,6 +82,24 @@ ETC_FILES = {"local.yaml", "radar.yaml", "power.toml", "secrets.yaml", "power-di
 
 class Stop(Exception):
     """An unexpected state or a refusal: nothing more is done."""
+
+
+class PartlyChanged(Stop):
+    """A stop after the changes to the image had begun."""
+
+
+# How far the run got, for the message when it ends early: "plan" (nothing written yet),
+# "dry" (a dry run: nothing is ever written), "apply" (changes being made), "done".
+PROGRESS = {"phase": "plan"}
+
+
+def what_was_changed():
+    phase = PROGRESS["phase"]
+    if phase == "apply":
+        return "the image may be partly changed; start again from a fresh copy"
+    if phase == "done":
+        return f"all the changes were made ({MARKER} says done); only the rest of the report was lost"
+    return "nothing in the image was changed"
 
 
 def now_utc():
@@ -779,8 +798,8 @@ class Unit:
             if n:
                 self.plan.add(f"{path}: its {n} entries removed ({why})", lambda: r.empty(path), r, path)
         elif what == UNKNOWN_RECORD:
-            if is_dir:
-                raise Stop(f"{path} is a directory")
+            if not stat.S_ISREG(st.st_mode):
+                raise Stop(f"{path} is not a regular file")
             body = (f"unknown\nwritten {now_utc()} by {TOOL} for a new unit: nothing is known about "
                     "this unit's SDR yet\n").encode()
             self.plan.add(f"{path}: `unknown` ({why})", lambda: r.write(path, body, 0o644), r, path)
@@ -943,9 +962,9 @@ class Unit:
             for text, fn in self.plan.changes:
                 try:
                     fn()
-                except (OSError, subprocess.CalledProcessError) as e:
-                    raise Stop(f"while making the change '{text}': {e}. The image is partly changed: "
-                               "start again from a fresh copy")
+                except (Stop, OSError, subprocess.CalledProcessError) as e:
+                    raise PartlyChanged(f"while making the change '{text}': {e}. The image is partly "
+                                        "changed: start again from a fresh copy")
                 print(f"done: {text}", flush=True)
         finally:
             if self.keygen_dir:
@@ -954,15 +973,18 @@ class Unit:
         r.write(MARKER, (json.dumps(marker, indent=1) + "\n").encode(), 0o644, 0, 0)
 
     def run(self):
-        self.make_plan()
         dry = self.args.dry_run
+        PROGRESS["phase"] = "dry" if dry else "plan"
+        self.make_plan()
         print(f"\n== {'Changes this run would make (dry run: nothing is written)' if dry else 'Changes'} ==")
         if dry:
             for text, _ in self.plan.changes:
                 print(f"would: {text}")
             print(f"would: {MARKER}: the record that this tool has run")
         else:
+            PROGRESS["phase"] = "apply"
             self.apply()
+            PROGRESS["phase"] = "done"
         self.report()
 
     def report(self):
@@ -1252,11 +1274,9 @@ def parse(argv):
     return args
 
 
-PARTLY = "the image may be partly changed; start again from a fresh copy"
-
-
 def main(argv=None):
     args = parse(sys.argv[1:] if argv is None else argv)
+    PROGRESS["phase"] = "plan"
     try:
         sys.stdout.reconfigure(line_buffering=True)     # each line reaches | tee as it is printed
     except (AttributeError, ValueError):
@@ -1273,22 +1293,29 @@ def main(argv=None):
         if isinstance(cause, Stop):
             say(f"STOPPED: {cause}")
         elif cause is not None:
-            say(f"INTERRUPTED ({type(cause).__name__}): {PARTLY}")
+            say(f"ENDED EARLY ({type(cause).__name__}): {what_was_changed()}")
         say(f"FAILED: the clean-up is incomplete ({e})")
         return 3
+    except PartlyChanged as e:
+        say(f"\nSTOPPED: {e}")
+        return 5
     except Stop as e:
         say(f"\nSTOPPED: {e}")
         return 2
     except KeyboardInterrupt:
-        say(f"\nINTERRUPTED: {PARTLY}")
+        say(f"\nINTERRUPTED: {what_was_changed()}")
         return 130
     except BrokenPipeError:
         try:        # nothing more can go to stdout; keep Python's own exit flush from failing too
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         except OSError:
             pass
-        say(f"\nOUTPUT LOST (broken pipe): {PARTLY}")
+        say(f"\nOUTPUT LOST (broken pipe): {what_was_changed()}")
         return 4
+    except Exception as e:      # a fault of this tool: say what it means for the image, then the details
+        say(f"\nFAILED ({type(e).__name__}: {e}): {what_was_changed()}")
+        say("details:\n" + "".join(traceback.format_exception(type(e), e, e.__traceback__)))
+        return 1
     return 0
 
 
