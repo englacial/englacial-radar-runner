@@ -186,7 +186,7 @@ sent, unless its whole answer had come before.
 | 2xx | deleted from the queue; the next one is sent at once (at most `max_per_round`, 5, per round) |
 | no connection, timeout, 5xx, 408, 3xx, 401, 403, 404 | kept; wait `retry_s` (10 s), doubling with each failure in a row up to `retry_max_s` (300 s); the link is back at most 5 minutes after it returns |
 | 429 | as above, and at least the server's `Retry-After` (at most an hour) |
-| 400, 413, 422 | kept, and not tried again for `retry_max_s`. If no alert has gone through since its first refusal, it is taken as the settings (a refused topic, a change at the server) and handled like a failure above: nothing is dropped for it. Only an alert refused three times while others went through in between is dropped (`rejected`) |
+| 400, 413, 422 | kept, not tried again for `retry_max_s`, and from then on sent after every alert that was never refused (refused ones in the order of their last refusal), so a refused alert never holds up another. A refusal counts against the alert only if another alert went through since its previous refusal; otherwise it is taken as the settings (a refused topic, a change at the server) and handled like a failure above. An alert is dropped (`rejected`) after three refusals that count, so never while the server refuses everything |
 
 A Pi whose clock is not set yet fails the certificate check ("certificate not
 accepted ... is the clock set?"): its alerts wait like any others.

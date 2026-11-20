@@ -642,8 +642,12 @@ class Alerts(Service):
         if self._stop.is_set() or self._uptime() < self.next_send_at or len(self.stale) >= MAX_STALE:
             return False
         now = self._uptime()            # holds and retries count in uptime, like every other wait here
-        # Alerts never refused before those that were: a refused one must not hold up the rest.
-        for _, _, name in sorted(self.queue.names(), key=lambda x: x[2] in self.rejections):
+        # Alerts never refused first (by priority and age); then the refused ones, the one refused
+        # longest ago first: a refused alert never holds up another one.
+        def order(entry):
+            r = self.rejections.get(entry[2])
+            return (0, 0.0) if r is None else (1, r["at"])
+        for _, _, name in sorted(self.queue.names(), key=order):
             if name in self.unremovable or self.held.get(name, 0.0) > now or self.unreadable.get(name, 0.0) > now:
                 continue
             item = self.queue.load(name)
@@ -721,7 +725,7 @@ class Alerts(Service):
                 r = self.rejections[name] = {"count": 0, "accepts": self.accepts}
             if server_works:
                 r["count"] += 1
-            r["accepts"] = self.accepts
+            r["accepts"], r["at"] = self.accepts, now
             self.log.error("ntfy refused %s (%d time(s) while others went through): %s", name, r["count"], text)
             if r["count"] >= REJECT_LIMIT and server_works:
                 self.queue.remove(name)

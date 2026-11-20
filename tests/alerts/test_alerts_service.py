@@ -154,7 +154,8 @@ def test_one_message_the_server_refuses_while_others_go_through_is_dropped_after
         rig.manager_event(event="fault", kind=f"good{i}", reason="fine")
         rig.tick(12)
     status = rig.tick(12)
-    assert status["counters"]["rejected"] == 1 and len(server.refused) == 3 and rig.queued() == []
+    # The first refusal proves nothing (it may be the server); three more with others accepted between.
+    assert status["counters"]["rejected"] == 1 and len(server.refused) == 4 and rig.queued() == []
     assert [t for t in titles(server) if "good" in t] == [f"test-unit: radar FAULT: good{i}" for i in range(3)]
 
 
@@ -668,3 +669,34 @@ def test_gps_causes_from_telemetry(tmp_path, server, cause, health, title):
     [gps] = [b for b in without_summary(server)]
     assert gps["title"] == f"test-unit: {title}" and gps["priority"] == L.DEFAULT
     assert f"the reason for {cause or health}" in gps["message"]
+
+
+@pytest.mark.parametrize("bad, good", [(L.HIGH, L.HIGH), (L.HIGH, L.DEFAULT)])
+def test_an_alert_refused_for_a_long_time_does_not_hold_up_a_new_one(tmp_path, server, bad, good):
+    rig = Rig(tmp_path, server.url, **{"ntfy.retry_max_s": 300.0})
+    server.refuse = lambda body: "BAD" in body["message"]
+    rig.start()
+    rig.tick(3)                                 # the summary goes out
+    rig.manager_event(event="fault", kind="bad", reason="BAD")
+    rig.tick(1800)                              # refused, alone in the queue, for 30 minutes
+    if good == L.HIGH:
+        rig.manager_event(event="fault", kind="good", reason="fine")
+    else:
+        rig.watcher_event(event="warning", severity="warning", warning="good", text="good")   # priority 3
+    rig.tick(5)
+    new = [b for b in server.bodies() if "good" in b["title"] or "good" in b["message"]]
+    assert len(new) == 1 and new[0]["priority"] == good
+
+
+def test_refusals_while_the_server_refused_everything_do_not_count_towards_dropping(tmp_path, server):
+    rig = Rig(tmp_path, server.url, **{"ntfy.retry_max_s": 8.0})
+    server.mode, server.status = "status", 400
+    rig.start()
+    rig.manager_event(event="fault", kind="x", reason="BAD")
+    rig.tick(400)                               # every message refused, many times each
+    server.mode = "ok"
+    server.refuse = lambda body: "BAD" in body["message"]      # from now on only that one
+    status = rig.tick(30)
+    assert any("summary" in b["title"] for b in server.bodies())
+    assert status["counters"]["rejected"] == 0                  # one later 400 drops nothing
+    assert any(n.startswith("p4-") for n in rig.queued())
