@@ -163,7 +163,21 @@ TODO: Radar exit time. After the 2 h soak the receive thread had not exited 5 s 
 
 Before every start the manager checks the requested config against fixed limits and refuses to run if any fail: amplifier pin set and active low, TX gain at or below a cap, enable duty at or below a cap, receive window at least as long as the transmit pulse, frequency inside the amplifier band, output on the NVMe drive. `pwr_amp_pin: -1` leaves the amplifier enable unmanaged and must never run with the amplifier powered.
 
-TODO: Set the limits once the VVA setting is decided.
+Amplifier gain set on the bench, 2026-11-20 (replacement control board with a 10k potentiometer on the VVA line; SDR at 300 MHz, 30 MHz chirp, 11.5 us enable every 200 us):
+
+- `tx_gain` 72 is the maximum drive: about +4 dBm from the SDR (the amplifier's input rating is +10 dBm), linear to there.
+- The potentiometer was set so that `tx_gain` 72 gives about +40 dBm (10 W peak) at the amplifier output: power detector +40.2 dBm, scope +39.6 dBm, best figure +40.0 +/-1 dBm. This is about 11 dB more amplifier gain than the earlier "VVA 5 V" setting (about 35.7 dB against 24.6 dB).
+- Output against `tx_gain` at this setting (detector): 60 = +27.8 dBm, 66 = +34.1 dBm, 72 = +40.2 dBm; no compression up to 10 W (steps within 0.05 dB of the low-power ramp).
+- At the earlier setting the output at `tx_gain` 60 was +18 dBm, not the +20 dBm assumed until then (the scope's correction near 300 MHz had been 2.5 dB too large). The detector (ZX47-40, datasheet curve, 46.6 dB below the amplifier since the 30 dB attenuator was moved into the loopback branch) is the absolute reference.
+- The potentiometer's whole range is 30.6 dB and most of it lies in a small part of the travel: the gain rose about 20 dB in one second of turning, and at `tx_gain` 72 the amplifier saturated near 75 W before the run was stopped. The setting sits in that steep part. Tuning was therefore done at `tx_gain` 45 and confirmed by stepping up with the potentiometer untouched.
+
+Fixed divider, 2026-11-20 (user): the VVA measured 3.485 V at that potentiometer setting, and the node is loaded by about 14.7 kohm (the potentiometer alone would give 3.87 V; a 10k/4.7k pair gave 2.787 V, predicted 2.79 V, and 16.5 dB too much gain). The potentiometer was replaced by a stiff divider: 1k from VVA to 5 V, 2.2k + 470 ohm from VVA to ground, measured 3.452 V. That is 1.5 dB more gain than the potentiometer setting (the curve is about 45 dB per volt here, 24 dB per volt averaged down to 2.79 V), so `tx_gain` 72 would give about +41.4 dBm (14 W). The user chose to keep the resistors and cap `tx_gain` at 70. Measured with the divider: `tx_gain` 60 = +29.4 dBm, 66 = +35.6 dBm, 70 = +39.6 +/-1 dBm (detector +39.8 to +39.9, scope +39.3 to +39.5; about 9.1 to 9.8 W peak, the unit's maximum output); linear within 0.1 dB on the loopback.
+
+12 V input in this configuration (scope, 110 s continuous record with 62 s of transmitting, raw clamp readings): idle 1.76 A / 24.1 W; transmitting 2.18 A / 29.7 W, essentially constant; peaks 2.51 A / 34.2 W instantaneous and 2.21 A / 30.1 W over 1 s, all during ordinary pulsing; the pulse-synchronous part is 0.015 A peak to peak.
+
+Settings for this unit: `manager.limits.max_tx_gain: 70` in `/etc/radar-runner/local.yaml`. The 10 W limit is therefore a software cap: a config at `tx_gain` 72 would give about 14 W, which the amplifier and the bench can take.
+
+TODO: the temperature dependence of this gain is not known (the VVA node's load may change in the cold); the HIL fixtures in `~/radar-testbench/fixtures` still describe the earlier gain (24 dB) and attenuator position.
 
 ## Safe turn-on
 
