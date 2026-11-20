@@ -733,11 +733,13 @@ class Alerts(Service):
     def _reap(self):
         """Sends given up on that have ended since (a DNS lookup); and files that could not be deleted."""
         now = self._uptime()
-        queued = {name for _, _, name in self.queue.names()}
-        for records in (self.held, self.rejections, self.unreadable):
-            for name in [n for n in records if n not in queued]:
-                del records[name]
-        self.unremovable &= queued
+        listing = self.queue.listing()
+        if listing is not None:     # a listing that failed (a failing card) says nothing about what is gone
+            queued = {name for _, _, name in listing}
+            for records in (self.held, self.rejections, self.unreadable):
+                for name in [n for n in records if n not in queued]:
+                    del records[name]
+            self.unremovable &= queued
         if len(self.stale) < MAX_STALE:
             self._stale_full_since = None
         elif self._stale_full_since is None:

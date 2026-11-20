@@ -558,6 +558,36 @@ def test_a_sent_alert_that_cannot_be_deleted_is_sent_once(tmp_path, server, monk
     assert status["sent_not_deleted"] == [] and rig.queued() == [] and len(server.bodies()) == 2
 
 
+def test_a_failed_listing_of_the_queue_does_not_forget_what_was_sent(tmp_path, server, monkeypatch):
+    rig = Rig(tmp_path, closed_port())
+    rig.start()
+    rig.tick(2)
+    rig.watcher_event(event="stuck", severity="urgent", text="AMPLIFIER STUCK ENABLED: 2.5 A")
+    rig.tick(3)
+    queue_dir = str(rig.state_dir / "alerts-queue")
+    real_unlink, real_listdir = os.unlink, os.listdir
+
+    def read_only(path, *a, **k):
+        if str(path).startswith(queue_dir):
+            raise OSError(30, "Read-only file system")
+        return real_unlink(path, *a, **k)
+    monkeypatch.setattr(os, "unlink", read_only)
+    rig.service.ntfy["server"] = server.url
+    rig.service.next_send_at = 0
+    rig.tick(20)
+    assert len(server.bodies()) == 2 and len(rig.service.unremovable) == 2
+
+    def failing(path=".", *a, **k):
+        if str(path) == queue_dir:
+            raise OSError(5, "Input/output error")
+        return real_listdir(path, *a, **k)
+    monkeypatch.setattr(os, "listdir", failing)         # the failing card: one listing fails
+    rig.tick()
+    monkeypatch.setattr(os, "listdir", real_listdir)
+    status = rig.tick(20)
+    assert len(server.bodies()) == 2 and len(status["sent_not_deleted"]) == 2
+
+
 def test_an_inbox_request_that_cannot_be_deleted_is_not_sent_again_and_again(tmp_path, server, monkeypatch):
     rig = Rig(tmp_path, server.url)
     rig.start()
