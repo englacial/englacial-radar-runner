@@ -120,7 +120,10 @@ def scan_collections(root):
                 pass
     how = (str(end.get("how") or "ended") if end else
            "cut off (no end recorded: power cut or crash)" if meta else "no collection.json")
-    return {"count": len(found), "last": {"name": name, "how": how,
+    began = started or (meta.get("created") if isinstance(meta.get("created"), dict) else {})
+    began = began.get("time_utc") if isinstance(began.get("time_utc"), str) else ""
+    return {"count": len(found), "last": {"name": name, "how": how, "open": bool(meta) and end is None,
+                                          "started_utc": began,
                                           "reason": str(end.get("reason") or "") if end else "",
                                           "recorded_s": recorded, "data_gb": size / 1e9}}
 
@@ -200,6 +203,9 @@ class Alerts(Service):
         self._scan = None
         self._reads = {}
         self._followed = set()      # event logs read once already by this process
+        self._settled_since = None  # uptime since which the other services' status has been usable
+        self._unsettled_now = []
+        self._started_at = 0.0
 
     # ------------------------------------------------------------------ state
 
@@ -246,6 +252,7 @@ class Alerts(Service):
 
     def setup(self):
         now = self._uptime()
+        self._started_at = now
         self.queue.setup()
         # Temporary state files of a run that was cut off in the middle of a save.
         directory, base = os.path.split(self.state_path)
@@ -362,6 +369,7 @@ class Alerts(Service):
         alerts += self._guarded("inbox", self._inbox)
         alerts += self._guarded("events", self._events)
         alerts += self._guarded("conditions", self._conditions, now)
+        self._settle(now)
         alerts += self._guarded("summary", self._summary, now)
         alerts += [(a, None) for a in self._guarded("storm notes", self.limiter.notes, now)]
         for alert, when in alerts:
@@ -476,9 +484,32 @@ class Alerts(Service):
 
     # ---- the boot summary
 
+    def _unsettled(self):
+        """What keeps the other services' status from being worth a summary yet, as short texts."""
+        out = [f"{name} status {read.state}" for name, read in self._reads.items() if not read.ok]
+        tel, wat, man = (self._reads.get(n) for n in ("telemetry", "watcher", "manager"))
+        if tel is not None and tel.ok and L._get(tel.data, "sources", "pi", "health") != "ok":
+            out.append("telemetry not reading the Pi yet")
+        if wat is not None and wat.ok and wat.data.get("running") is False:
+            out.append("safety watcher stopping")
+        if man is not None and man.ok and man.data.get("state") == "stopped":
+            out.append("radar manager stopping")
+        return out
+
+    def _settle(self, now):
+        """Since when the inputs have been usable without a break (a restart of the others resets it)."""
+        self._unsettled_now = self._unsettled()
+        if self._unsettled_now:
+            self._settled_since = None
+        elif self._settled_since is None:
+            self._settled_since = now
+
     def _summary(self, now):
         if self.summary_sent or now < self.cfg["summary_after_s"]:
             return []
+        settled = self._settled_since is not None and now - self._settled_since >= self.cfg["summary_settle_s"]
+        if not settled and now - self._started_at < self.cfg["summary_wait_max_s"]:
+            return []           # a restart of the other services under way: wait until it is over
         if self._scan is None:
             result = {}
 
@@ -496,6 +527,10 @@ class Alerts(Service):
         collections = scan["result"].get("value") or {
             "error": f"the data drive did not answer within {SCAN_TIMEOUT_S:g} s"}
         facts = self._summary_facts(now, collections)
+        if not settled:
+            facts["unsettled"] = (f"Sent before the other services had settled ({L._duration(now - self._started_at)} "
+                                  f"after this service started): {'; '.join(self._unsettled_now) or 'unsteady'}. "
+                                  "\"unknown\" below means not reported yet, not a fault of the radar.")
         self.summary_sent = True
         self._dirty = True
         return [(L.boot_summary(facts), None)]
@@ -503,6 +538,16 @@ class Alerts(Service):
     def _summary_facts(self, now, collections):
         r = self._reads
         tel, wat, man, pwr = r["telemetry"], r["watcher"], r["manager"], r["power"]
+        last = collections.get("last") if isinstance(collections, dict) else None
+        if isinstance(last, dict) and last.get("open"):
+            # No end in collection.json: being recorded, or cut off. The manager's status tells which.
+            started = last.get("started_utc", "")
+            started = f"started {started[11:19]} UTC" if len(started) >= 19 else "start time not known"
+            if man.ok and man.data.get("state") in ("starting", "running", "stopping") \
+                    and man.data.get("collection") == last.get("name"):
+                last["how"] = f"recording now ({started})"
+            elif not man.ok:
+                last["how"] = f"no end recorded yet ({started}; the radar manager's state is not known)"
         values = L._get(tel.data, "sources", "pi", "values") if tel.ok else None
         previous = dict(self.previous) if self.previous else None
         last_shutdown = L._get(pwr.data, "guard", "last_shutdown") if pwr.data else None

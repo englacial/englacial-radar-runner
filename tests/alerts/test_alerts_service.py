@@ -740,3 +740,83 @@ def test_sends_stuck_in_dns_lookups_for_ten_minutes_make_the_service_exit_for_a_
     rig.tick(10)
     assert svc._stop.is_set() and svc.exit_status == 1
     assert any(n.startswith("p4-") for n in rig.queued())      # the alert waits on disk for the next process
+
+
+# ---- the boot summary in real boots
+
+def summaries(server):
+    return [b for b in server.bodies() if "summary" in b["title"]]
+
+
+def test_a_collection_being_recorded_is_not_called_cut_off(tmp_path, server):
+    rig = Rig(tmp_path, server.url)
+    col = rig.collections / "b00042_s001_20261120T054629Z"
+    col.mkdir()
+    (col / "collection.json").write_text(json.dumps({"created": {"time_utc": "2026-11-20T05:46:29Z"}, "end": None}))
+    rig.manager = {"state": "starting", "not_ready": [], "collection": "b00042_s001_20261120T054629Z"}
+    rig.start()
+    rig.tick(3)
+    [s] = summaries(server)
+    assert "b00042_s001_20261120T054629Z, recording now (started 05:46:29 UTC)" in s["message"]
+    assert "cut off" not in s["message"]
+
+
+@pytest.mark.parametrize("manager, wording", [
+    ({"state": "ready", "not_ready": [], "collection": None}, "cut off (no end recorded: power cut or crash)"),
+    (None, "no end recorded yet (started 05:46:29 UTC; the radar manager's state is not known)"),
+])
+def test_an_open_collection_when_no_run_is_under_way(tmp_path, server, manager, wording):
+    rig = Rig(tmp_path, server.url, summary_wait_max_s=0.0)
+    col = rig.collections / "b00041_s003_20261120T054629Z"
+    col.mkdir()
+    (col / "collection.json").write_text(json.dumps({"recording_started": {"time_utc": "2026-11-20T05:46:29Z"},
+                                                     "end": None}))
+    rig.manager = manager
+    rig.start()
+    rig.tick(3)
+    assert wording in summaries(server)[0]["message"]
+
+
+def test_a_late_start_during_a_restart_of_the_other_services_waits_until_they_have_settled(tmp_path, server):
+    rig = Rig(tmp_path, server.url, summary_after_s=180.0, summary_settle_s=30.0)
+    rig.clock.up = 2700.0                       # 45 min after boot (the service's first start, or a restart)
+    rig.telemetry["state"] = "degraded"         # the others are being restarted right now
+    rig.telemetry["sources"]["pi"].update(health="missing", values={})
+    rig.watcher = {"ok": False, "running": False, "reason": "the safety watcher is not running"}
+    rig.start()
+    rig.tick(5)
+    assert summaries(server) == []
+    rig.telemetry = __import__("alerts_rig").telemetry_data()      # back, as they are a few seconds later
+    rig.watcher = {"ok": True, "tripped": False, "reason": "", "running": True}
+    rig.tick(25)
+    assert summaries(server) == []              # not yet 30 s of usable status
+    rig.tick(10)
+    [s] = summaries(server)
+    assert "Sent before" not in s["message"] and "900.0 GB free" in s["message"] and "Safety watcher: ok" in s["message"]
+    rig.tick(60)
+    assert len(summaries(server)) == 1          # once per boot
+
+
+def test_a_summary_that_cannot_wait_any_longer_says_what_was_missing(tmp_path, server):
+    rig = Rig(tmp_path, server.url, summary_after_s=180.0, summary_settle_s=30.0, summary_wait_max_s=600.0)
+    rig.clock.up = 2700.0
+    rig.telemetry = None                        # never comes back
+    rig.start()
+    rig.tick(590)
+    assert summaries(server) == []
+    rig.tick(15)
+    [s] = summaries(server)
+    first = s["message"].split("\n")[0]
+    assert first.startswith("Sent before the other services had settled (10 min after this service started)")
+    assert "telemetry status" in first and "not a fault of the radar" in first
+
+
+def test_a_normal_boot_still_sends_the_summary_at_three_minutes(tmp_path, server):
+    rig = Rig(tmp_path, server.url, summary_after_s=180.0, summary_settle_s=30.0)
+    rig.clock.up = 20.0                         # started early in the boot, the others too
+    rig.start()
+    rig.tick(158)
+    assert summaries(server) == []
+    rig.tick(4)
+    [s] = summaries(server)
+    assert "Sent before" not in s["message"] and "up 3" in s["message"]

@@ -367,6 +367,8 @@ DEFAULTS = {
             "max_per_hour": 30,
         },
         "summary_after_s": 180.0,               # the boot summary is sent at this uptime (or at the start, if later)
+        "summary_settle_s": 30.0,               # ... once the other services' status has been usable this long
+        "summary_wait_max_s": 600.0,            # ... but at most this long after this service's start
         # How long each condition must last before it is an alert.
         "conditions": {
             "status_stale_s": 120.0,            # the status file of telemetry, watcher, manager or power old or missing

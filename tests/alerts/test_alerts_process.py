@@ -29,7 +29,8 @@ def server():
 def write_config(tmp_path, server_url, **alerts):
     for d in ("run", "state", "collections"):
         (tmp_path / d).mkdir(exist_ok=True)
-    a = {"summary_after_s": 0.0, "loop_interval_s": 0.2, "unit_name": "proc-unit",
+    # No other services' files here: the summary goes out at once, saying so.
+    a = {"summary_after_s": 0.0, "summary_wait_max_s": 0.0, "loop_interval_s": 0.2, "unit_name": "proc-unit",
          "ntfy": {"server": server_url, "topic": TOPIC, "token": TOKEN, "timeout_s": 2.0, "retry_s": 0.5,
                   "retry_max_s": 1.0}}
     a.update(alerts)
