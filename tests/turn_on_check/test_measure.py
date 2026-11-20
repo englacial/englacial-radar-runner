@@ -114,14 +114,25 @@ def test_by_hand_on_the_portable_loopback_prints_the_settings(tmp_path, capsys):
     d = collection(tmp_path, "loopback_30ft_tx70.bin", 70.0)
     assert measure.main([str(d)]) == 0
     out = capsys.readouterr().out
-    assert "one peak at 78.4" in out and "cannot be told apart" in out
+    assert "one peak at 78.4" in out and "cannot be told apart" in out and "WARNING" not in out
     assert "      verified: true\n      leakage_sample: 78.4\n      delay_samples: 0.0\n" in out
     assert "      level_tx_gain: 70\n      min_level_db: -18.0" in out
 
 
-def test_by_hand_finds_the_leakage_before_the_direct_peak(tmp_path, capsys):
+def test_by_hand_with_more_than_one_strong_peak_the_user_must_choose(tmp_path, capsys):
+    # If the leakage were the strongest peak, taking the strongest as the direct one would judge the leakage.
     d = collection(tmp_path, "loopback_50m_tx70.bin", 70.0)
     assert measure.main([str(d)]) == 0
     out = capsys.readouterr().out
+    assert "WARNING: more than one peak within 40 dB of the strongest" in out
+    assert "74.98" in out and "90.16" in out and "--direct" in out
+    assert "verified: true" not in out and "      verified: false" in out
+
+
+def test_by_hand_finds_the_leakage_before_the_direct_peak(tmp_path, capsys):
+    d = collection(tmp_path, "loopback_50m_tx70.bin", 70.0)
+    assert measure.main([str(d), "--direct", "90.16"]) == 0
+    out = capsys.readouterr().out
+    assert "WARNING" not in out and "      verified: true" in out
     assert "leakage peak at 74.98" in out and "15.18 samples after the leakage (about 81.3 m of path in air)" in out
     assert "      delay_samples: 15.18" in out and "      min_level_db: -22.6" in out

@@ -26,6 +26,7 @@ C = 299792458.0
 MAX_RECORDS = 50            # records read by hand from a collection: enough for the profile
 PEAKS_DB = 50.0             # local maxima listed: down to this far below the strongest
 LEAKAGE_WITHIN = 40         # by hand: the leakage peak is looked for at most this many samples before the direct
+RIVAL_DB = 40.0             # by hand: another peak this close to the strongest makes the choice the user's
 
 
 def data_files(directory, name):
@@ -193,6 +194,17 @@ def by_hand(args):
         print(f"  {pk['sample']:8.2f}  {pk['level_db']:7.1f}")
     s = m["strongest"]
     direct = s["sample"] if args.direct is None else args.direct
+    # The strongest peak is taken as the direct one only when it is the only strong one: if the SDR's
+    # leakage were the strongest, the check would judge the leakage and pass with the antenna gone.
+    rivals = [pk for pk in m["peaks"] if abs(pk["sample"] - s["sample"]) >= args.min_separation
+              and pk["level_db"] >= s["level_db"] - RIVAL_DB]
+    ambiguous = args.direct is None and bool(rivals)
+    if ambiguous:
+        print(f"\nWARNING: more than one peak within {RIVAL_DB:g} dB of the strongest:")
+        for pk in [s] + rivals:
+            print(f"  sample {pk['sample']:8.2f}  {pk['level_db']:7.1f} dB")
+        print("The strongest is not necessarily the direct signal (the leakage inside the SDR may be stronger).\n"
+              "Choose with --direct SAMPLE (and --leakage SAMPLE); until then the block below is not verified.")
     if args.leakage is not None:
         leakage = args.leakage
     else:
@@ -221,7 +233,8 @@ def by_hand(args):
     if gain is None:
         sys.exit("tx_gain not found in config.yaml")
     print("\nSettings for /etc/radar-runner/local.yaml, if this collection is verified as correct:\n")
-    print("manager:\n  turn_on_check:\n    expected:\n      verified: true")
+    print("manager:\n  turn_on_check:\n    expected:\n      verified: " + ("false      # choose --direct first"
+                                                                       if ambiguous else "true"))
     print(f"      leakage_sample: {leakage if m['mode'] == 'combined' else m['leakage'].get('sample', leakage)}")
     print(f"      delay_samples: {round(delay, 2)}")
     print(f"      tolerance_samples: {args.tolerance:g}")

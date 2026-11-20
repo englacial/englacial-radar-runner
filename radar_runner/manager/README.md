@@ -252,7 +252,10 @@ cables, receive chain or radar config), with `blocking: false`:
 
    It takes the strongest peak as the direct one and the strongest peak up to 40
    samples before it (and at most 40 dB weaker) as the leakage; `--direct` and
-   `--leakage` override that, `--margin-db` (12) sets the minimum level below the
+   `--leakage` override that. If any other peak is within 40 dB of the strongest,
+   it lists them and prints `verified: false` until the direct peak is chosen
+   with `--direct` (the leakage may be the strongest peak in the field: judging it
+   would pass with the antenna gone). `--margin-db` (12) sets the minimum level below the
    measured one.
 4. The next start: `radarctl status` shows "check blocking; last: passed ...".
 
@@ -285,7 +288,7 @@ over every run and power cycle of 2026-11-20 (`docs/transit-reference/`), and wi
 the amplifier off (the 28 V gone, only the leakage left; b00013_s003) the peak is
 27.6 dB down and 3 samples early, so 12 to 15 dB still fails that case and a
 disconnected cable (about 30 dB). With the
-earlier 50 m cable the same tool finds the two peaks: leakage 74.98, delay 15.18
+earlier 50 m cable the same tool, given `--direct 90.16`, finds the two peaks: leakage 74.98, delay 15.18
 samples (81 m of path in air), -10.6 dB.
 
 
