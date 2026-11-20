@@ -149,7 +149,7 @@ then the radar at the requested power. The low-power run is the collection's own
 config (as written and checked) with three changes, and nothing else (checked):
 `RF0.tx_gain` capped at `max_tx_gain` (40: 30 dB under the cap of 70, about
 +9.6 dBm, 9 mW peak, at the amplifier output), `CHIRP.num_pulses` set to
-`pulses` rounded up to whole records (8000: 8 records at presum 1000, 1.6 s at
+`pulses` rounded up to whole records (15000: 15 records at presum 1000, 3 s at
 5 kHz), and its output in `<collection>/turn_on_check/` with the data file
 `low_power.bin.0`. The waveform is unchanged, so every peak is at the delay it
 has at full power. It passes the same config limits, and is the same binary
@@ -162,7 +162,7 @@ limit counts two SDR starts for each start (`max_starts_per_hour`).
 | Criterion | From | Fails when |
 |---|---|---|
 | `amplifier_before` | the telemetry status just before the low-power run | 28 V outside 26-30.5 V; idle current outside 0.10-0.20 A; amplifier or case temperature outside -40 to 50 C; no reading |
-| `amplifier_during` | telemetry readings during its pulses (after `CHIRP.time_offset`) | fewer than 2 readings; the highest not 0.05 A above the idle reading (not enabled); one above 0.6 A |
+| `amplifier_during` | telemetry readings during its pulses (after `CHIRP.time_offset`) | the highest not 0.05 A above the idle reading (not enabled); one above 0.6 A. Fewer than `min_current_readings` (2) readings: not judged, with a warning |
 | `data` | the data file | fewer records than the pulse count asks for |
 | `clipping` | the raw maximum of the low-power data | at or above `clip_fs` (0.9 of full scale) |
 | `signal` | the pulse-compressed profile (the chirp correlated with each record, magnitudes averaged; dB relative to the chirp, as `tools/transit_check`) | see below; not judged until `expected.verified` |
@@ -171,6 +171,9 @@ limit counts two SDR starts for each start (`max_starts_per_hour`).
 Without amplifier telemetry and with the override set, the two amplifier
 criteria are not judged. The raw maximum scaled to the requested `tx_gain`
 (1 dB per step) is shown, and is a warning (not a failure) when it would clip.
+Telemetry writes one reading every 0.5 s (`telemetry.status_interval_s`): pulses
+that last less than 0.4 s plus that many readings' worth (1.4 s for 2) give a
+warning in the result, since they cannot be relied on for the readings.
 
 **The signal.** `expected.leakage_sample` is where the leakage inside the SDR
 peaks, `expected.delay_samples` how much later the direct signal between the
@@ -206,8 +209,8 @@ whether the direct wave clips at full power.
 | its directory cannot be written | a failed start (`directory`) |
 
 What it adds to a start, warm SDR: SDR set-up 4.9 s, `CHIRP.time_offset` 1 s,
-the pulses 1.6 s, the exit 0.1 s, the amplifier step after its exit (a reading
-taken 2 s after the exit: 2-2.7 s), the analysis 0.3 s: about 10 s. On the first
+the pulses 3 s, the exit 0.1 s, the amplifier step after its exit (a reading
+taken 2 s after the exit: 2-2.7 s), the analysis 0.3 s: about 11.5 s. On the first
 start after power-up the firmware and FPGA load (about 14 s) happens in the
 low-power run instead of the radar at power, so it adds nothing. Nothing of the
 check runs while the radar records.

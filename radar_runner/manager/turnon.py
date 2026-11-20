@@ -326,12 +326,19 @@ def judge(s, facts, before, override, during, measurement, analysis_error=""):
     measurement  measure.py's output (dict), or None with `analysis_error`
     Each criterion: {name, ok: True / False / None (not judged), text}.
     """
-    criteria = []
+    criteria, warnings = [], []
 
     def add(name, ok, text):
         criteria.append({"name": name, "ok": ok, "text": text})
 
     gain, requested = facts["tx_gain"], facts["requested_tx_gain"]
+    interval = facts.get("telemetry_interval_s", 0.5)
+    pulses_s = facts["pulses"] * facts["pri_s"]
+    if pulses_s - WINDOW_START_S - WINDOW_END_S < s.min_current_readings * interval:
+        warnings.append(f"the low-power pulses last {pulses_s:.1f} s: too short for {s.min_current_readings} "
+                        f"amplifier readings at one every {interval:g} s (they need at least "
+                        f"{s.min_current_readings * interval + WINDOW_START_S + WINDOW_END_S:.1f} s: "
+                        "raise manager.turn_on_check.pulses)")
     reading, problem = before
     idle = None
     if reading is None:
@@ -354,10 +361,14 @@ def judge(s, facts, before, override, during, measurement, analysis_error=""):
         add("amplifier_before", not wrong, "; ".join(wrong) or
             f"{reading['voltage_v']:.1f} V, {idle:.3f} A idle, {reading.get('temp_c')} C")
     currents = [r["current_a"] for r in during]
-    if len(currents) < s.min_current_readings or idle is None:
-        why = (f"{len(currents)} amplifier readings during the pulses (at least {s.min_current_readings} needed)"
-               if idle is not None else "no idle reading to compare with")
-        add("amplifier_during", None if override else False, why + ("; not judged: override set" if override else ""))
+    if idle is None:
+        add("amplifier_during", None, "not judged: no idle reading to compare with")
+    elif len(currents) < s.min_current_readings:
+        # Telemetry's freshness is a gate of its own: a reading too few is no reason to keep the radar off.
+        why = (f"only {len(currents)} amplifier readings during the pulses (at least {s.min_current_readings} "
+               "needed): not judged")
+        add("amplifier_during", None, why)
+        warnings.append(why)
     else:
         top = max(currents)
         wrong = []
@@ -418,9 +429,10 @@ def judge(s, facts, before, override, during, measurement, analysis_error=""):
             if isinstance(peak, dict) and peak.get("found"):
                 measured[f"{name}_sample"], measured[f"{name}_level_db"] = peak["sample"], peak["level_db"]
         if measured["raw_max_at_requested_fs"] >= s.clip_fs:
-            out["warning"] = (f"at tx_gain {requested:g} the raw maximum would be about "
-                              f"{measured['raw_max_at_requested_fs']:.2f} of full scale: the receiver would clip")
+            warnings.append(f"at tx_gain {requested:g} the raw maximum would be about "
+                            f"{measured['raw_max_at_requested_fs']:.2f} of full scale: the receiver would clip")
     out["measured"] = measured
+    out["warnings"] = warnings
     out["reason"] = "; ".join(c["text"] for c in criteria if c["ok"] is False)
     return out
 
@@ -429,11 +441,12 @@ def summary_text(result):
     """One line for the status, the journal and the alerts."""
     if result.get("stopped"):
         return f"stopped before it was judged ({result['stopped']})"
+    warnings = "".join(f"; warning: {w}" for w in result.get("warnings") or [])
     if result["passed"]:
         signal = next((c for c in result["criteria"] if c["name"] == "signal"), None)
-        return "passed" + (f": {signal['text']}" if signal else "")
+        return "passed" + (f": {signal['text']}" if signal else "") + warnings
     return ("FAILED, the radar stays off: " if result["blocked"] else
-            "FAILED (record only, the radar starts anyway): ") + result["reason"]
+            "FAILED (record only, the radar starts anyway): ") + result["reason"] + warnings
 
 
 # ------------------------------------------------------------------------ the check
@@ -472,6 +485,7 @@ class TurnOnCheck:
             lp, facts = low_power_config(derived, s.max_tx_gain, s.pulses, os.path.relpath(directory, orca))
         except (limits.ConfigError, ValueError) as e:
             return self._fail(run, result, "config", f"turn-on check: no low-power config: {e}", fatal=True)
+        facts["telemetry_interval_s"] = self.config["telemetry"]["status_interval_s"]
         result["low_power"] = facts
         problems = limits.check(lp, self.cfg["limits"]) + limits.check_output(lp, orca, root)
         extra = differences(derived, lp) - CHANGED
@@ -592,7 +606,7 @@ class TurnOnCheck:
                               reason=result.get("failure", ""))
             result["text"] = result.get("failure") or summary_text(result)
             summary = {k: result.get(k) for k in ("collection", "passed", "blocking", "blocked", "text")}
-            summary.update({k: result[k] for k in ("mode", "reason", "measured", "warning", "stopped", "failure",
+            summary.update({k: result[k] for k in ("mode", "reason", "measured", "warnings", "stopped", "failure",
                                                    "duration_s") if result.get(k) not in (None, "")})
             summary["criteria"] = [{"name": c["name"], "ok": c["ok"]} for c in result.get("criteria", [])]
             summary["low_power"] = {k: v for k, v in (result.get("low_power") or {}).items()

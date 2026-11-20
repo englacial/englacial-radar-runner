@@ -38,7 +38,7 @@ def settings(**changes):
 def test_defaults_are_off_record_only_and_without_warnings():
     s = settings()
     assert not s.enabled and not s.blocking and not s.verified and not s.blocks and s.expected() is None
-    assert s.max_tx_gain == 40.0 and s.pulses == 8000 and s.analysis_command[-1].endswith("measure.py")
+    assert s.max_tx_gain == 40.0 and s.pulses == 15000 and s.analysis_command[-1].endswith("measure.py")
 
 
 def test_blocking_needs_verified_expected_values():
@@ -213,7 +213,10 @@ def test_amplifier_current_during_the_pulses():
     assert failing(judged(readings=during(0.156, 0.168))) == ["amplifier_during"]     # no rise: not enabled
     assert "did not rise" in judged(readings=during(0.156, 0.168))["reason"]
     assert failing(judged(readings=during(0.3, 0.9))) == ["amplifier_during"]         # far too much
-    assert failing(judged(readings=during(0.3))) == ["amplifier_during"]              # too few readings
+    r = judged(readings=during(0.3))                                                   # too few readings
+    assert r["passed"] and criterion(r, "amplifier_during")["ok"] is None
+    assert "only 1 amplifier readings during the pulses" in r["warnings"][0]
+    assert "; warning: only 1 amplifier readings" in turnon.summary_text(r)
     assert judged(readings=during(0.156, 0.288))["passed"]     # a reading between pulses does not matter
 
 
@@ -229,7 +232,16 @@ def test_data_clipping_and_analysis():
 
 def test_clipping_at_the_requested_power_is_a_warning():
     r = judged(m=measurement(raw=0.03))         # 0.03 at tx_gain 40 is about 0.95 at 70
-    assert r["passed"] and "would clip" in r["warning"]
+    assert r["passed"] and "would clip" in r["warnings"][0]
+
+
+def test_pulses_too_short_for_the_readings_are_a_warning():
+    s = settings(**VERIFIED)
+    short = dict(FACTS, pulses=4000, telemetry_interval_s=0.5)         # 0.8 s
+    r = turnon.judge(s, short, IDLE, False, during(0.288, 0.264), measurement())
+    assert r["passed"] and "too short for 2 amplifier readings at one every 0.5 s" in r["warnings"][0]
+    assert "at least 1.4 s" in r["warnings"][0]
+    assert judged()["warnings"] == []                                   # 1.6 s is enough
 
 
 def test_signal_missing_or_too_weak():

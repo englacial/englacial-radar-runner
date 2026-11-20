@@ -303,7 +303,7 @@ manager:
     enabled: false
     blocking: false           # true: a failed check keeps the radar off (fault turn_on_check); needs expected.verified
     max_tx_gain: 40.0         # PER UNIT. The low-power run at RF0.tx_gain min(requested, this): 30 dB under 70 (about 9 W)
-    pulses: 8000              # error-free pulses, rounded up to whole records (8 records at presum 1000; 1.6 s at 5 kHz)
+    pulses: 15000             # error-free pulses, rounded up to whole records (15 records at presum 1000; 3 s at 5 kHz)
     analysis_command: [/home/englacial/miniforge3/envs/orca/bin/python, -I,
                        /home/englacial/englacial-radar-runner/tools/turn_on_check/measure.py]
     analysis_timeout_s: 30.0
@@ -315,7 +315,7 @@ manager:
     temp_min_c: -40.0
     temp_max_c: 50.0
     # During the pulses: the highest reading at least current_rise_min_a above the idle one, none above
-    # current_max_a, and at least min_current_readings of them (one every 0.5 s). Measured at 6.5 %
+    # current_max_a. Fewer than min_current_readings (one every 0.5 s): not judged, a warning. Measured at 6.5 %
     # enable duty: 0.25-0.31 A at any tx_gain from 30 to 72 (the enable, not the drive, sets it).
     current_rise_min_a: 0.05
     current_max_a: 0.6

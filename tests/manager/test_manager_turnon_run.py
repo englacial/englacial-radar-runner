@@ -32,9 +32,10 @@ VERIFIED = dict(verified=True, leakage_sample=78.4, delay_samples=0.0, level_tx_
 class Feed(threading.Thread):
     """The telemetry status: 0.288 A while the stand-in radar sends pulses (its tx_file exists), else 0.156 A."""
 
-    def __init__(self, env, tx_file):
+    def __init__(self, env, tx_file, interval_s=0.05):
         super().__init__(daemon=True)
         self.env, self.tx_file, self.halt = env, tx_file, threading.Event()
+        self.interval_s = interval_s
         self.idle, self.on = 0.156, 0.288
 
     def run(self):
@@ -44,13 +45,13 @@ class Feed(threading.Thread):
             self.env.publish("telemetry", {"state": "ok", "amp": {
                 "fresh": True, "reason": "", "current_a": current, "voltage_v": 28.0, "sample_uptime_s": up,
                 "temp_c": 27.6, "case_temp_c": 19.2}, "loop": {"last_gap_s": 0.25, "recent_longest_gap_s": 0.25}})
-            time.sleep(0.05)
+            time.sleep(self.interval_s)
 
 
-def setup_check(env, real=False, **changes):
-    """Enable the check in env's config; the stand-in radar at real speed, time_offset 0. Returns the tx_file."""
+def setup_check(env, real=False, time_offset=0, **changes):
+    """Enable the check in env's config; the stand-in radar at real speed. Returns the tx_file."""
     t = env.config["manager"]["turn_on_check"]
-    t.update(enabled=True, pulses=4000, analysis_timeout_s=5.0,      # 0.8 s of pulses
+    t.update(enabled=True, pulses=8000, analysis_timeout_s=5.0,      # 1.6 s of pulses
              analysis_command=[ORCA_PYTHON, "-I", MEASURE] if real else
              [sys.executable, os.path.join(env.orca, "fake_measure.py")])
     for key, value in changes.items():
@@ -59,7 +60,7 @@ def setup_check(env, real=False, **changes):
     m["orca"]["env"] = [e for e in m["orca"]["env"] if not e.startswith("FAKE_RADAR_SPEEDUP")]
     with open(env.radar_config) as f:
         radar = yaml.safe_load(f)
-    radar["CHIRP"]["time_offset"] = 0
+    radar["CHIRP"]["time_offset"] = time_offset
     with open(env.radar_config, "w") as f:
         yaml.safe_dump(radar, f)
     return os.path.join(env.tmp, "transmitting")
@@ -69,11 +70,11 @@ def setup_check(env, real=False, **changes):
 def check_env(env):
     feeds = []
 
-    def make(events, behave=None, telemetry=None, feed=True, real=False, **changes):
-        tx_file = setup_check(env, real=real, **changes)
-        env.behave(tx_file=tx_file, **(behave or {}))
+    def make(events, behave=None, telemetry=None, feed=True, real=False, time_offset=0, feed_s=0.05, **changes):
+        tx_file = setup_check(env, real=real, time_offset=time_offset, **changes)
+        env.behave(tx_file=tx_file, pulse_delay_s=time_offset, **(behave or {}))
         if feed:
-            f = Feed(env, tx_file)
+            f = Feed(env, tx_file, feed_s)
             f.start()
             feeds.append(f)
         s, warnings = turnon.Settings.from_config(env.config)
@@ -119,19 +120,19 @@ def test_the_check_runs_before_the_radar_and_is_kept_with_the_collection(env, ev
     assert summary["passed"] is True and summary["blocking"] is False and summary["blocked"] is False
     assert summary["text"].startswith("passed: strongest peak at sample 78.4, -36.0 dB at tx_gain 40 (-4.0 dB at")
     assert summary["text"].endswith("not judged: the expected peak is not set")
-    assert summary["low_power"] == {"tx_gain": 40.0, "requested_tx_gain": 72.0, "pulses": 4000}
+    assert summary["low_power"] == {"tx_gain": 40.0, "requested_tx_gain": 72.0, "pulses": 8000}
     assert [c["ok"] for c in summary["criteria"]] == [True, True, True, True, None]
     # The low-power data is in its own directory, under a name of its own.
     d = check_dir(env)
     names = set(os.listdir(d))
     assert {"config.yaml", "chirp.bin", "low_power.bin.0", "uhd_stdout.log", "uhd_stderr.log", "gps_log.txt",
             "analysis_input.json", "analysis.json", "analysis.log", "result.json"} <= names
-    assert os.path.getsize(os.path.join(d, "low_power.bin.0")) == 4 * 2352 * 8
+    assert os.path.getsize(os.path.join(d, "low_power.bin.0")) == 8 * 2352 * 8
     with open(os.path.join(d, "config.yaml")) as f:
         lp = yaml.safe_load(f)
     with open(os.path.join(env.collection_dir(), "config.yaml")) as f:
         full = yaml.safe_load(f)
-    assert lp["RF0"]["tx_gain"] == 40.0 and full["RF0"]["tx_gain"] == 72.0 and lp["CHIRP"]["num_pulses"] == 4000
+    assert lp["RF0"]["tx_gain"] == 40.0 and full["RF0"]["tx_gain"] == 72.0 and lp["CHIRP"]["num_pulses"] == 8000
     assert lp["GENERATE"] == full["GENERATE"] and lp["CHIRP"]["tx_duration"] == full["CHIRP"]["tx_duration"]
     with open(os.path.join(d, "chirp.bin"), "rb") as a, open(os.path.join(env.collection_dir(), "chirp.bin"), "rb") as b:
         assert a.read() == b.read()
@@ -198,6 +199,34 @@ def test_amplifier_current_that_does_not_rise_fails_the_check(env, events, check
     assert info["kind"] == "turn_on_check" and "amplifier current did not rise" in info["failure"]
 
 
+def test_the_default_pulse_count_gives_readings_at_the_real_telemetry_rate(env, events, check_env):
+    # As on the unit: CHIRP.time_offset before the first pulse, one telemetry status every 0.5 s.
+    pulses = common_config.DEFAULTS["manager"]["turn_on_check"]["pulses"]
+    r = check_env(events, blocking=True, time_offset=0.5, feed_s=0.5, pulses=pulses, **VERIFIED)
+    r.start(REQUEST)
+    events.wait("started", timeout=15.0)
+    r.stop("test stop")
+    events.wait("ended")
+    summary = events.wait("turn_on_check")
+    assert summary["passed"] is True and [c["ok"] for c in summary["criteria"]][:2] == [True, True]
+    assert summary["measured"]["current_readings"] >= 4 and summary["measured"]["current_max_a"] == 0.288
+
+
+def test_too_few_readings_during_short_pulses_is_not_judged_and_does_not_block(env, events, check_env):
+    # 0.8 s of pulses after a 0.5 s time_offset, telemetry at 2 Hz: at most one reading in the window.
+    r = check_env(events, blocking=True, time_offset=0.5, feed_s=0.5, pulses=4000, **VERIFIED)
+    r.start(REQUEST)
+    events.wait("started", timeout=15.0)
+    r.stop("test stop")
+    assert events.wait("ended")["failure"] == ""
+    summary = events.wait("turn_on_check")
+    during = next(c for c in summary["criteria"] if c["name"] == "amplifier_during")
+    assert summary["passed"] is True and during["ok"] is None
+    assert any("amplifier readings during the pulses" in w for w in summary["warnings"])
+    assert any("too short for 2 amplifier readings" in w for w in summary["warnings"])
+    assert "warning:" in summary["text"]
+
+
 def test_amplifier_telemetry_missing_with_the_override_is_not_judged(env, events, check_env):
     r = check_env(events, feed=False, **VERIFIED)
     with open(os.path.join(env.state_dir, "override-no-amp-telemetry"), "w") as f:
@@ -246,7 +275,7 @@ def test_the_amplifier_not_confirmed_safe_after_the_low_power_radar_is_amp_unsaf
 
 
 @pytest.mark.parametrize("mode,words,crit", [("no_data", "no complete record", "analysis"),
-                                             ("short_data", "2 records of 4", "data")])
+                                             ("short_data", "4 records of 8", "data")])
 def test_too_little_data_fails_the_check(env, events, check_env, mode, words, crit):
     r = check_env(events, behave={"radar_check": mode, "analysis": "count_data"}, blocking=True, **VERIFIED)
     r.start(REQUEST)
@@ -352,10 +381,11 @@ def test_a_power_loss_between_the_two_runs_starts_nothing(env, events, check_env
     r = check_env(events, behave={"analysis": "slow"}, analysis_timeout_s=20.0)
     r.start(REQUEST)
     deadline = time.monotonic() + 10
-    while not (r._current and r._current.check_run and r._current.check_run.radar_over):
+    while not os.path.exists(os.path.join(env.root, env.collections()[-1] if env.collections() else "x",
+                                          turnon.SUBDIR, turnon.INPUT_FILE)):
         assert time.monotonic() < deadline
         time.sleep(0.01)
-    assert env.sdr_state() == "safe"            # the low-power radar exited cleanly
+    assert env.sdr_state() == "safe"            # the low-power radar exited cleanly, its amplifier step is done
     time.sleep(0.3)                             # the analysis is running
     t0 = time.monotonic()
     r.stop("power service", urgent=True, power=True)
