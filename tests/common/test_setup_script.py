@@ -19,7 +19,7 @@ FILES = os.path.join(REPO, "setup", "files")
 FAKE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_system_tool.py")
 BASH = shutil.which("bash")
 FAKE_TOOLS = ("systemctl", "systemd-tmpfiles", "busctl", "dpkg-query", "apt-mark", "apt-get", "snap", "tailscale",
-              "id", "findmnt", "lsblk", "ps")
+              "id", "findmnt", "lsblk", "ps", "python3", "udevadm")
 REAL_TOOLS = ("cat", "cmp", "diff", "stat", "install", "ln", "mktemp", "sed", "awk", "grep", "cut", "tr", "head", "tail",
               "wc", "sync", "mv", "cp", "chmod", "rm", "dirname", "uname", "find", "readlink", "printf")
 UPDATE_UNITS = ["apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrades.service",
@@ -66,7 +66,7 @@ class System:
                  snap_hold="", tailscale_auto_update=True,
                  watchdog="0", inhibit_usec=30000000, fail="", log=[],
                  nvme_device="/dev/nvme0n1p1", nvme_uuid=UUID, nvme_label="radar-data",
-                 labels=["writable", "system-boot", "radar-data"], fstab_valid=True)
+                 other_labels=["writable", "system-boot"], fstab_valid=True)
 
     @property
     def state(self):
@@ -432,7 +432,7 @@ def test_nvme_by_label(with_fstab):
 
 @pytest.mark.parametrize("change, message", [
     (dict(nvme_label=""), "has no filesystem label"),
-    (dict(labels=["radar-data", "radar-data"]), "2 filesystems have the label"),
+    (dict(other_labels=["radar-data"]), "2 filesystems have the label"),
     (dict(nvme_label="my data"), "unsafe in /etc/fstab"),
     (dict(nvme_device=""), "/mnt/nvme is not mounted"),
     (dict(nvme_uuid="0000"), "is not the one in /etc/fstab"),
@@ -457,6 +457,101 @@ def test_nvme_by_label_refuses_unexpected_fstab(with_fstab, fstab, message):
     r = with_fstab.run("--nvme-by-label")
     assert r.returncode == 1 and message in r.stderr
     assert with_fstab.path("/etc/fstab").read_text() == fstab
+
+
+def relabelled_while_mounted(system):
+    """e2label on the mounted drive: the filesystem has the new label, udev's cache the old one."""
+    system.set(nvme_label="orca-hil", nvme_fs_label="radar-data")
+
+
+def udev(system):
+    return [call for call in system.log if call.startswith("udevadm")]
+
+
+def test_nvme_by_label_after_relabel_uses_the_real_label(with_fstab):
+    system = with_fstab
+    relabelled_while_mounted(system)
+    r = system.run("--nvme-by-label", "--dry-run")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"/etc/fstab: UUID={UUID} -> LABEL=radar-data" in r.stdout
+    assert "udev's cache is stale" in r.stdout and "the real run refreshes it" in r.stdout
+    assert "WOULD    run: udevadm trigger --action=change /dev/nvme0n1p1" in r.stdout
+    assert system.log == [] and system.path("/etc/fstab").read_text() == FSTAB
+    r = system.run("--nvme-by-label")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert udev(system) == ["udevadm trigger --action=change /dev/nvme0n1p1", "udevadm settle"]
+    assert "CHANGE   run: udevadm trigger --action=change /dev/nvme0n1p1" in r.stdout
+    assert system.state["nvme_label"] == "radar-data"
+    assert system.path("/etc/fstab").read_text() == FSTAB.replace(f"UUID={UUID}", "LABEL=radar-data")
+
+
+def test_nvme_by_label_corrects_a_label_line_that_the_drive_does_not_have(with_fstab):
+    # The state that the cached label left behind: the line names the old label.
+    system = with_fstab
+    system.path("/etc/fstab.before-radar-runner").write_text(FSTAB)
+    wrong = FSTAB.replace(f"UUID={UUID}", "LABEL=orca-hil")
+    system.path("/etc/fstab").write_text(wrong)
+    relabelled_while_mounted(system)
+    r = system.run("--nvme-by-label", "--dry-run")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "already mounted by label" not in r.stdout
+    assert ("the /mnt/nvme line says LABEL=orca-hil, but the drive mounted there (/dev/nvme0n1p1) has the "
+            "label radar-data") in r.stdout
+    assert "/etc/fstab: LABEL=orca-hil -> LABEL=radar-data" in r.stdout
+    assert system.path("/etc/fstab").read_text() == wrong
+    r = system.run("--nvme-by-label")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert system.path("/etc/fstab").read_text() == FSTAB.replace(f"UUID={UUID}", "LABEL=radar-data")
+    assert system.path("/etc/fstab.before-radar-runner").read_text() == FSTAB       # the first backup is kept
+    assert "udevadm settle" in system.log
+    r = system.run("--nvme-by-label")
+    assert r.returncode == 0 and "/mnt/nvme is already mounted by label (LABEL=radar-data)" in r.stdout
+
+
+def test_nvme_by_label_corrects_a_wrong_label_line_also_with_a_fresh_cache(with_fstab):
+    with_fstab.path("/etc/fstab").write_text(FSTAB.replace(f"UUID={UUID}", "LABEL=orca-hil"))
+    r = with_fstab.run("--nvme-by-label")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert with_fstab.path("/etc/fstab").read_text() == FSTAB.replace(f"UUID={UUID}", "LABEL=radar-data")
+    assert with_fstab.path("/etc/fstab.before-radar-runner").read_text() == FSTAB.replace(f"UUID={UUID}",
+                                                                                           "LABEL=orca-hil")
+    assert udev(with_fstab) == []                                  # nothing for udev to refresh
+
+
+def test_nvme_by_label_matching_label_line_is_done_and_the_cache_is_refreshed(with_fstab):
+    system = with_fstab
+    line = FSTAB.replace(f"UUID={UUID}", "LABEL=radar-data")
+    system.path("/etc/fstab").write_text(line)
+    relabelled_while_mounted(system)
+    r = system.run("--nvme-by-label")
+    assert r.returncode == 0 and "/mnt/nvme is already mounted by label (LABEL=radar-data)" in r.stdout
+    assert system.path("/etc/fstab").read_text() == line and not system.path("/etc/fstab.before-radar-runner").exists()
+    assert udev(system) == ["udevadm trigger --action=change /dev/nvme0n1p1", "udevadm settle"]
+
+
+@pytest.mark.parametrize("change, message", [
+    (dict(fail="fs_label.py"), "cannot read the label of the filesystem at /mnt/nvme"),
+    (dict(nvme_device=""), "/mnt/nvme is not mounted"),
+    (dict(fstab_valid=False), "does not pass 'findmnt --verify'"),
+])
+def test_nvme_by_label_refuses_to_correct_a_label_line(with_fstab, change, message):
+    wrong = FSTAB.replace(f"UUID={UUID}", "LABEL=orca-hil")
+    with_fstab.path("/etc/fstab").write_text(wrong)
+    with_fstab.set(**change)
+    r = with_fstab.run("--nvme-by-label")
+    assert r.returncode == 1 and message in r.stderr
+    assert with_fstab.path("/etc/fstab").read_text() == wrong
+
+
+def test_nvme_by_label_uniqueness_is_not_fooled_by_a_stale_cache(with_fstab):
+    system = with_fstab
+    relabelled_while_mounted(system)
+    system.set(other_labels=["radar-data"])          # another drive really has the new label
+    r = system.run("--nvme-by-label", "--dry-run")
+    assert r.returncode == 1 and "2 filesystems have the label 'radar-data'" in r.stderr
+    system.set(other_labels=["orca-hil"])            # another drive has the old label: no conflict
+    r = system.run("--nvme-by-label", "--dry-run")
+    assert r.returncode == 0 and f"/etc/fstab: UUID={UUID} -> LABEL=radar-data" in r.stdout
 
 
 # ---- optional: package holds

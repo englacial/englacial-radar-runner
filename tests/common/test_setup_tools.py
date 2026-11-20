@@ -217,6 +217,7 @@ def test_check_script_runs_and_reports_every_item():
     assert "SKIP  GPS receiver settings (asked of the receiver): not asked" in r.stdout
     assert "NMEA output on UART1" not in r.stdout
     for name in ("OS release", "kernel", "bootloader", "Tailscale", "SSH enabled", "NVMe mounted",
+                 "NVMe fstab line names the mounted drive", "NVMe label in udev's cache",
                  "orca mamba environment", "patched UHD", "ORCA checkout", "repository version",
                  "virtual environment matches uv.lock", "wheelhouse complete", "radar-power.service",
                  "power service status file", "RuntimeWatchdogSec", "watchdog device", "journal size limit",
@@ -357,6 +358,34 @@ def test_check_fails_a_receiver_that_gpsd_has_not_identified():
     assert gps_identification([dict(device, subtype="Unknown")])[0] == "FAIL"     # gpsd's placeholder
     assert gps_identification([]) == ("SKIP", "gpsd has no receiver")             # cannot tell
     assert gps_identification(None)[0] == "SKIP"
+
+
+def test_check_fails_an_fstab_line_that_would_not_mount_the_drive():
+    findings = check_function("nvme_fstab_findings")
+    uuid, dev = "4803c5eb-0612-4afa-a67b-1ad14c085f79", "/dev/nvme0n1p1"
+    # e2label on the mounted drive, then the label taken from udev's cache: the state of 2026-11-20.
+    found = {name: (status, text) for status, name, text in findings("LABEL=orca-hil", dev, uuid, "radar-data", "orca-hil")}
+    status, text = found["NVMe fstab line names the mounted drive"]
+    assert status == "FAIL" and "LABEL=orca-hil" in text and "radar-data" in text and "missing after the next boot" in text
+    status, text = found["NVMe label in udev's cache"]
+    assert status == "INFO" and "sudo udevadm trigger --action=change /dev/nvme0n1p1 && sudo udevadm settle" in text
+    found = {name: status for status, name, _ in findings("LABEL=radar-data", dev, uuid, "radar-data", "radar-data")}
+    assert found == {"NVMe fstab line names the mounted drive": "PASS", "NVMe label in udev's cache": "PASS"}
+    assert findings(f"UUID={uuid}", dev, uuid, "radar-data", "radar-data")[0][0] == "PASS"
+    status, _, text = findings("UUID=0000", dev, uuid, "radar-data", "radar-data")[0]
+    assert status == "FAIL" and f"UUID={uuid}" in text and "missing after the next boot" in text
+    assert findings("LABEL=radar-data", dev, uuid, None, "radar-data")[0][0] == "SKIP"     # label unreadable
+
+
+def test_fs_label_reads_the_filesystem_itself():
+    sys.path.insert(0, os.path.join(REPO, "setup"))
+    from fs_label import fs_label
+    mounts = [line.split() for line in open("/proc/self/mounts")]
+    root = next(m for m in mounts if m[1] == "/")
+    if root[2] != "ext4":
+        pytest.skip("/ is not ext4")
+    label = subprocess.run(["lsblk", "-no", "LABEL", root[0]], capture_output=True, text=True).stdout.strip()
+    assert fs_label("/") == label         # nobody relabels / while mounted
 
 
 # ---- check.py: the radar's hooks in the power service's config (a pure function, taken from the source)

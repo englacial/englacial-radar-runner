@@ -664,9 +664,23 @@ relying on it.
 ### `--nvme-by-label`: mount the data drive by label
 
 - **What:** in `/etc/fstab`, the `/mnt/nvme` line's `UUID=...` becomes
-  `LABEL=<the label the drive has now>` (today `orca-hil`). Nothing else on the
-  line changes. To use another label first: `sudo e2label /dev/nvme0n1p1 radar-data`.
+  `LABEL=<the label the drive has now>`. Nothing else on the line changes. To
+  use another label first: `sudo e2label /dev/nvme0n1p1 radar-data`, then run
+  the script; that order works. A `LABEL=` line that names a label the
+  mounted drive does not have is corrected the same way; one that matches is
+  left alone.
 - **Why:** any drive with the right label then works as a replacement.
+- **Label cache:** `e2label` on a mounted drive sets the label through an
+  ioctl, and udev is not told, so `lsblk`, `findmnt -o LABEL` and
+  `/dev/disk/by-label/` keep the old label until the next boot or a udev
+  refresh. The script therefore reads the label from the filesystem itself
+  (`setup/fs_label.py`, no root needed), and if udev's label differs, a real
+  run refreshes it with `udevadm trigger --action=change <device>` and
+  `udevadm settle` (a dry run says it would). `setup/check.py` fails a line
+  that would not mount the drive mounted now, and reports a stale cache.
+  By hand: `setup/fs_label.py /mnt/nvme` (the filesystem's label) against
+  `lsblk -no LABEL /dev/nvme0n1p1` (udev's) and the `/mnt/nvme` line of
+  `/etc/fstab`.
 - **Risk:** `/etc/fstab` is not a drop-in file; a broken line can stop the boot
   and with it SSH. The script therefore only touches a line that has `nofail`,
   changes one field, checks the result with `findmnt --verify`, refuses a label

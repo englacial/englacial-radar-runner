@@ -212,10 +212,22 @@ if tool == "findmnt":
         done(0 if state["fstab_valid"] else 1)
     done(0 if state["nvme_device"] else 1, state["nvme_device"] or None)
 
+# udev's cached labels ("nvme_label" for the data drive) and the label its filesystem really has
+# ("nvme_fs_label", the same unless e2label changed it while mounted).
 if tool == "lsblk":
-    if args[0] == "-rno":
-        done(0, "\n".join(state["labels"]))
+    if args[0] == "-rpno":
+        rows = [f"/dev/other{i} {label}" for i, label in enumerate(state["other_labels"])]
+        done(0, "\n".join(rows + [f"{state['nvme_device']} {state['nvme_label']}"]))
     done(0, state["nvme_uuid"] if "UUID" in args else state["nvme_label"])
+
+if tool == "python3" and args[-2:-1] and args[-2].endswith("/setup/fs_label.py"):
+    done(0, state.get("nvme_fs_label", state["nvme_label"]))
+
+if tool == "udevadm":
+    if args[:2] == ["trigger", "--action=change"] and args[2] == state["nvme_device"]:
+        state["nvme_label"] = state.get("nvme_fs_label", state["nvme_label"])     # udev reads the device again
+        done(0, record=True)
+    done(0 if args == ["settle"] else 1, record=True)
 
 print(f"fake_system_tool: no stand-in for {tool}", file=sys.stderr)
 done(127, record=True)

@@ -855,18 +855,19 @@ step_time() {
 
 # OPTIONAL (--nvme-by-label). Edits /etc/fstab, which is not a drop-in file.
 # Only the source field of the /mnt/nvme line is changed, and only if that
-# line has "nofail", so that a missing drive cannot stop the boot.
+# line has "nofail", so that a missing drive cannot stop the boot. The label
+# is read from the filesystem itself: after e2label on a mounted drive, udev's
+# cache (lsblk, findmnt, /dev/disk/by-label/) still has the old one.
 optional_nvme_by_label() {
     step "OPTIONAL: mount /mnt/nvme by label instead of UUID"
-    local fstab=$DESTDIR/etc/fstab mnt=/mnt/nvme spec opts dev uuid label count
+    local fstab=$DESTDIR/etc/fstab mnt=/mnt/nvme spec opts dev uuid label cached count
     count=$(awk -v m="$mnt" '$1 !~ /^#/ && $2 == m' "$fstab" | wc -l)
     [ "$count" -eq 1 ] || die "expected exactly one line for $mnt in /etc/fstab, found $count"
     spec=$(awk -v m="$mnt" '$1 !~ /^#/ && $2 == m {print $1}' "$fstab")
     opts=$(awk -v m="$mnt" '$1 !~ /^#/ && $2 == m {print $4}' "$fstab")
     case "$spec" in
-        LABEL=*) ok "$mnt is already mounted by label ($spec)"; return 0 ;;
-        UUID=*) ;;
-        *) die "the $mnt line in /etc/fstab starts with $spec; expected UUID=..." ;;
+        UUID=*|LABEL=*) ;;
+        *) die "the $mnt line in /etc/fstab starts with $spec; expected UUID=... or LABEL=..." ;;
     esac
     case ",$opts," in
         *,nofail,*) ;;
@@ -875,11 +876,29 @@ optional_nvme_by_label() {
     dev=$(findmnt -n -o SOURCE "$mnt" 2>/dev/null || true)
     [ -n "$dev" ] || die "$mnt is not mounted, so the drive and its label cannot be checked"
     uuid=$(lsblk -no UUID "$dev")
-    label=$(lsblk -no LABEL "$dev")
-    [ "UUID=$uuid" = "$spec" ] || die "the drive mounted at $mnt ($dev, UUID $uuid) is not the one in /etc/fstab ($spec)"
+    case "$spec" in
+        UUID=*) [ "UUID=$uuid" = "$spec" ] || die "the drive mounted at $mnt ($dev, UUID $uuid) is not the one in /etc/fstab ($spec)" ;;
+    esac
+    label=$(python3 -B "$REPO/setup/fs_label.py" "$mnt") || die "cannot read the label of the filesystem at $mnt"
+    cached=$(lsblk -no LABEL "$dev")
+    if [ "$cached" != "$label" ]; then
+        note "udev has the label '$cached' for $dev, its filesystem has '$label' (relabelled while mounted)"
+        [ "$DRY_RUN" -eq 0 ] || note "udev's cache is stale; the real run refreshes it:"
+        run udevadm trigger --action=change "$dev"
+        [ "$DRY_RUN" -eq 1 ] || udevadm settle || die "command failed: udevadm settle"
+    fi
+    if [ "$spec" = "LABEL=$label" ]; then
+        ok "$mnt is already mounted by label ($spec)"
+        return 0
+    fi
+    case "$spec" in
+        LABEL=*) note "the $mnt line says $spec, but the drive mounted there ($dev) has the label ${label:-(none)}: at the next boot it would not be mounted" ;;
+    esac
     [ -n "$label" ] || die "$dev has no filesystem label. Set one first, for example: e2label $dev radar-data"
     [[ "$label" =~ ^[A-Za-z0-9_.-]+$ ]] || die "the label '$label' has characters that are unsafe in /etc/fstab"
-    count=$(lsblk -rno LABEL | grep -cxF -- "$label" || true)
+    # This drive by its real label, the others by udev's cache (an unmounted one cannot be asked without root).
+    count=$(lsblk -rpno NAME,LABEL | awk -v d="$dev" -v l="$label" '$1 != d && $2 == l' | wc -l)
+    count=$((count + 1))
     [ "$count" -eq 1 ] || die "$count filesystems have the label '$label'; it must be unique"
     change "/etc/fstab: $spec -> LABEL=$label on the $mnt line (backup: /etc/fstab.before-radar-runner)"
     [ "$DRY_RUN" -eq 0 ] || return 0
