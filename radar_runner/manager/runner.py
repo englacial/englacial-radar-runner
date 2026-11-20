@@ -189,6 +189,7 @@ class _Run:
     parent = None           # set on the low-power radar of the turn-on check (_CheckRun)
     check_run = None        # that radar, while and after it runs
     max_run_s = None        # a radar that has printed its start line must have exited this long after it
+    exit_uptime = None      # when the radar process was found gone
 
     def __init__(self, request, flags):
         self.request = dict(request)
@@ -783,7 +784,7 @@ class Runner:
             self._after_radar(run)
         with self._lock:
             run.radar_over = True
-        self.last_activity_uptime = self._uptime()
+        run.exit_uptime = self.last_activity_uptime = self._uptime()
 
         for thread in readers:
             thread.join(5.0)        # the pipes close when the radar is gone

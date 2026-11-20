@@ -229,6 +229,35 @@ def test_too_few_readings_during_short_pulses_is_not_judged_and_does_not_block(e
     assert "warning:" in summary["text"]
 
 
+def test_the_readings_window_ends_at_the_check_radars_own_exit(env, events, check_env):
+    # A reading after the exit says "enabled": the reset tool runs (1 s) after the low-power radar. The
+    # readings in that time (idle current, no pulses) must not count as "during the pulses".
+    env.config["manager"]["amp_safe"]["confirm_settle_s"] = 0.0
+    r = check_env(events, telemetry=Telemetry(state=False, text="amplifier current 2.5 A"),
+                  behave={"amp_safe_s": 1.0})
+    r.start(REQUEST)
+    events.wait("started", timeout=15.0)
+    r.stop("test stop")
+    events.wait("ended", timeout=15.0)
+    res = result(env)
+    assert res["radar"]["amp_safe_command_run"] is True
+    assert res["readings"]["during"] and all(x["current_a"] == 0.288 for x in res["readings"]["during"])
+
+
+def test_the_amplifier_step_of_the_check_radar_reaches_the_run_after_an_internal_error(env, events, check_env):
+    r = check_env(events, behave={"radar_check": "fail_start", "amp_safe": 5})
+    real = r._radar
+
+    def radar_then_bug(run, argv, cwd):
+        real(run, argv, cwd)
+        if run.parent is not None:
+            raise ZeroDivisionError("bug after the check radar")
+    r._radar = radar_then_bug
+    r.start(REQUEST)
+    info = events.wait("ended")
+    assert info["kind"] == "internal" and info["amp_safe"] is False and not info["launched"]
+
+
 def test_amplifier_telemetry_missing_with_the_override_is_not_judged(env, events, check_env):
     r = check_env(events, feed=False, **VERIFIED)
     with open(os.path.join(env.state_dir, "override-no-amp-telemetry"), "w") as f:

@@ -179,7 +179,8 @@ warning in the result, since they cannot be relied on for the readings.
 peaks, `expected.delay_samples` how much later the direct signal between the
 antennas peaks. If the delay is at least `min_separation_samples` (4), the
 leakage peak is looked for within `tolerance_samples` (1.5) of its place, and the
-direct peak within the tolerance of the found leakage peak plus the delay. If it
+direct peak within the tolerance of the found leakage peak plus the delay (the
+tolerance must then be below the delay, else the expected values are refused). If it
 is shorter, the two form one peak (one sample is 5.4 m of path in air, and a
 30 MHz chirp spreads each peak over about 3 samples): the level of that combined
 peak, at `leakage_sample + delay_samples`, is judged. Either way the direct (or

@@ -167,11 +167,19 @@ class Settings:
                 warnings.append(f"manager.turn_on_check.{low} must be below {high}: the defaults are used")
         take("current_max_a", lambda v: v > out["idle_current_max_a"], "must be above idle_current_max_a")
         take("tolerance_samples", lambda v: 0 < v <= 50, "must be above 0 and at most 50", e)
+        cap = config["manager"]["limits"]["max_tx_gain"]
+        if out["max_tx_gain"] >= cap:
+            warnings.append(f"manager.turn_on_check.max_tx_gain ({out['max_tx_gain']:g}) is not below "
+                            f"manager.limits.max_tx_gain ({cap:g}): the low-power run may be at full power")
         if e["verified"]:
+            two_peak = e["delay_samples"] >= out["min_separation_samples"]
             problems = [why for ok, why in ((e["leakage_sample"] >= 1, "leakage_sample at least 1"),
                                             (e["delay_samples"] >= 0, "delay_samples not negative"),
                                             (e["level_tx_gain"] > 0, "level_tx_gain above 0"),
-                                            (e["min_level_db"] < 0, "min_level_db below 0")) if not ok]
+                                            (e["min_level_db"] < 0, "min_level_db below 0"),
+                                            # else the leakage peak lies in the direct peak's window
+                                            (not two_peak or out["tolerance_samples"] < e["delay_samples"],
+                                             "tolerance_samples must be below delay_samples")) if not ok]
             if problems:
                 warnings.append("manager.turn_on_check.expected is marked verified but needs "
                                 + ", ".join(problems) + ": the check only records")
@@ -383,13 +391,17 @@ def judge(s, facts, before, override, during, measurement, analysis_error=""):
             f"up to {top:.3f} A in {len(currents)} readings ({idle:.3f} A idle)")
 
     m = measurement or {}
+    if measurement is not None and not analysis_error and "error" not in m and not _finite(m):
+        analysis_error = "a measured value is not a finite number"
+    if gain >= requested:
+        warnings.append(f"the check ran at the requested tx_gain {requested:g}: it is not at low power")
     if analysis_error or "error" in m:
         add("analysis", False, f"the analysis failed: {analysis_error or m['error']}")
     elif measurement is not None:
         records, wanted = m.get("records", 0), m.get("records_expected") or facts["records"]
         add("data", records >= wanted, f"{records} records" + ("" if records >= wanted else f" of {wanted}"))
         raw = m["raw_max_fs"]
-        clipped = raw >= s.clip_fs
+        clipped = not raw < s.clip_fs
         add("clipping", not clipped, f"raw maximum {raw:.3f} of full scale" +
             (f", at or above {s.clip_fs:g}: clipping" if clipped else ""))
         strongest = m["strongest"]
@@ -443,6 +455,16 @@ def judge(s, facts, before, override, during, measurement, analysis_error=""):
     return out
 
 
+def _finite(m):
+    """The numbers that are judged are all finite (a NaN would pass every comparison)."""
+    values = [m.get("raw_max_fs"), (m.get("strongest") or {}).get("level_db")]
+    for name in ("direct", "leakage"):
+        peak = m.get(name)
+        if isinstance(peak, dict) and peak.get("found"):
+            values += [peak.get("level_db"), peak.get("sample")]
+    return all(type(v) in (int, float) and math.isfinite(v) for v in values)
+
+
 def summary_text(result):
     """One line for the status, the journal and the alerts."""
     if result.get("stopped"):
@@ -475,6 +497,11 @@ class TurnOnCheck:
         try:
             passed, text = self._check(run, result)
         finally:
+            check = run.check_run
+            if check is not None and check.amp_safe is False and run.amp_safe is not False:
+                # On every path, also an internal error: the run reports what the amplifier step found.
+                run.amp_safe, run.amp_safe_ran = False, check.amp_safe_ran
+                run.amp_safe_detail = f"after the turn-on check's radar: {check.amp_safe_detail}"
             result["duration_s"] = round(time.monotonic() - started, 2)
             self._record(run, result)
         return passed, text
@@ -531,7 +558,7 @@ class TurnOnCheck:
         finally:
             sampler.halt.set()
             sampler.join(2.0)
-        exit_uptime = runner.last_activity_uptime
+        exit_uptime = check.exit_uptime if check.exit_uptime is not None else runner.last_activity_uptime
         result["radar"] = {k: v for k, v in check.info().items() if k in (
             "launched", "started", "exit_status", "killed", "failure", "kind", "signalled_before_start",
             "amp_safe", "amp_safe_command_run", "amp_safe_detail")}

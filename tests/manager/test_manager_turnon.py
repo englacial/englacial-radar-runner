@@ -65,6 +65,23 @@ def test_a_setting_that_cannot_work_is_refused_and_the_default_used(name, value)
     assert getattr(s, name) == getattr(default, name) and name in warnings[0]
 
 
+def test_a_tolerance_that_reaches_the_leakage_is_refused_in_two_peak_mode():
+    # With tolerance 5 and delay 4 the leakage peak itself lies within the direct peak's window.
+    for tolerance in (5.0, 4.0):
+        s, warnings = turnon.Settings.from_config(config(**dict(VERIFIED, delay_samples=4.0,
+                                                                tolerance_samples=tolerance)))
+        assert not s.verified and "tolerance_samples must be below delay_samples" in warnings[0]
+    assert settings(**dict(VERIFIED, delay_samples=4.0, tolerance_samples=1.5)).verified
+    assert settings(**dict(VERIFIED, delay_samples=2.0, tolerance_samples=3.0)).verified    # combined: no matter
+
+
+def test_a_low_power_cap_not_below_the_radars_cap_is_a_warning():
+    c = config()
+    c["manager"]["limits"]["max_tx_gain"] = 40.0
+    _, warnings = turnon.Settings.from_config(c)
+    assert "max_tx_gain (40) is not below manager.limits.max_tx_gain (40)" in warnings[0]
+
+
 def test_limits_that_cross_are_refused_together():
     s, warnings = turnon.Settings.from_config(config(idle_current_min_a=0.3, idle_current_max_a=0.2))
     assert (s.idle_current_min_a, s.idle_current_max_a) == (0.10, 0.20) and "must be below" in warnings[0]
@@ -256,6 +273,19 @@ def test_data_clipping_and_analysis():
     assert failing(r) == ["analysis"] and "no result within 30 s" in r["reason"]
     r = judged(m={"records": 0, "records_expected": 8, "error": "no complete record in the data"})
     assert failing(r) == ["analysis"] and "no complete record" in r["reason"]
+
+
+def test_a_measurement_that_is_not_a_number_is_a_failed_analysis():
+    r = judged(m=measurement(raw=float("nan")))
+    assert failing(r) == ["analysis"] and "not a finite number" in r["reason"]
+    r = judged(m=measurement(level=float("nan")))
+    assert failing(r) == ["analysis"]
+
+
+def test_a_low_power_run_at_the_requested_gain_is_noted():
+    r = turnon.judge(settings(**VERIFIED), dict(FACTS, requested_tx_gain=40.0), IDLE, False,
+                     during(0.288, 0.3), measurement())
+    assert any("at the requested tx_gain 40: it is not at low power" in w for w in r["warnings"])
 
 
 def test_clipping_at_the_requested_power_is_a_warning():
