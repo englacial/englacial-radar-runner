@@ -570,6 +570,31 @@ def test_nvme_by_label_refuses_to_correct_a_label_line(with_fstab, change, messa
     assert with_fstab.path("/etc/fstab").read_text() == wrong
 
 
+def test_nvme_by_label_keeps_a_label_line_that_means_another_drive_that_is_present(with_fstab):
+    # The data drive is present but not mounted; another drive ("spare") is mounted at /mnt/nvme.
+    line = FSTAB.replace(f"UUID={UUID}", "LABEL=radar-data")
+    with_fstab.path("/etc/fstab").write_text(line)
+    with_fstab.set(nvme_label="spare", other_labels=["writable", "system-boot", "radar-data"])
+    r = with_fstab.run("--nvme-by-label", "--dry-run")
+    assert r.returncode == 1 and "LABEL=radar-data means another drive that is present (/dev/other2)" in r.stderr
+    assert "WOULD    /etc/fstab" not in r.stdout
+    r = with_fstab.run("--nvme-by-label")
+    assert r.returncode == 1 and with_fstab.path("/etc/fstab").read_text() == line
+
+
+@pytest.mark.parametrize("change, message", [
+    (dict(nvme_device="/dev/mmcblk0p2"), "/dev/mmcblk0p2 is the device of the root filesystem"),
+    (dict(nvme_type="loop"), "/dev/nvme0n1p1 is a loop device, not a disk or partition"),
+])
+@pytest.mark.parametrize("spec", [f"UUID={UUID}", "LABEL=orca-hil"])
+def test_nvme_by_label_refuses_a_mount_that_is_not_a_data_drive(with_fstab, change, message, spec):
+    line = FSTAB.replace(f"UUID={UUID}", spec)
+    with_fstab.path("/etc/fstab").write_text(line)
+    with_fstab.set(**change)
+    r = with_fstab.run("--nvme-by-label", "--dry-run")
+    assert r.returncode == 1 and message in r.stderr and "WOULD    /etc/fstab" not in r.stdout
+
+
 def test_nvme_by_label_uniqueness_is_not_fooled_by_a_stale_cache(with_fstab):
     system = with_fstab
     relabelled_while_mounted(system)

@@ -222,6 +222,8 @@ if tool == "findmnt":
         errors += state.get("verify_errors", [])
         lines = [f"\n0 parse errors, {len(errors)} error{'' if len(errors) == 1 else 's'}, 0 warnings"]
         done(1 if errors else 0, "\n".join(lines + (["/mnt/nvme"] if errors else []) + ["   " + e for e in errors]))
+    if args[-1] == "/":
+        done(0, state.get("root_device", "/dev/mmcblk0p2"))
     done(0 if state["nvme_device"] else 1, state["nvme_device"] or None)
 
 # udev's cached labels ("nvme_label" for the data drive) and the label its filesystem really has
@@ -230,6 +232,8 @@ if tool == "lsblk":
     if args[0] == "-rpno":
         rows = [f"/dev/other{i} {label}" for i, label in enumerate(state["other_labels"])]
         done(0, "\n".join(rows + [f"{state['nvme_device']} {state['nvme_label']}"]))
+    if "TYPE" in args:
+        done(0, state.get("nvme_type", "part"))
     done(0, state["nvme_uuid"] if "UUID" in args else state["nvme_label"])
 
 if tool == "python3" and args[-2:-1] and args[-2].endswith("/setup/fs_label.py"):

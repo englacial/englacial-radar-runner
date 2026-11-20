@@ -875,7 +875,7 @@ verify_fstab() {        # verify_fstab FILE LABEL MOUNT_POINT: findmnt --verify 
 
 optional_nvme_by_label() {
     step "OPTIONAL: mount /mnt/nvme by label instead of UUID"
-    local fstab=$DESTDIR/etc/fstab mnt=/mnt/nvme spec opts dev uuid label cached count
+    local fstab=$DESTDIR/etc/fstab mnt=/mnt/nvme spec opts dev type uuid label cached others count
     count=$(awk -v m="$mnt" '$1 !~ /^#/ && $2 == m' "$fstab" | wc -l)
     [ "$count" -eq 1 ] || die "expected exactly one line for $mnt in /etc/fstab, found $count"
     spec=$(awk -v m="$mnt" '$1 !~ /^#/ && $2 == m {print $1}' "$fstab")
@@ -890,6 +890,12 @@ optional_nvme_by_label() {
     esac
     dev=$(findmnt -n -o SOURCE "$mnt" 2>/dev/null || true)
     [ -n "$dev" ] || die "$mnt is not mounted, so the drive and its label cannot be checked"
+    [ "$dev" != "$(findmnt -n -o SOURCE / 2>/dev/null || true)" ] || die "$dev is the device of the root filesystem, not a data drive"
+    type=$(lsblk -dno TYPE "$dev" 2>/dev/null || true)
+    case "$type" in
+        part|disk) ;;
+        *) die "$dev is a ${type:-unknown} device, not a disk or partition" ;;
+    esac
     uuid=$(lsblk -no UUID "$dev")
     case "$spec" in
         UUID=*) [ "UUID=$uuid" = "$spec" ] || die "the drive mounted at $mnt ($dev, UUID $uuid) is not the one in /etc/fstab ($spec)" ;;
@@ -905,6 +911,11 @@ optional_nvme_by_label() {
         ok "$mnt is already mounted by label ($spec)"
         return 0
     fi
+    # Like a UUID= line for another drive: a LABEL= line that another present drive has is not this one's.
+    others=$(lsblk -rpno NAME,LABEL | awk -v d="$dev" -v l="${spec#LABEL=}" '$1 != d && $2 == l {print $1}')
+    case "$spec" in
+        LABEL=*) [ -z "$others" ] || die "the $mnt line's $spec means another drive that is present (${others//$'\n'/ }), not $dev, which is mounted there; not changing it" ;;
+    esac
     case "$spec" in
         LABEL=*) note "the $mnt line says $spec, but the drive mounted there ($dev) has the label ${label:-(none)}: at the next boot it would not be mounted" ;;
     esac

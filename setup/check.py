@@ -328,17 +328,24 @@ def _(name):
 section("Storage")
 
 
-def nvme_fstab_findings(spec, device, uuid, label, cached_label):
+def nvme_fstab_findings(spec, device, uuid, label, cached_label, others):
     """Would the /etc/fstab line's source `spec` mount the drive that is at /mnt/nvme now? `label` is the
     filesystem's own label (None if unreadable), `cached_label` udev's, which e2label on a mounted drive
-    does not update. Returns (status, name, observed) items."""
+    does not update; `others`: {device: label} of the other devices, from udev's cache.
+    Returns (status, name, observed) items."""
     name = "NVMe fstab line names the mounted drive"
     by, _, value = spec.partition("=")
     if by == "LABEL" and label is None:
         found = [(SKIP, name, f"{spec}: the label of the filesystem at /mnt/nvme cannot be read")]
     elif by in ("LABEL", "UUID"):
         has = label if by == "LABEL" else uuid
-        fix = "sudo setup/setup.sh --nvme-by-label corrects it" if by == "LABEL" else "correct the line by hand"
+        meant = [d for d, other in others.items() if other == value] if by == "LABEL" else []
+        if meant:       # setup.sh refuses to change such a line
+            fix = f"{spec} is another drive that is present, {', '.join(meant)}; decide by hand which one belongs here"
+        elif by == "LABEL":
+            fix = "sudo setup/setup.sh --nvme-by-label corrects it"
+        else:
+            fix = "correct the line by hand"
         found = [(PASS, name, spec) if value == has else
                  (FAIL, name, f"the line names {spec}, the drive mounted at /mnt/nvme ({device}) has {by}={has}: "
                               f"it would be missing after the next boot ({fix})")]
@@ -379,9 +386,11 @@ def _(name):
         label = fs_label("/mnt/nvme")
     except OSError:
         label = None
-    for finding in nvme_fstab_findings(spec, out("findmnt", "-n", "-o", "SOURCE", "/mnt/nvme"),
-                                       out("findmnt", "-n", "-o", "UUID", "/mnt/nvme"), label,
-                                       out("findmnt", "-n", "-o", "LABEL", "/mnt/nvme")):
+    device = out("findmnt", "-n", "-o", "SOURCE", "/mnt/nvme")
+    rows = [row.split(" ", 1) for row in out("lsblk", "-rpno", "NAME,LABEL").split("\n")]
+    others = {row[0]: row[1] for row in rows if len(row) == 2 and row[1] and row[0] != device}
+    for finding in nvme_fstab_findings(spec, device, out("findmnt", "-n", "-o", "UUID", "/mnt/nvme"), label,
+                                       out("findmnt", "-n", "-o", "LABEL", "/mnt/nvme"), others):
         report(*finding)
 
 
