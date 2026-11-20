@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from alerts_rig import BOOT_B, LAT, LON, POSITION_STRINGS, TOKEN, TOPIC, Rig
+from alerts_rig import BOOT_A, BOOT_B, LAT, LON, POSITION_STRINGS, TOKEN, TOPIC, Rig
 from fake_ntfy import FakeNtfy, closed_port
 from radar_runner.alerts import logic as L
 
@@ -838,10 +838,15 @@ def summaries(server):
 
 @pytest.mark.parametrize("meta, wording", [
     # The clock at the start of the run may not have been set yet: the uptime stamps tell how long.
-    ({"created": {"time_utc": "1970-01-01T00:01:10Z", "uptime_s": 860.0},
+    ({"boot_id": BOOT_A, "created": {"time_utc": "1970-01-01T00:01:10Z", "uptime_s": 860.0},
       "recording_started": {"time_utc": "1970-01-01T00:01:12Z", "uptime_s": 870.0}}, "recording now (for 2 min)"),
-    ({"created": {"time_utc": "1970-01-01T00:01:10Z", "uptime_s": 870.0}}, "recording now (created 2 min ago)"),
-    ({"created": {"time_utc": "2026-11-20T05:46:29Z"}}, "recording now (started 05:46:29 UTC)"),  # no uptime stamp
+    ({"boot_id": BOOT_A, "created": {"time_utc": "1970-01-01T00:01:10Z", "uptime_s": 870.0}},
+     "recording now (created 2 min ago)"),
+    ({"boot_id": BOOT_A, "created": {"time_utc": "2026-11-20T05:46:29Z"}}, "recording now (started 05:46:29 UTC)"),
+    # Uptime stamps of another boot, or of a boot not known, say nothing about this one.
+    ({"boot_id": BOOT_B, "created": {"time_utc": "2026-11-20T05:46:29Z", "uptime_s": 870.0}},
+     "recording now (started 05:46:29 UTC)"),
+    ({"created": {"time_utc": "2026-11-20T05:46:29Z", "uptime_s": 870.0}}, "recording now (started 05:46:29 UTC)"),
 ])
 def test_a_collection_being_recorded_is_not_called_cut_off(tmp_path, server, meta, wording):
     rig = Rig(tmp_path, server.url)
@@ -872,16 +877,19 @@ def test_an_open_collection_when_no_run_is_under_way(tmp_path, server, manager, 
     assert wording in summaries(server)[0]["message"]
 
 
-@pytest.mark.parametrize("name, wording", [
-    ("b00042_s001_20261120T054629Z", "no end recorded yet (started 05:46:29 UTC; a run is starting)"),
-    ("b00041_s003_20261120T054629Z", "cut off (no end recorded: power cut or crash)"),     # from a boot before
+@pytest.mark.parametrize("boot_id, wording", [
+    (BOOT_A, "no end recorded yet (created 2 min ago; a run is starting)"),
+    (BOOT_B, "cut off (no end recorded: power cut or crash)"),          # from a boot before
+    (None, "cut off (no end recorded: power cut or crash)"),            # not known to be from this boot
 ])
-def test_a_collection_just_created_by_a_run_that_is_starting_is_not_called_cut_off(tmp_path, server, name, wording):
+def test_a_collection_just_created_by_a_run_that_is_starting_is_not_called_cut_off(tmp_path, server, boot_id, wording):
     # The runner has made the directory; the manager names it only once the runner's event has come.
     rig = Rig(tmp_path, server.url)
-    col = rig.collections / name
+    rig.telemetry.pop("boot_count")                 # the boot number not known: only the boot ID tells
+    col = rig.collections / "b00042_s001_20261120T054629Z"
     col.mkdir()
-    (col / "collection.json").write_text(json.dumps({"created": {"time_utc": "2026-11-20T05:46:29Z"}, "end": None}))
+    (col / "collection.json").write_text(json.dumps({"boot_id": boot_id, "end": None,
+                                                     "created": {"time_utc": "2026-11-20T05:46:29Z", "uptime_s": 870.0}}))
     rig.manager = {"state": "starting", "not_ready": [], "collection": None}
     rig.start()
     rig.tick(3)

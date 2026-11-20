@@ -102,7 +102,7 @@ def scan_collections(root):
             found.append((int(m.group(1)), int(m.group(2)), name))
     if not found:
         return {"count": 0, "last": None}
-    boot, _, name = max(found)
+    name = max(found)[2]
     directory = os.path.join(root, name)
     meta = {}
     try:
@@ -132,7 +132,8 @@ def scan_collections(root):
     began = began.get("time_utc") if isinstance(began.get("time_utc"), str) else ""
     uptimes = {key: x.get("uptime_s") if type(x.get("uptime_s")) in (int, float) else None
                for key, x in (("started_uptime_s", started or {}), ("created_uptime_s", created))}
-    return {"count": len(found), "last": {"name": name, "boot": boot, "how": how, "open": bool(meta) and end is None,
+    boot_id = meta.get("boot_id") if isinstance(meta.get("boot_id"), str) else None
+    return {"count": len(found), "last": {"name": name, "boot_id": boot_id, "how": how, "open": bool(meta) and end is None,
                                           "started_utc": began, **uptimes,
                                           "reason": str(end.get("reason") or "") if end else "",
                                           "recorded_s": recorded, "data_gb": size / 1e9}}
@@ -576,18 +577,20 @@ class Alerts(Service):
             # No end in collection.json: being recorded, or cut off. The manager's status tells which.
             started = last.get("started_utc", "")
             started = f"started {started[11:19]} UTC" if len(started) >= 19 else "start time not known"
-            # A run of this boot: how long, from the uptime stamps (the clock at its start may not have
-            # been set yet). The time of day only when there is no uptime stamp.
+            # A run of this boot (its boot ID): how long, from the uptime stamps (the clock at its start
+            # may not have been set yet). The time of day otherwise, or when there is no uptime stamp.
+            this_boot = bool(self.boot_id) and last.get("boot_id") == self.boot_id
+
             def ago(key):
                 up = last.get(key)
-                return now - up if type(up) in (int, float) and 0 <= up <= now else None
+                return now - up if this_boot and type(up) in (int, float) and 0 <= up <= now else None
             recording, created = ago("started_uptime_s"), ago("created_uptime_s")
             since = (f"for {L._duration(recording)}" if recording is not None else
                      f"created {L._duration(created)} ago" if created is not None else started)
             run = man.ok and man.data.get("state") in ("starting", "running", "stopping")
             if run and man.data.get("collection") == last.get("name"):
                 last["how"] = f"recording now ({since})"
-            elif run and man.data.get("collection") is None and self.boot in (None, last.get("boot")):
+            elif run and man.data.get("collection") is None and this_boot:
                 # The runner has made the directory; the manager names it once the runner's event is in.
                 last["how"] = f"no end recorded yet ({since}; a run is starting)"
             elif not man.ok:
