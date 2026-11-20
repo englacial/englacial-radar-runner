@@ -828,18 +828,20 @@ def test_odd_fields_in_the_other_services_status_do_not_keep_the_summary_from_go
     assert "Config warnings: 4" in s["message"]
 
 
-@pytest.mark.parametrize("change", [
-    lambda t: t["sources"]["pi"].update(values=[900.0]),
-    lambda t: t["sources"].update(pi=["ok"]),
-    lambda t: t.update(logging="primary"),
+@pytest.mark.parametrize("change, title", [
+    (lambda t: t["sources"]["pi"].update(values=[900.0]), "GPS: no data from the receiver"),
+    (lambda t: t["sources"].update(pi=["ok"]), "GPS: no data from the receiver"),
+    (lambda t: t.update(logging="primary"), "GPS: no data from the receiver"),
+    (lambda t: t["sources"]["gps"].update(no_position=["x"]), "GPS: no data from the receiver"),
+    (lambda t: t["sources"]["gps"].update(health={"a": 1}), "GPS: no fix"),
 ])
-def test_odd_parts_of_the_telemetry_status_do_not_stop_the_conditions(tmp_path, server, change):
+def test_odd_parts_of_the_telemetry_status_do_not_stop_the_conditions(tmp_path, server, change, title):
     rig = Rig(tmp_path, server.url, **{"conditions.gps_s": 5.0})
-    change(rig.telemetry)
     rig.telemetry["sources"]["gps"].update(health="stale", reason="no data")
+    change(rig.telemetry)
     rig.start()
     status = rig.tick(10)
-    assert "conditions" not in status["errors"] and "test-unit: GPS: no data from the receiver" in titles(server)
+    assert "conditions" not in status["errors"] and f"test-unit: {title}" in titles(server)
 
 
 def test_a_summary_that_cannot_be_put_together_still_goes_out_once(tmp_path, server, monkeypatch):

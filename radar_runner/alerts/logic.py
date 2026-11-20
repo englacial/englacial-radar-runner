@@ -305,8 +305,9 @@ def condition_states(reads, cfg, tracked=()):
                                "The radar still runs; its data lacks positions.", cfg["gps_s"])
         else:
             problem = gps.get("health") != "ok" or bool(gps.get("reason"))
-            out["gps"] = State(problem, DEFAULT, GPS_TITLES.get(gps.get("no_position"))
-                               or GPS_TITLES.get(gps.get("health")) or "GPS: no fix",
+            # Looked up only as texts: a list there would be an unhashable key.
+            titles = [GPS_TITLES.get(gps.get(k)) for k in ("no_position", "health") if isinstance(gps.get(k), str)]
+            out["gps"] = State(problem, DEFAULT, next((t for t in titles if t), "GPS: no fix"),
                                f"GPS {gps.get('health')}: {gps.get('reason') or 'no fix'}. The radar still runs; "
                                "its data lacks positions.", cfg["gps_s"])
         logs = d.get("logging") if isinstance(d.get("logging"), dict) else {}
