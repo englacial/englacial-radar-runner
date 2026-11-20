@@ -175,3 +175,24 @@ def test_an_unconfigured_server_or_topic_sends_nothing(server):
     assert ntfy.publish("http://ntfy.sh", "t", "-", ALERT, 1.0).kind == ntfy.UNCONFIGURED
     assert ntfy.publish(server.url, "-", "-", ALERT, 1.0).kind == ntfy.UNCONFIGURED
     assert server.attempts == 0
+
+
+@pytest.mark.parametrize("answer, sent", [
+    (b"HTTP/1.1 200 OK\r\n", False),                                                   # status line, then closed
+    (b"HTTP/1.1 200 OK\r\nContent-Type: applica", False),                              # cut in the headers
+    (b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n{\"id\": \"m1\"", False),          # short body
+    (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"id\"\r\n", False),  # chunked, cut
+    (b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{\"id\": 12}", True),               # whole
+    (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3\r\n: 1\r\n1\r\n}\r\n0\r\n\r\n", True),
+])
+def test_only_a_whole_answer_counts_as_sent(answer, sent):
+    def reply(conn):
+        conn.recv(65536)
+        conn.sendall(answer)
+        conn.close()
+    url, sock = raw_server(reply)
+    r = send(url, timeout=3.0)
+    sock.close()
+    assert (r.kind == ntfy.SENT) is sent, r
+    if not sent:
+        assert r.kind == ntfy.RETRY

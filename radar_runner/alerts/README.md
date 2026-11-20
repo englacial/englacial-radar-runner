@@ -175,11 +175,15 @@ elsewhere).
 Each send runs in a thread of its own; the loop never waits on the network for
 more than half a second per round, so the watchdog pings and the status file go
 on. A send is given up on after `ntfy.timeout_s` (15 s) in all, a server that
-sends one byte at a time included: its socket is shut, which ends a connect, a
-TLS handshake or a read at once. A DNS lookup cannot be ended that way: such a
-send runs on in its thread until the lookup gives up, and no new send starts
-while two are left like that. A send that was cut off is never counted as
-sent, unless its whole answer had come before.
+sends one byte at a time included: its socket is shut, which ends a read at
+once. A DNS lookup, a TCP connect or a TLS handshake in progress is not ended
+that way: a connect or handshake ends at the 10 s socket timeout, a lookup when
+the resolver gives up; the send runs on in its thread meanwhile (the loop and a
+stop do not wait for it), and no new send starts while two are left like that.
+Sent means a complete 2xx answer: the end of the headers and the whole body
+(Content-Length matched, or the end of a chunked body). A connection that
+closes before that, or a send that was cut off before its answer was whole, is
+never counted as sent.
 
 | Answer | Then |
 |---|---|

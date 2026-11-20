@@ -13,10 +13,15 @@ has to fit into an HTTP header. The token goes in `Authorization: Bearer`.
   address), and the connection is ours, so it can be shut from outside.
 * Each send runs in a thread of its own (`Send`). The caller never waits on
   the network: it looks at `done`, and `cancel()` shuts the socket, which ends
-  a connect, a TLS handshake or a read at once. Only a DNS lookup cannot be
-  ended (getaddrinfo); a cancelled send then finishes when the lookup gives
-  up. A cancelled send is never reported as sent unless its whole answer had
-  been read before the cancel.
+  a read of the request or the answer at once. A DNS lookup, a TCP connect or a
+  TLS handshake in progress is not ended by it: those end when they give up
+  (the connect and the handshake at the 10 s socket timeout, the lookup when
+  the resolver gives up). Neither the caller nor a stop waits for them. A
+  cancelled send is never reported as sent unless its whole answer had been
+  read before the cancel.
+* Sent means a 2xx answer that is complete: the end of the headers and the
+  whole body (its Content-Length, or the end of a chunked body). A connection
+  that closes before that is a retry, never "sent".
 
 The result says what to do with the alert: sent (delete it), retry (keep it,
 back off; the link, the server or the token is the problem), or rejected (the
@@ -34,7 +39,7 @@ from dataclasses import dataclass
 SENT, RETRY, REJECTED, UNCONFIGURED = "sent", "retry", "rejected", "unconfigured"
 REJECTING = (400, 413, 422)
 USER_AGENT = "radar-runner-alerts"
-MAX_REPLY = 4096
+MAX_REPLY = 65536          # an answer is a few hundred bytes; more is not read
 READ_TIMEOUT_S = 10.0       # each connect and read; the whole send is limited by the caller
 
 
@@ -176,11 +181,14 @@ class Send:
             conn.request("POST", (parts.path or "").rstrip("/") + "/", body=body, headers=headers)
             response = conn.getresponse()
             status = response.status
-            reply = response.read(MAX_REPLY)
+            # Only a body of known length, or a chunked one, shows that the answer arrived whole (and
+            # with it the end of the headers): read to its end; a short one raises IncompleteRead.
+            whole = response.chunked or (response.length is not None and response.length <= MAX_REPLY)
+            reply = response.read() if whole else response.read(MAX_REPLY)
             with self._lock:
                 if self.cancelled:
                     return Result(RETRY, text="cancelled")
-                self._complete = True
+                self._complete = whole
         except ssl.SSLCertVerificationError as e:
             return Result(RETRY, text=f"certificate not accepted: {e.verify_message} (is the clock set?)"[:300])
         except (socket.timeout, TimeoutError):
@@ -188,6 +196,8 @@ class Send:
         except (OSError, ssl.SSLError, http.client.HTTPException, ValueError) as e:
             return Result(RETRY, text=f"{type(e).__name__}: {getattr(e, 'strerror', None) or e}"[:300])
         if 200 <= status < 300:
+            if not whole:
+                return Result(RETRY, status, f"incomplete answer ({status} without a whole body)")
             return Result(SENT, status, f"accepted ({status})")
         text = f"HTTP {status}" + (f": {_reply_text(reply)}" if reply else "")
         if status in REJECTING:
