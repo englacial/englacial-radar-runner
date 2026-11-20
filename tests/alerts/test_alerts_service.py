@@ -403,6 +403,18 @@ def test_test_alerts_from_the_inbox_go_through_the_queue(tmp_path, server):
     assert any(r.get("test_id") == "abc123" and r["result"] == "sent" for r in status["recent"])
 
 
+def test_a_test_alert_request_with_an_odd_priority_loses_no_request(tmp_path, server):
+    rig = Rig(tmp_path, server.url)
+    rig.start()
+    inbox = rig.state_dir / "alerts-inbox"
+    (inbox / "1-1.json").write_text(json.dumps({"id": "good", "priority": "high"}))     # taken first
+    (inbox / "2-1.json").write_text(json.dumps({"id": "odd", "priority": ["urgent"]}))
+    status = rig.tick(3)
+    test = sorted((b["priority"], b["message"].split(",")[0]) for b in server.bodies() if "test alert" in b["title"])
+    assert test == [(3, "Test alert from alertctl"), (4, "Test alert from alertctl")]
+    assert "inbox" not in status["errors"] and os.listdir(inbox) == []
+
+
 def test_the_status_file_says_what_the_service_does(tmp_path, server):
     rig = Rig(tmp_path, server.url)
     rig.start()

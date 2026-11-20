@@ -447,7 +447,9 @@ class Alerts(Service):
             if not isinstance(request, dict):
                 continue
             self.counters["inbox"] += 1
-            priority = L.BY_NAME.get(request.get("priority"), L.DEFAULT)
+            # A priority that is not a name (a list) is the default, like an unknown name.
+            wanted = request.get("priority")
+            priority = L.BY_NAME.get(wanted, L.DEFAULT) if isinstance(wanted, str) else L.DEFAULT
             test_id = str(request.get("id") or "")[:40]
             text = str(request.get("text") or "")
             alert = L.Alert("test", priority, f"test alert ({L.PRIORITY_NAMES[priority]})",
