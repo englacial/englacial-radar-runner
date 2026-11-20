@@ -33,6 +33,7 @@ sys.dont_write_bytecode = True
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [os.path.join(REPO, "setup"), REPO]
 import uvlock  # noqa: E402
+from fs_label import fs_label  # noqa: E402
 from gps_receiver import RAWX, SFRBX, gpsd_args, parse_comms, parse_valget, rawx_every  # noqa: E402
 from radar_runner.common import status as status_files  # noqa: E402  (standard library only)
 
@@ -327,6 +328,48 @@ def _(name):
 section("Storage")
 
 
+def nvme_fstab_findings(spec, device, uuid, label, cached_label, others):
+    """Would the /etc/fstab line's source `spec` mount the drive that is at /mnt/nvme now? `label` is the
+    filesystem's own label (None if unreadable), `cached_label` udev's, which e2label on a mounted drive
+    does not update; `others`: {device: label} of the other devices, from udev's cache.
+    Returns (status, name, observed) items."""
+    name = "NVMe fstab line names the mounted drive"
+    by, _, value = spec.partition("=")
+    if by == "LABEL" and label is None:
+        found = [(SKIP, name, f"{spec}: the label of the filesystem at /mnt/nvme cannot be read")]
+    elif by in ("LABEL", "UUID"):
+        has = label if by == "LABEL" else uuid
+        meant = [d for d, other in others.items() if other == value] if by == "LABEL" else []
+        if meant:       # setup.sh refuses to change such a line
+            fix = f"{spec} is another drive that is present, {', '.join(meant)}; decide by hand which one belongs here"
+        elif by == "LABEL":
+            fix = "sudo setup/setup.sh --nvme-by-label corrects it"
+        else:
+            fix = "correct the line by hand"
+        found = [(PASS, name, spec) if value == has else
+                 (FAIL, name, f"the line names {spec}, the drive mounted at /mnt/nvme ({device}) has {by}={has}: "
+                              f"it would be missing after the next boot ({fix})")]
+    else:
+        found = [(INFO, name, f"{spec}: neither LABEL= nor UUID=, not compared")]
+    if by == "LABEL" and label is not None:
+        # The mounted drive by its real label, the others by udev's cache.
+        carry = ([device] if label == value else []) + meant
+        found.append((PASS, "NVMe fstab label unique", f"{spec} is on {carry[0]}") if len(carry) == 1 else
+                     (FAIL, "NVMe fstab label unique", f"{spec} is on {', '.join(carry)}: which one is mounted "
+                                                        "at the next boot is not determined") if carry else
+                     (PASS, "NVMe fstab label unique", f"{spec} is on no present drive"))
+    if label is not None and label != cached_label:
+        # INFO, not FAIL: udev reads the label again at the next boot; until then lsblk, findmnt and
+        # /dev/disk/by-label show the old one. The fstab finding above covers what matters for the boot.
+        # A udev refresh is not suggested: with a LABEL= line it can make systemd unmount the drive.
+        found.append((INFO, "NVMe label in udev's cache",
+                      f"udev has '{cached_label}', the filesystem has '{label}'; the next boot refreshes it "
+                      "(do not trigger udev for the mounted data drive: it can unmount it; setup/SYSTEM_CHANGES.md)"))
+    elif label is not None:
+        found.append((PASS, "NVMe label in udev's cache", f"'{label}', as the filesystem has it"))
+    return found
+
+
 @item("NVMe mounted at /mnt/nvme")
 def _(name):
     rc, text, _ = run("findmnt", "-n", "-o", "SOURCE,FSTYPE,LABEL,UUID", "/mnt/nvme")
@@ -343,6 +386,19 @@ def _(name):
           "nofail, so that a missing drive cannot stop the boot")
     by = spec.split("=")[0]
     report(INFO, "NVMe mounted by", f"{spec} ({'any drive with this label works' if by == 'LABEL' else 'only this one drive; optional: setup.sh --nvme-by-label'})")
+    if not (rc == 0 and text):
+        report(SKIP, "NVMe fstab line names the mounted drive", "nothing is mounted at /mnt/nvme")
+        return
+    try:
+        label = fs_label("/mnt/nvme")
+    except OSError:
+        label = None
+    device = out("findmnt", "-n", "-o", "SOURCE", "/mnt/nvme")
+    rows = [row.split(" ", 1) for row in out("lsblk", "-rpno", "NAME,LABEL").split("\n")]
+    others = {row[0]: row[1] for row in rows if len(row) == 2 and row[1] and row[0] != device}
+    for finding in nvme_fstab_findings(spec, device, out("findmnt", "-n", "-o", "UUID", "/mnt/nvme"), label,
+                                       out("findmnt", "-n", "-o", "LABEL", "/mnt/nvme"), others):
+        report(*finding)
 
 
 section("Radar software (not automated by setup.sh)")

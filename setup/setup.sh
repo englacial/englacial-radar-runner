@@ -855,18 +855,34 @@ step_time() {
 
 # OPTIONAL (--nvme-by-label). Edits /etc/fstab, which is not a drop-in file.
 # Only the source field of the /mnt/nvme line is changed, and only if that
-# line has "nofail", so that a missing drive cannot stop the boot.
+# line has "nofail", so that a missing drive cannot stop the boot. The label
+# is read from the filesystem itself: after e2label on a mounted drive, udev's
+# cache (lsblk, findmnt, /dev/disk/by-label/) still has the old one.
+verify_fstab() {        # verify_fstab FILE LABEL MOUNT_POINT: findmnt --verify on the new fstab
+    local out
+    out=$(findmnt --verify --tab-file "$1" 2>&1) && return 0
+    # Without root, and while udev's cache has the old label, findmnt cannot find the new one. Only that
+    # one error, for exactly the source written, is accepted, and only if the mounted filesystem has it.
+    if grep -Eqx '0 parse errors, 1 error, [0-9]+ warnings?' <<<"$out" \
+       && [ "$(grep -F '[E]' <<<"$out" | sed 's/^ *//')" = "[E] unreachable on boot required source: LABEL=$2" ] \
+       && [ "$(python3 -B "$REPO/setup/fs_label.py" "$3")" = "$2" ]; then
+        note "findmnt --verify cannot find LABEL=$2 yet (udev's cache has the old label); the filesystem at $3 has it"
+        return 0
+    fi
+    printf '%s\n' "$out" | sed 's/^/             /'
+    return 1
+}
+
 optional_nvme_by_label() {
     step "OPTIONAL: mount /mnt/nvme by label instead of UUID"
-    local fstab=$DESTDIR/etc/fstab mnt=/mnt/nvme spec opts dev uuid label count
+    local fstab=$DESTDIR/etc/fstab mnt=/mnt/nvme spec opts dev type uuid label cached others count
     count=$(awk -v m="$mnt" '$1 !~ /^#/ && $2 == m' "$fstab" | wc -l)
     [ "$count" -eq 1 ] || die "expected exactly one line for $mnt in /etc/fstab, found $count"
     spec=$(awk -v m="$mnt" '$1 !~ /^#/ && $2 == m {print $1}' "$fstab")
     opts=$(awk -v m="$mnt" '$1 !~ /^#/ && $2 == m {print $4}' "$fstab")
     case "$spec" in
-        LABEL=*) ok "$mnt is already mounted by label ($spec)"; return 0 ;;
-        UUID=*) ;;
-        *) die "the $mnt line in /etc/fstab starts with $spec; expected UUID=..." ;;
+        UUID=*|LABEL=*) ;;
+        *) die "the $mnt line in /etc/fstab starts with $spec; expected UUID=... or LABEL=..." ;;
     esac
     case ",$opts," in
         *,nofail,*) ;;
@@ -874,20 +890,49 @@ optional_nvme_by_label() {
     esac
     dev=$(findmnt -n -o SOURCE "$mnt" 2>/dev/null || true)
     [ -n "$dev" ] || die "$mnt is not mounted, so the drive and its label cannot be checked"
+    [ "$dev" != "$(findmnt -n -o SOURCE / 2>/dev/null || true)" ] || die "$dev is the device of the root filesystem, not a data drive"
+    type=$(lsblk -dno TYPE "$dev" 2>/dev/null || true)
+    case "$type" in
+        part|disk) ;;
+        *) die "$dev is a ${type:-unknown} device, not a disk or partition" ;;
+    esac
     uuid=$(lsblk -no UUID "$dev")
-    label=$(lsblk -no LABEL "$dev")
-    [ "UUID=$uuid" = "$spec" ] || die "the drive mounted at $mnt ($dev, UUID $uuid) is not the one in /etc/fstab ($spec)"
+    case "$spec" in
+        UUID=*) [ "UUID=$uuid" = "$spec" ] || die "the drive mounted at $mnt ($dev, UUID $uuid) is not the one in /etc/fstab ($spec)" ;;
+    esac
+    label=$(python3 -B "$REPO/setup/fs_label.py" "$mnt") || die "cannot read the label of the filesystem at $mnt"
     [ -n "$label" ] || die "$dev has no filesystem label. Set one first, for example: e2label $dev radar-data"
     [[ "$label" =~ ^[A-Za-z0-9_.-]+$ ]] || die "the label '$label' has characters that are unsafe in /etc/fstab"
-    count=$(lsblk -rno LABEL | grep -cxF -- "$label" || true)
-    [ "$count" -eq 1 ] || die "$count filesystems have the label '$label'; it must be unique"
+    # This drive by its real label, the others by udev's cache (an unmounted one cannot be asked without root).
+    others=$(lsblk -rpno NAME,LABEL | awk -v d="$dev" -v l="$label" '$1 != d && $2 == l {print $1}')
+    [ -z "$others" ] || die "$(($(wc -l <<<"$others") + 1)) filesystems have the label '$label' ($dev ${others//$'\n'/ }); it must be unique"
+    if [ "$spec" != "LABEL=$label" ]; then
+        # Like a UUID= line for another drive: a LABEL= line that another present drive has is not this one's.
+        others=$(lsblk -rpno NAME,LABEL | awk -v d="$dev" -v l="${spec#LABEL=}" '$1 != d && $2 == l {print $1}')
+        case "$spec" in
+            LABEL=*) [ -z "$others" ] || die "the $mnt line's $spec means another drive that is present (${others//$'\n'/ }), not $dev, which is mounted there; not changing it" ;;
+        esac
+    fi
+    cached=$(lsblk -no LABEL "$dev")
+    if [ "$cached" != "$label" ]; then
+        # Never refreshed here: a change event for the mounted data drive can make systemd unmount it.
+        note "udev's cache has the label '$cached' for $dev, the filesystem has '$label'"
+        note "the next boot refreshes udev's cache; until then lsblk and /dev/disk/by-label/ show the old label"
+    fi
+    if [ "$spec" = "LABEL=$label" ]; then
+        ok "$mnt is already mounted by label ($spec)"
+        return 0
+    fi
+    case "$spec" in
+        LABEL=*) note "the $mnt line says $spec, but the drive mounted there ($dev) has the label $label: at the next boot it would not be mounted" ;;
+    esac
     change "/etc/fstab: $spec -> LABEL=$label on the $mnt line (backup: /etc/fstab.before-radar-runner)"
     [ "$DRY_RUN" -eq 0 ] || return 0
     TMP_FILE=$(mktemp "$(dirname "$fstab")/.radar-setup.XXXXXX")
     awk -v m="$mnt" -v old="$spec" -v new="LABEL=$label" \
         '$1 == old && $2 == m { sub(/^[^[:space:]]+/, new) } { print }' "$fstab" > "$TMP_FILE"
     [ "$(diff "$fstab" "$TMP_FILE" | grep -c '^>' || true)" -eq 1 ] || die "unexpected result when editing fstab; nothing changed"
-    findmnt --verify --tab-file "$TMP_FILE" >/dev/null || die "the new fstab does not pass 'findmnt --verify'; nothing changed"
+    verify_fstab "$TMP_FILE" "$label" "$mnt" || die "the new fstab does not pass 'findmnt --verify'; nothing changed"
     chmod 0644 "$TMP_FILE"
     [ -e "$fstab.before-radar-runner" ] || cp -p "$fstab" "$fstab.before-radar-runner"
     sync "$TMP_FILE"
