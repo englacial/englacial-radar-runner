@@ -259,6 +259,8 @@ if "-g" in sys.argv:
         print("UBX-CFG-VALGET:\\n version 1 layer %d position 0\\n  layers (...)" % layer)
         print("    item CFG-MSGOUT-UBX_NAV_PVT_USB/0x20910009 val 1")
         print("    item CFG-UART1OUTPROT-NMEA/0x10740002 val %s" % ({value!r} if layer < 2 else {flash_nmea!r}))
+        print("    item CFG-MSGOUT-UBX_RXM_RAWX_USB/0x209102a7 val 10")
+        print("    item CFG-MSGOUT-UBX_RXM_SFRBX_USB/0x20910234 val 1")
 else:
     print("UBX-MON-COMMS:\\nversion 0 nPorts 3 txErrors x{errors} reserved1 0\\n  Port: 0x300 (USB)\\n"
           "   txPending 0 txBytes 26542809 txUsage 5 txPeakUsage 88")
@@ -287,9 +289,13 @@ def test_check_script_asks_the_receiver_only_when_told_and_only_reads(tmp_path, 
     pvt_status = "FAIL" if "not stored" in pvt else "PASS"
     assert f"{pvt_status}  GPS receiver: position message (NAV-PVT) on USB: CFG-MSGOUT-UBX_NAV_PVT_USB: {pvt}" in r.stdout
     errors_status = "FAIL" if errors == "90" else "PASS"
-    assert f"{errors_status}  GPS receiver: no transmit buffer errors: txErrors 0x{errors}, USB buffer peak 88 %" in r.stdout
+    assert (f"{errors_status}  GPS receiver: no transmit buffer errors: txErrors 0x{errors}; USB buffer 5 % "
+            "(last period), peak 88 % (since the receiver started)") in r.stdout
+    assert "GPS receiver: navigation data for PPK (RXM-SFRBX) on USB" in r.stdout
+    assert "GPS receiver: raw messages for PPK (RXM-RAWX) on USB" in r.stdout
     calls = [json.loads(line) for line in log.read_text().splitlines()]
-    assert calls == [["-P", "27.50", "-w", "1.5", "-g", f"CFG-MSGOUT-UBX_NAV_PVT_USB,{n}", "-g", f"CFG-UART1OUTPROT-NMEA,{n}"]
+    assert calls == [["-P", "27.50", "-w", "1.5", "-g", f"CFG-MSGOUT-UBX_NAV_PVT_USB,{n}", "-g", f"CFG-UART1OUTPROT-NMEA,{n}",
+                      "-g", f"CFG-MSGOUT-UBX_RXM_RAWX_USB,{n}", "-g", f"CFG-MSGOUT-UBX_RXM_SFRBX_USB,{n}"]
                      for n in range(3)] + [["-P", "27.50", "-w", "1.5", "-p", "MON-COMMS"]]
     for call in calls:
         assert not {"-z", "-x", "-e", "-d", "-c", "-S", "-s"} & set(call)
@@ -305,9 +311,8 @@ def test_check_script_asks_once_more_after_a_lost_reply(tmp_path):
                        capture_output=True, text=True, timeout=300, cwd="/", env=env)
     assert r.returncode in (0, 1) and r.stderr == ""
     assert "PASS  GPS receiver: NMEA output on UART1 off: CFG-UART1OUTPROT-NMEA: RAM 0, battery-backed 0, flash 0" in r.stdout
-    reads = [json.loads(line)[-1] for line in log.read_text().splitlines() if "-g" in line]
-    assert reads == ["CFG-UART1OUTPROT-NMEA,0", "CFG-UART1OUTPROT-NMEA,1", "CFG-UART1OUTPROT-NMEA,1",
-                     "CFG-UART1OUTPROT-NMEA,2"]
+    reads = [json.loads(line)[-1].split(",")[1] for line in log.read_text().splitlines() if "-g" in line]
+    assert reads == ["0", "1", "1", "2"]
 
 
 def test_check_script_rejects_unknown_options():

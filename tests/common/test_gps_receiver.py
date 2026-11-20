@@ -21,6 +21,9 @@ WANT = {f"CFG-MSGOUT-UBX_NAV_{m}_USB": 1 for m in ("PVT", "SAT", "SIG", "EOE", "
 WANT["CFG-MSGOUT-UBX_NAV_TIMELS_USB"] = 255
 WANT.update({f"CFG-MSGOUT-NMEA_ID_{m}_USB": 0 for m in ("GGA", "GLL", "GSA", "GSV", "RMC", "VTG")})
 WANT.update({"CFG-USBOUTPROT-UBX": 1, NMEA: 0})
+GPSD_WANT = dict(WANT)                  # what gpsd needs; then the raw GPS log's two messages
+RAWX, SFRBX = "CFG-MSGOUT-UBX_RXM_RAWX_USB", "CFG-MSGOUT-UBX_RXM_SFRBX_USB"
+WANT.update({RAWX: 10, SFRBX: 1})
 GGA = "CFG-MSGOUT-NMEA_ID_GGA_USB"
 
 
@@ -125,6 +128,7 @@ def tool(tmp_path):
     stand_in.write_text(UBXTOOL_STAND_IN.replace("STATE", repr(str(state))))
     stand_in.chmod(0o755)
     module.UBXTOOL = str(stand_in)
+    module.rawx_every = lambda: (10, "")       # manager.gps_log.rawx_every, as in the repository's config
     module.IDENTIFY_WAIT_S, module.CONFIGURE_WAIT_S, module.POLL_S = 1.5, 0.2, 0.1
     module.gpsd_args = lambda: ["/usr/sbin/gpsd", "-n", "-p", "/dev/ttyACM0"]     # not this machine's gpsd
     module.calls_file = state / "calls"
@@ -167,7 +171,7 @@ def test_already_identified_no_version_request(tool, capsys):
     out = capsys.readouterr().out
     assert "gpsd has identified the receiver: /dev/ttyACM0: ROM BASE" in out and "MON-VER" not in out
     assert f"{PVT}: RAM 1, battery-backed 1, flash 1\n" in out and f"{NMEA}: RAM 0, battery-backed 0, flash 0\n" in out
-    assert "all 17 settings are right in RAM, battery-backed memory and flash" in out
+    assert "all 19 settings are right in RAM, battery-backed memory and flash" in out
     assert f"{PVT} in RAM: 1" in out and f"{NMEA} in RAM: 0" in out
     assert set(gpsd.questions) == {b"?DEVICES;\n"}
 
@@ -177,7 +181,8 @@ def test_provisioning_with_everything_right_writes_nothing(tool, capsys):
     assert tool.main(["--apply"]) == 0
     assert calls(tool) == READ_ALL                          # one read per layer, no write
     out = capsys.readouterr().out
-    assert out.count(": RAM 1, battery-backed 1, flash 1\n") == 9 and "setting in" not in out
+    assert out.count(": RAM 1, battery-backed 1, flash 1\n") == 10 and "setting in" not in out
+    assert f"{RAWX}: RAM 10, battery-backed 10, flash 10\n" in out
 
 
 def test_provisioning_writes_a_message_off_in_flash_only_to_all_three_layers(tool, capsys):
@@ -218,7 +223,7 @@ def test_provisioning_a_receiver_at_factory_settings(tool, capsys):
         tool.stored(key, 1, "")
         tool.stored(key, 2, "")
         if key != "CFG-USBOUTPROT-UBX":       # the factory defaults in RAM (layer 7 on this unit)
-            tool.ram(key, {0: 1, 1: 0, 255: 0}[value])
+            tool.ram(key, {0: 1, 1: 0, 10: 0, 255: 0}[value])
     assert tool.main(["--apply"]) == 0
     assert all(tool.all_layers(key) == [str(value)] * 3 for key, value in WANT.items())
     writes = [c for c in calls(tool) if "-z" in c]
@@ -226,15 +231,16 @@ def test_provisioning_a_receiver_at_factory_settings(tool, capsys):
     out = capsys.readouterr().out
     assert f"{NMEA}: RAM 1, battery-backed not stored, flash not stored\n" in out
     assert f"{GGA}: RAM 1, battery-backed not stored, flash not stored\n" in out
-    assert out.count(" now: RAM 1, battery-backed 1, flash 1\n") == 9
+    assert out.count(" now: RAM 1, battery-backed 1, flash 1\n") == 10
     assert out.count(" now: RAM 0, battery-backed 0, flash 0\n") == 7
+    assert f"{RAWX} now: RAM 10, battery-backed 10, flash 10\n" in out
     assert "CFG-MSGOUT-UBX_NAV_TIMELS_USB now: RAM 255, battery-backed 255, flash 255\n" in out
 
 
 def test_one_read_and_one_write_fit_in_a_gpsd_message(tool):
     """gpsd passes on at most 255 bytes per message (gps.py, write_gpsd): 8 bytes of UBX frame,
     4 of VALGET or VALSET header, 4 bytes a key to read, 5 to write (every key here is one byte)."""
-    assert set(tool.SETTINGS) == set(WANT) and tool.SETTINGS == WANT
+    assert tool.SETTINGS == GPSD_WANT and tool.wanted() == WANT
     assert 8 + 4 + 5 * len(WANT) <= 255 and 8 + 4 + 4 * len(WANT) <= 255
 
 
@@ -377,7 +383,7 @@ def test_parse_valget_reads_a_real_ubxtool_transcript(tool):
     """The start of `ubxtool -P 27.50 -g <17 keys>,1` on englacial-radar-1, 2026-11-20 (the position
     messages after the reply left out), followed by the receiver's ordinary output."""
     text = open(FIXTURE).read()
-    assert tool.parse_valget(text, 1) == WANT
+    assert tool.parse_valget(text, 1) == GPSD_WANT
     assert tool.parse_valget(text, 0) is None and tool.parse_valget(text, 2) is None     # not ours
 
 
@@ -389,3 +395,59 @@ def test_parse_valget_ignores_a_reply_for_another_layer_and_sees_a_refusal(tool)
     assert tool.parse_valget(refused, 0) == {}
     other_nak = "UBX-ACK-NAK:\n  NAK to Class x06 (CFG) ID x8a (VALSET)\n"
     assert tool.parse_valget(other_nak, 0) is None
+
+
+def test_the_raw_message_rate_is_the_setting_and_an_unreadable_setting_writes_nothing(tool, capsys):
+    tool.gpsd([IDENTIFIED])
+    tool.rawx_every = lambda: (1, "")                       # 10 Hz raw data
+    assert tool.main(["--apply"]) == 0
+    assert tool.all_layers(RAWX) == ["1", "1", "1"]
+    assert [c for c in calls(tool) if "-z" in c] == [["-z", f"{RAWX},1"]]
+    tool.calls_file.unlink()
+    tool.rawx_every = lambda: (None, "cannot read manager.gps_log.rawx_every")
+    assert tool.main(["--apply"]) == 1
+    assert calls(tool) == []
+    assert "cannot read manager.gps_log.rawx_every" in capsys.readouterr().out
+    assert tool.main(["--apply", "--ram"]) == 0             # the boot-time run does not need it
+
+
+def test_the_rawx_setting_is_read_from_the_repository_config():
+    """With the repository's environment (here: the one running the tests), as setup/check.py does."""
+    import sys
+    from radar_runner.common import config as C
+    spec = importlib.util.spec_from_file_location("gps_receiver_plain", os.path.join(REPO, "setup", "gps_receiver.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.VENV_PYTHON = sys.executable
+    assert module.rawx_every() == (C.load(secrets_file=None)[0]["manager"]["gps_log"]["rawx_every"], "")
+
+
+COMMS = """UBX-MON-COMMS:
+ version 0 nPorts 2 txErrors x%s reserved1 0
+protIds 0/1/ff/ff (UBX/NMEA/None/None)
+  Port: 0x100 (UART1)
+   txPending 0 txBytes 0 txUsage 0 txPeakUsage 0
+   rxPending 0 rxBytes 0 rxUsage 0 rxPeakUsage 0
+   overrunErrs 0 msgs 0/0/0/0 reserved 0 0 skipped 0
+  Port: 0x300 (USB)
+   txPending 0 txBytes %d txUsage 31 txPeakUsage 88
+   rxPending 0 rxBytes 0 rxUsage 0 rxPeakUsage 0
+   overrunErrs 0 msgs 0/0/0/0 reserved 0 0 skipped 0
+"""
+
+
+def test_comms_reports_usage_peak_and_rate_and_sets_nothing(tool, capsys):
+    replies = iter([COMMS % ("0", 1_000_000), COMMS % ("0", 1_230_000)])
+    asked = []
+    tool.ubxtool = lambda *args: asked.append(args) or next(replies)
+    tool.COMMS_GAP_S = 0.2
+    assert tool.main(["--comms"]) == 0
+    assert asked == [("-p", "MON-COMMS"), ("-p", "MON-COMMS")]       # polls only
+    out = capsys.readouterr().out
+    assert "USB: transmit buffer 31 % (highest in the last period), peak 88 % (since the receiver started)" in out
+    assert "bytes/s" in out and "txErrors 0x00: none" in out
+    replies = iter([COMMS % ("40", 0), COMMS % ("40", 10)])
+    tool.ubxtool = lambda *args: next(replies)
+    assert tool.main(["--comms"]) == 1
+    assert "memory errors (output lost)" in capsys.readouterr().out
+    assert tool.main(["--comms", "--apply"]) == 4

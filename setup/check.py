@@ -2,8 +2,8 @@
 """Check this system against the setup that the radar manager expects.
 
     setup/check.py               everything that can be checked by looking
-    setup/check.py --receiver    also ask the GPS receiver for two settings in all three layers and its
-                                 buffer error flags (four read-only polls through gpsd, each asked once
+    setup/check.py --receiver    also ask the GPS receiver for four settings in all three layers and its
+                                 port statistics (four read-only polls through gpsd, each asked once
                                  more after a lost reply; nothing is ever set)
 
 Prints one line per item:
@@ -33,7 +33,7 @@ sys.dont_write_bytecode = True
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [os.path.join(REPO, "setup"), REPO]
 import uvlock  # noqa: E402
-from gps_receiver import gpsd_args, parse_valget  # noqa: E402  (standard library only)
+from gps_receiver import RAWX, SFRBX, gpsd_args, parse_comms, parse_valget, rawx_every  # noqa: E402
 from radar_runner.common import status as status_files  # noqa: E402  (standard library only)
 
 FILES = os.path.join(REPO, "setup", "files")
@@ -817,11 +817,12 @@ def _(name):
 def _(name):
     if not ASK_RECEIVER:
         raise Skip("not asked: setup/check.py --receiver reads them (four read-only polls through gpsd, nothing is set)")
+    every, why = rawx_every()
     # Read only: -g reads configuration items from one layer (0 RAM, 1 battery-backed, 2 flash), -p MON-COMMS
     # polls the port statistics. No -z, -x, -e, -d here, ever: this script changes nothing, least of all the receiver.
     # The stored layers are what the receiver starts from at the next power-up.
     ubxtool = ("ubxtool", "-P", "27.50", "-w", "1.5")
-    keys = ("CFG-MSGOUT-UBX_NAV_PVT_USB", "CFG-UART1OUTPROT-NMEA")
+    keys = ("CFG-MSGOUT-UBX_NAV_PVT_USB", "CFG-UART1OUTPROT-NMEA", RAWX, SFRBX)
     values = {key: [] for key in keys}
     for layer in range(3):
         for _ in range(2):          # asked once more if the reply was lost, as gps_receiver.py does
@@ -842,15 +843,24 @@ def _(name):
           "setup/SYSTEM_CHANGES.md, section 11)")
     check("GPS receiver: position message (NAV-PVT) on USB", values[keys[0]] == [1, 1, 1], shown(keys[0]),
           "1 in all three (setup/gps_receiver.py --apply)")
+    if why:
+        report(FAIL, "GPS receiver: raw messages for PPK (RXM-RAWX) on USB", why)
+    else:
+        check("GPS receiver: raw messages for PPK (RXM-RAWX) on USB", values[keys[2]] == [every] * 3, shown(keys[2]),
+              f"{every} in all three (manager.gps_log.rawx_every; setup/gps_receiver.py --apply)")
+    sfrbx = 0 if every == 0 else 1
+    check("GPS receiver: navigation data for PPK (RXM-SFRBX) on USB", values[keys[3]] == [sfrbx] * 3, shown(keys[3]),
+          f"{sfrbx} in all three (setup/gps_receiver.py --apply)")
     for _ in range(2):              # asked once more if the reply was lost
         rc, text, err = run(*ubxtool, "-p", "MON-COMMS", timeout=30)
-        m = re.search(r"txErrors x([0-9a-fA-F]+)", text)
-        if m:
+        errors, ports = parse_comms(text)
+        if errors is not None:
             break
-    peak = re.search(r"\(USB\)\s+txPending \d+ txBytes \d+ txUsage \d+ txPeakUsage (\d+)", text)
-    check("GPS receiver: no transmit buffer errors", bool(m) and not int(m.group(1), 16) & 0xC0,
-          (f"txErrors 0x{int(m.group(1), 16):02x}" + (f", USB buffer peak {peak.group(1)} %" if peak else ""))
-          if m else "no answer from the receiver", "memory (0x40) and allocation (0x80) flags clear")
+    usb = ports.get("USB")
+    check("GPS receiver: no transmit buffer errors", errors is not None and not errors & 0xC0,
+          (f"txErrors 0x{errors:02x}" + (f"; USB buffer {usb[1]} % (last period), peak {usb[2]} % (since the "
+                                          "receiver started)" if usb else ""))
+          if errors is not None else "no answer from the receiver", "memory (0x40) and allocation (0x80) flags clear")
 
 
 section("setup.sh: telemetry service")

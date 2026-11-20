@@ -201,6 +201,44 @@ simply running the script again.
 
 ### 11. gpsd owns the GPS receiver
 
+**Added 2026-11-20, stage 6: raw messages for PPK. Not applied to the receiver yet.**
+`setup/gps_receiver.py --apply` now also provisions two messages on USB, in all three layers,
+for the raw GPS log in each collection (`radar_runner/gpsraw/README.md`):
+
+- `CFG-MSGOUT-UBX_RXM_RAWX_USB` = `manager.gps_log.rawx_every` (default 10: RXM-RAWX at every
+  10th epoch, 1 Hz at the OLA's 10 Hz; 2 = 5 Hz, 1 = 10 Hz). The script reads the setting
+  from the repository's config and `/etc/radar-runner/local.yaml` with the repository's Python
+  environment, and writes nothing if it cannot.
+- `CFG-MSGOUT-UBX_RXM_SFRBX_USB` = 1 (the broadcast navigation data, as it comes); both 0
+  with `rawx_every: 0`.
+- **Why 1 Hz by default:** the USB output is already 21 kB/s with its transmit buffer peaking at
+  88 % (below). RXM-RAWX is 16 + 32 bytes per signal tracked: about 1.5 to 2 kB per epoch for the
+  40 to 60 signals this receiver tracks under open sky (dual frequency, four systems), so about
+  +2 kB/s at 1 Hz and +15 to 20 kB/s at 10 Hz (nearly doubling the output); RXM-SFRBX adds
+  about 1 to 2 kB/s at any rate. These are estimates from the message sizes, not measured. The
+  peak of the buffer is set by the largest burst at one epoch, which grows by one RXM-RAWX at
+  any rate; the rate decides the average load. 1 Hz is the usual rate for PPK of a slow
+  vehicle (a few metres between epochs at truck speed).
+- **Not in the RAM-only run after every gpsd start** (`--apply --ram`): it still checks only
+  NAV-PVT and UART1 NMEA, the two settings that decide whether gpsd has positions. Every write
+  reaches flash at the next OLA start, and a missing raw message costs PPK data, not positions:
+  it shows as `gps_raw.no_raw_data` (flag `no_raw_gps`) in each collection and in
+  `setup/check.py --receiver`.
+- **Apply:** `setup/gps_receiver.py` (reads only: RAWX and SFRBX show as 0 or "not stored"),
+  then `setup/gps_receiver.py --apply` (writes the two, and anything else wrong, to all three
+  layers), then `sudo systemctl restart radar-telemetry` (an OLA start, so that the OLA's save
+  carries them), then `setup/gps_receiver.py` and `setup/check.py --receiver`.
+- **Measure:** `setup/gps_receiver.py --comms` polls MON-COMMS twice 10 s apart (a poll, sets
+  nothing) and prints each port's transmit-buffer use in the last period, its peak since the
+  receiver started, the bytes per second, and the error flags. Before and after the change; a
+  peak near 100 % or a memory/allocation error flag means lost output. A larger `rawx_every`
+  lowers the average, not the burst; what shrinks the burst is fewer messages at the same
+  epoch: MON-SPAN and MON-RF (the `gps_jam` logger's, every 10 epochs, possibly the same
+  epochs as RXM-RAWX at 1 Hz) off, or NAV-SAT and NAV-SIG at a lower rate (not a setting here).
+- **Revert:** `manager.gps_log.rawx_every: 0` and `manager.gps_log.enabled: false` in
+  `/etc/radar-runner/local.yaml`, then `setup/gps_receiver.py --apply` (both messages 0 in all
+  three layers) and an OLA start (`sudo systemctl restart radar-telemetry`).
+
 **Changed 2026-11-20: gpsd runs passive (`-p`)** (this paragraph overrides anything below that
 contradicts it). The drop-in's command line is `gpsd -n -p <receiver>`. With `-p` gpsd does not
 configure the receiver; it still asks for its version, identifies it, and passes ubxtool
