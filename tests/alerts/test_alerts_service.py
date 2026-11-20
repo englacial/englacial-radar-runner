@@ -778,16 +778,23 @@ def summaries(server):
     return [b for b in server.bodies() if "summary" in b["title"]]
 
 
-def test_a_collection_being_recorded_is_not_called_cut_off(tmp_path, server):
+@pytest.mark.parametrize("meta, wording", [
+    # The clock at the start of the run may not have been set yet: the uptime stamps tell how long.
+    ({"created": {"time_utc": "1970-01-01T00:01:10Z", "uptime_s": 860.0},
+      "recording_started": {"time_utc": "1970-01-01T00:01:12Z", "uptime_s": 870.0}}, "recording now (for 2 min)"),
+    ({"created": {"time_utc": "1970-01-01T00:01:10Z", "uptime_s": 870.0}}, "recording now (created 2 min ago)"),
+    ({"created": {"time_utc": "2026-11-20T05:46:29Z"}}, "recording now (started 05:46:29 UTC)"),  # no uptime stamp
+])
+def test_a_collection_being_recorded_is_not_called_cut_off(tmp_path, server, meta, wording):
     rig = Rig(tmp_path, server.url)
     col = rig.collections / "b00042_s001_20261120T054629Z"
     col.mkdir()
-    (col / "collection.json").write_text(json.dumps({"created": {"time_utc": "2026-11-20T05:46:29Z"}, "end": None}))
-    rig.manager = {"state": "starting", "not_ready": [], "collection": "b00042_s001_20261120T054629Z"}
+    (col / "collection.json").write_text(json.dumps(dict(meta, end=None)))
+    rig.manager = {"state": "running", "not_ready": [], "collection": "b00042_s001_20261120T054629Z"}
     rig.start()
     rig.tick(3)
     [s] = summaries(server)
-    assert "b00042_s001_20261120T054629Z, recording now (started 05:46:29 UTC)" in s["message"]
+    assert f"b00042_s001_20261120T054629Z, {wording}" in s["message"]
     assert "cut off" not in s["message"]
 
 

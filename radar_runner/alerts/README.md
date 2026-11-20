@@ -247,7 +247,11 @@ A restart of the service in the same boot does not send another. A collection
 without an end is "recording now" when the manager's status names it as its
 current run, "no end recorded yet" when the manager's state is not known or a
 run of this boot is starting and the manager has not named its collection yet
-(the first second of a run), and "cut off" only otherwise. Contents:
+(the first second of a run), and "cut off" only otherwise. How long a run of
+this boot has been recording comes from the uptime stamps in its
+`collection.json` ("recording now (for 2 min)"), as the clock may not have been
+set at its start; its start time of day only when there is no such stamp.
+Contents:
 
 * boot number, uptime, whether the clock is set;
 * the boot before: how long it ran (at least: the state file is updated every

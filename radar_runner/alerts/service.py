@@ -120,10 +120,13 @@ def scan_collections(root):
                 pass
     how = (str(end.get("how") or "ended") if end else
            "cut off (no end recorded: power cut or crash)" if meta else "no collection.json")
-    began = started or (meta.get("created") if isinstance(meta.get("created"), dict) else {})
+    created = meta.get("created") if isinstance(meta.get("created"), dict) else {}
+    began = started or created
     began = began.get("time_utc") if isinstance(began.get("time_utc"), str) else ""
+    uptimes = {key: x.get("uptime_s") if type(x.get("uptime_s")) in (int, float) else None
+               for key, x in (("started_uptime_s", started or {}), ("created_uptime_s", created))}
     return {"count": len(found), "last": {"name": name, "boot": boot, "how": how, "open": bool(meta) and end is None,
-                                          "started_utc": began,
+                                          "started_utc": began, **uptimes,
                                           "reason": str(end.get("reason") or "") if end else "",
                                           "recorded_s": recorded, "data_gb": size / 1e9}}
 
@@ -548,12 +551,20 @@ class Alerts(Service):
             # No end in collection.json: being recorded, or cut off. The manager's status tells which.
             started = last.get("started_utc", "")
             started = f"started {started[11:19]} UTC" if len(started) >= 19 else "start time not known"
+            # A run of this boot: how long, from the uptime stamps (the clock at its start may not have
+            # been set yet). The time of day only when there is no uptime stamp.
+            def ago(key):
+                up = last.get(key)
+                return now - up if type(up) in (int, float) and 0 <= up <= now else None
+            recording, created = ago("started_uptime_s"), ago("created_uptime_s")
+            since = (f"for {L._duration(recording)}" if recording is not None else
+                     f"created {L._duration(created)} ago" if created is not None else started)
             run = man.ok and man.data.get("state") in ("starting", "running", "stopping")
             if run and man.data.get("collection") == last.get("name"):
-                last["how"] = f"recording now ({started})"
+                last["how"] = f"recording now ({since})"
             elif run and man.data.get("collection") is None and self.boot in (None, last.get("boot")):
                 # The runner has made the directory; the manager names it once the runner's event is in.
-                last["how"] = f"no end recorded yet ({started}; a run is starting)"
+                last["how"] = f"no end recorded yet ({since}; a run is starting)"
             elif not man.ok:
                 last["how"] = f"no end recorded yet ({started}; the radar manager's state is not known)"
         values = L._get(tel.data, "sources", "pi", "values") if tel.ok else None
