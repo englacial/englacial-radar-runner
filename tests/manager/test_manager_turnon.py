@@ -76,10 +76,12 @@ def test_a_tolerance_that_reaches_the_leakage_is_refused_in_two_peak_mode():
 
 
 def test_a_low_power_cap_not_below_the_radars_cap_is_a_warning():
-    c = config()
+    c = config(enabled=True)
     c["manager"]["limits"]["max_tx_gain"] = 40.0
     _, warnings = turnon.Settings.from_config(c)
     assert "max_tx_gain (40) is not below manager.limits.max_tx_gain (40)" in warnings[0]
+    c["manager"]["turn_on_check"]["enabled"] = False                # nothing to say while it is off
+    assert turnon.Settings.from_config(c)[1] == []
 
 
 def test_limits_that_cross_are_refused_together():
@@ -216,7 +218,7 @@ def test_not_verified_judges_everything_but_the_signal():
 def test_amplifier_before_the_run(change, name, words):
     r = judged(s=settings(blocking=True, **VERIFIED), before=(dict(IDLE[0], **change), ""))
     assert failing(r)[0] == name and words in r["reason"] and r["blocked"] and r["retry"]
-    assert turnon.summary_text(r).startswith("FAILED, the start is tried again")
+    assert turnon.summary_text(r).startswith("FAILED (amplifier readings): a failed start: ")
 
 
 @pytest.mark.parametrize("change", [dict(case_temp_c=-45.0), dict(temp_c=-41.0, case_temp_c=-48.0),
@@ -226,14 +228,25 @@ def test_amplifier_before_is_never_stricter_than_the_safety_watcher(change):
     assert judged(s=settings(blocking=True, **VERIFIED), before=(dict(IDLE[0], **change), ""))["passed"]
 
 
+def before_fails(s, **reading):
+    r = turnon.judge(s, FACTS, (dict(IDLE[0], **reading), ""), False, during(0.3, 0.3), measurement())
+    return failing(r) == ["amplifier_before"]
+
+
 def test_the_watchers_limits_are_used():
-    c = config(**VERIFIED)
-    c["watcher"].update(temp_trip_c=45.0, voltage_min_v=27.0)
+    c = config(**VERIFIED)                  # limits the watcher accepts
+    c["watcher"].update(temp_warn_c=45.0, temp_clear_c=45.0, temp_trip_c=48.0, voltage_min_v=27.0)
     s, _ = turnon.Settings.from_config(c)
-    assert failing(turnon.judge(s, FACTS, (dict(IDLE[0], temp_c=46.0), ""), False, during(0.3, 0.3),
-                                measurement())) == ["amplifier_before"]
-    assert failing(turnon.judge(s, FACTS, (dict(IDLE[0], voltage_v=26.5), ""), False, during(0.3, 0.3),
-                                measurement())) == ["amplifier_before"]
+    assert before_fails(s, temp_c=48.0) and not before_fails(s, temp_c=47.5)
+    assert before_fails(s, voltage_v=26.5) and not before_fails(s, voltage_v=27.0)
+
+
+def test_the_watchers_limits_as_the_watcher_really_uses_them():
+    # A trip level under the warning level is refused by the watcher, which then stops at its default 55 C.
+    c = config(**VERIFIED)
+    c["watcher"].update(temp_trip_c=45.0)
+    s, _ = turnon.Settings.from_config(c)
+    assert s.temp_trip_c == 55.0 and not before_fails(s, temp_c=46.0) and before_fails(s, temp_c=55.0)
 
 
 def test_only_the_signal_clipping_and_data_raise_the_fault():

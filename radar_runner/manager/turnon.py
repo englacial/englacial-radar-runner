@@ -61,6 +61,8 @@ from dataclasses import dataclass
 from radar_runner.common.config import DEFAULTS
 from radar_runner.common.status import boottime_s, read_status
 
+from radar_runner.watcher.service import checked as watcher_settings
+
 from . import collection as coll
 from . import gates
 from . import limits
@@ -71,7 +73,7 @@ SUBDIR = "turn_on_check"
 DATA_FILE = "low_power.bin"
 INPUT_FILE, OUTPUT_FILE, ANALYSIS_LOG, RESULT_FILE = ("analysis_input.json", "analysis.json", "analysis.log",
                                                       "result.json")
-FLAG = "turn_on_check_failed"
+FLAG, WARNING_FLAG = "turn_on_check_failed", "turn_on_check_warning"
 # The only settings in which the low-power config may differ from the collection's.
 CHANGED = {("RF0", "tx_gain"), ("CHIRP", "num_pulses"), ("FILES", "output_dir"), ("FILES", "save_loc"),
            ("FILES", "max_chirps_per_file")}
@@ -157,7 +159,7 @@ class Settings:
         take("current_rise_min_a", lambda v: 0 <= v <= 5, "must be between 0 and 5 A")
         for name in ("enabled", "blocking"):
             out[name] = c[name]
-        w = config["watcher"]
+        w, _ = watcher_settings(config["watcher"])         # as the watcher itself uses them
         out.update(voltage_min_v=w["voltage_min_v"], voltage_max_v=w["voltage_max_v"], temp_trip_c=w["temp_trip_c"])
         for low, high in (("idle_current_min_a", "idle_current_max_a"),):
             if c[low] < c[high]:
@@ -168,7 +170,7 @@ class Settings:
         take("current_max_a", lambda v: v > out["idle_current_max_a"], "must be above idle_current_max_a")
         take("tolerance_samples", lambda v: 0 < v <= 50, "must be above 0 and at most 50", e)
         cap = config["manager"]["limits"]["max_tx_gain"]
-        if out["max_tx_gain"] >= cap:
+        if out["enabled"] and out["max_tx_gain"] >= cap:
             warnings.append(f"manager.turn_on_check.max_tx_gain ({out['max_tx_gain']:g}) is not below "
                             f"manager.limits.max_tx_gain ({cap:g}): the low-power run may be at full power")
         if e["verified"]:
@@ -325,6 +327,29 @@ def _scaled(level, at_gain, to_gain):
     return level + (to_gain - at_gain)
 
 
+def judge_before(s, before, override):
+    """The criterion `amplifier_before`, from (reading, problem) taken just before the low-power run."""
+    reading, problem = before
+    if reading is None:
+        return {"name": "amplifier_before", "ok": None if override else False,
+                "text": f"no amplifier reading before the run ({problem})"
+                        + ("; not judged: override set" if override else "")}
+    idle, wrong = reading["current_a"], []
+    if not s.voltage_min_v <= reading["voltage_v"] <= s.voltage_max_v:
+        wrong.append(f"28 V rail at {reading['voltage_v']:.1f} V (allowed {s.voltage_min_v:g}-{s.voltage_max_v:g})")
+    if not s.idle_current_min_a <= idle <= s.idle_current_max_a:
+        wrong.append(f"idle current {idle:.3f} A (allowed {s.idle_current_min_a:g}-{s.idle_current_max_a:g})")
+    for key, what in (("temp_c", "amplifier"), ("case_temp_c", "case")):
+        value = reading.get(key)
+        if value is None:
+            if key == "temp_c":
+                wrong.append("no amplifier temperature")
+        elif value >= s.temp_trip_c:
+            wrong.append(f"{what} temperature {value:.1f} C (the safety watcher stops at {s.temp_trip_c:g} C)")
+    return {"name": "amplifier_before", "ok": not wrong, "text": "; ".join(wrong) or
+            f"{reading['voltage_v']:.1f} V, {idle:.3f} A idle, {reading.get('temp_c')} C"}
+
+
 def judge(s, facts, before, override, during, measurement, analysis_error=""):
     """The criteria and the outcome. No I/O.
 
@@ -349,27 +374,9 @@ def judge(s, facts, before, override, during, measurement, analysis_error=""):
                         f"amplifier readings at one every {interval:g} s (they need at least "
                         f"{s.min_current_readings * interval + WINDOW_START_S + WINDOW_END_S:.1f} s: "
                         "raise manager.turn_on_check.pulses)")
-    reading, problem = before
-    idle = None
-    if reading is None:
-        add("amplifier_before", None if override else False,
-            f"no amplifier reading before the run ({problem})" + ("; not judged: override set" if override else ""))
-    else:
-        idle = reading["current_a"]
-        wrong = []
-        if not s.voltage_min_v <= reading["voltage_v"] <= s.voltage_max_v:
-            wrong.append(f"28 V rail at {reading['voltage_v']:.1f} V (allowed {s.voltage_min_v:g}-{s.voltage_max_v:g})")
-        if not s.idle_current_min_a <= idle <= s.idle_current_max_a:
-            wrong.append(f"idle current {idle:.3f} A (allowed {s.idle_current_min_a:g}-{s.idle_current_max_a:g})")
-        for key, what in (("temp_c", "amplifier"), ("case_temp_c", "case")):
-            value = reading.get(key)
-            if value is None:
-                if key == "temp_c":
-                    wrong.append("no amplifier temperature")
-            elif value >= s.temp_trip_c:
-                wrong.append(f"{what} temperature {value:.1f} C (the safety watcher stops at {s.temp_trip_c:g} C)")
-        add("amplifier_before", not wrong, "; ".join(wrong) or
-            f"{reading['voltage_v']:.1f} V, {idle:.3f} A idle, {reading.get('temp_c')} C")
+    reading = before[0]
+    idle = reading["current_a"] if reading is not None else None
+    criteria.append(judge_before(s, before, override))
     currents = [r["current_a"] for r in during]
     if idle is None:
         add("amplifier_during", None, "not judged: no idle reading to compare with")
@@ -473,7 +480,11 @@ def summary_text(result):
     if result["passed"]:
         signal = next((c for c in result["criteria"] if c["name"] == "signal"), None)
         return "passed" + (f": {signal['text']}" if signal else "") + warnings
-    return ("FAILED, the start is tried again: " if result.get("retry") else
+    if result.get("retry"):
+        what = "analysis" if any(c["name"] == "analysis" and c["ok"] is False for c in result["criteria"]) \
+            else "amplifier readings"
+        return f"FAILED ({what}): a failed start: " + result["reason"] + warnings
+    return (
             "FAILED, the radar stays off: " if result["blocked"] else
             "FAILED (record only, the radar starts anyway): ") + result["reason"] + warnings
 
@@ -549,6 +560,16 @@ class TurnOnCheck:
         # 2. Before the run, 3. the run, with the readings during its pulses.
         override = self.overrides.is_set()
         before = self.readings.latest()
+        first = judge_before(s, before, override)
+        if s.blocks and first["ok"] is False:
+            # Nothing is transmitted when the amplifier's readings are already out of their window.
+            result.update(passed=False, blocking=True, blocked=True, retry=True, mode="none", criteria=[first],
+                          reason=first["text"], warnings=[], measured={},
+                          readings={"before": before[0], "before_problem": before[1], "override": override})
+            runner.add_flag(FLAG)
+            run.fail("turn_on_check", f"turn-on check failed (a failed start; no low-power run): {first['text']} "
+                     f"(collection {run.name})")
+            return False, first["text"]
         sampler = _Sampler(self.readings, run, self._uptime)
         sampler.start()
         pulses_s = facts["pulses"] * facts["pri_s"]
@@ -616,12 +637,14 @@ class TurnOnCheck:
         # 5. The judgement.
         result.update(judge(s, facts, before, override, during, measurement, error))
         text = summary_text(result)
+        if result["warnings"]:
+            runner.add_flag(WARNING_FLAG)
         if result["passed"]:
             return True, text
         runner.add_flag(FLAG)
         if result["retry"]:
-            run.fail("turn_on_check", f"turn-on check failed: {result['reason']} (collection {run.name}; "
-                     "the start is tried again)")
+            run.fail("turn_on_check", f"turn-on check failed (a failed start): {result['reason']} "
+                     f"(collection {run.name})")
             return False, result["reason"]
         if result["blocked"]:
             return False, f"{result['reason']} (collection {run.name}; the next button press or trigger tries again)"
