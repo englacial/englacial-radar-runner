@@ -287,7 +287,7 @@ class Manager(Service):
         elif name == "ended" and event.get("failure"):
             self.log.warning("run ended: %s", event.get("failure"))
         elif name == "turn_on_check":
-            (self.log.info if event.get("passed") is not False else self.log.warning)(
+            (self.log.info if event.get("passed") is not False and not event.get("warnings") else self.log.warning)(
                 "turn-on check, collection %s: %s", event.get("collection"), event.get("text"))
         elif name != "ended":
             self.log.info("%s", {k: v for k, v in event.items()})

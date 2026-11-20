@@ -161,7 +161,7 @@ limit counts two SDR starts for each start (`max_starts_per_hour`).
 
 | Criterion | From | Fails when |
 |---|---|---|
-| `amplifier_before` | the telemetry status just before the low-power run | idle current outside 0.10-0.20 A; the 28 V rail or a temperature beyond the safety watcher's own limits (outside 26-30.5 V; 55 C or more; no cold limit); no reading |
+| `amplifier_before` | the telemetry status just before the low-power run | idle current outside 0.10-0.20 A; the 28 V rail or a temperature beyond the safety watcher's own limits, as the watcher checks its settings (outside 26-30.5 V; 55 C or more; no cold limit); no reading |
 | `amplifier_during` | telemetry readings during its pulses (after `CHIRP.time_offset`) | the highest not 0.05 A above the idle reading (not enabled); one above 0.6 A. Fewer than `min_current_readings` (2) readings: not judged, with a warning |
 | `data` | the data file | fewer records than the pulse count asks for |
 | `clipping` | the raw maximum of the low-power data | at or above `clip_fs` (0.9 of full scale) |
@@ -204,7 +204,8 @@ whether the direct wave clips at full power.
 | passed | the radar starts at the requested power |
 | failed, record only (`blocking: false`, or the expected values not set) | the radar starts anyway; the collection carries the flag `turn_on_check_failed`; a low alert |
 | failed, blocking (`blocking: true` and `expected.verified`), on the signal, clipping or data | the radar stays off: fault `turn_on_check` (fast blink, high alert with the reason); the next button press, `radarctl start` or motion trigger clears it and checks again |
-| failed, blocking, on the amplifier readings only, or the analysis failed | a failed start, retried as any (below): a matter of telemetry or the amplifier, not of the antenna |
+| failed, blocking, on the amplifier readings only, or the analysis failed | a failed start ("FAILED (amplifier readings): a failed start"), retried as any (below): a matter of telemetry or the amplifier, not of the antenna. If `amplifier_before` fails, the low-power run is not made at all (in record-only mode it is made and recorded) |
+| passed or failed with warnings (too few readings, pulses too short, clipping predicted at full power, the check at the requested gain) | the collection carries the flag `turn_on_check_warning`; a warning in the journal |
 | the low-power radar failed (did not start, exited with an error, killed, USB 2, not finished within `time_offset` + twice its pulse time + 5 s) | a failed start, retried as any (10, 30, 90 s, then `start_failures`) |
 | the amplifier not confirmed safe after it | fault `amp_unsafe`, as after any radar |
 | a stop at any point | nothing more is started |

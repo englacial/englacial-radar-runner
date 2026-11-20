@@ -82,6 +82,7 @@ def check_env(env):
         check = turnon.TurnOnCheck(env.config, s)
         r = Runner(env.config, events, turn_on_check=check, amp_telemetry=telemetry or Telemetry())
         check.runner = r
+        r.feed = feeds[-1] if feed else None
         runners.append(r)
         return r
     runners = []
@@ -198,7 +199,31 @@ def test_amplifier_current_that_does_not_rise_fails_the_check(env, events, check
     info = events.wait("ended")
     assert info["kind"] == "turn_on_check" and "amplifier current did not rise" in info["failure"]
     # An amplifier matter before the antenna is judged: a failed start, retried, not the latched fault.
-    assert not info["fatal"] and "the start is tried again" in events.wait("turn_on_check")["text"]
+    text = events.wait("turn_on_check")["text"]
+    assert not info["fatal"] and text.startswith("FAILED (amplifier readings): a failed start: ")
+    assert "(a failed start)" in info["failure"] and "tried again" not in info["failure"]
+
+
+@pytest.mark.parametrize("blocking", [True, False])
+def test_amplifier_readings_wrong_before_the_run(env, events, check_env, blocking):
+    # Blocking: nothing is transmitted, the start fails at once. Record only: the low-power run is made.
+    r = check_env(events, blocking=blocking, **VERIFIED)
+    r.feed.idle, r.feed.on = 0.39, 0.5
+    time.sleep(0.2)
+    r.start(REQUEST)
+    if not blocking:
+        events.wait("started")
+        r.stop("test stop")
+    info = events.wait("ended")
+    summary = events.wait("turn_on_check")
+    assert [c["name"] for c in summary["criteria"] if c["ok"] is False] == ["amplifier_before"]
+    ran = os.path.exists(os.path.join(check_dir(env), "low_power.bin.0"))
+    if blocking:
+        assert info["kind"] == "turn_on_check" and not info["fatal"] and not info["launched"]
+        assert "idle current 0.390 A" in info["failure"] and not ran and r._current is None
+        assert "radar" not in result(env)
+    else:
+        assert info["failure"] == "" and ran and summary["passed"] is False
 
 
 def test_the_default_pulse_count_gives_readings_at_the_real_telemetry_rate(env, events, check_env):
@@ -227,6 +252,7 @@ def test_too_few_readings_during_short_pulses_is_not_judged_and_does_not_block(e
     assert any("amplifier readings during the pulses" in w for w in summary["warnings"])
     assert any("too short for 2 amplifier readings" in w for w in summary["warnings"])
     assert "warning:" in summary["text"]
+    assert "turn_on_check_warning" in env.metadata()["flags"]     # the collection says so too
 
 
 def test_the_readings_window_ends_at_the_check_radars_own_exit(env, events, check_env):
@@ -561,3 +587,15 @@ def test_the_service_shows_a_blocking_failure_as_a_fault_and_tries_again_at_the_
         mgr.wait_state("ready")
     finally:
         mgr.stop()
+
+
+def test_a_check_with_warnings_is_logged_as_a_warning(env, caplog):
+    from radar_runner.manager.service import Manager
+    manager = Manager(env.config)
+    with caplog.at_level("INFO"):
+        manager._record({"event": "turn_on_check", "collection": "b1", "passed": True, "text": "passed",
+                         "warnings": ["only 1 amplifier readings during the pulses"]})
+        manager._record({"event": "turn_on_check", "collection": "b2", "passed": True, "text": "passed"})
+    levels = {r.getMessage().split(":")[0][-2:]: r.levelname for r in caplog.records
+              if "turn-on check" in r.getMessage()}
+    assert levels == {"b1": "WARNING", "b2": "INFO"}
