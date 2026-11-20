@@ -10,7 +10,7 @@ added 2026-11-19 (stage 2); sections 14 and 15 added 2026-11-19 (stages 4 and 3)
 ```
 setup/setup.sh --dry-run     # show what would change; no root needed
 tmux                         # a dropped SSH session must not interrupt the next command
-sudo setup/setup.sh          # apply sections 1-15; safe to run again, also after an interruption
+sudo setup/setup.sh          # apply sections 1-16; safe to run again, also after an interruption
 sudo reboot                  # logind and journald read their files at boot
 setup/check.py               # one PASS/FAIL line per item below
 ```
@@ -590,6 +590,27 @@ relying on it.
   `tail /var/lib/radar-runner/user/watcher-events.jsonl`
 - **Revert:** `sudo systemctl disable --now radar-watcher && sudo rm /etc/systemd/system/radar-watcher.service && sudo systemctl daemon-reload`.
   The event log stays.
+
+### 16. Alerts service
+
+- **What:** `systemd/radar-alerts.service` copied to `/etc/systemd/system/`,
+  enabled and started if it is not enabled yet (a running one is never
+  restarted or stopped), and `/usr/local/bin/alertctl` linked to
+  `bin/alertctl`. Its files go to `/var/lib/radar-runner/user` (state, queue,
+  inbox) and `/run/radar-runner/user/alerts.json` (item 1). It needs
+  `/etc/radar-runner/secrets.yaml` (mode 0640, `root:englacial`) with
+  `alerts: ntfy: {server, topic, token}`; the script only says whether the file
+  exists and never reads it. Added 2026-11-19 (stage 5).
+- **Why and how it works:** `radar_runner/alerts/README.md`. It only reads the
+  other services' files. The unit allows writes only in the two `user`
+  directories (`ProtectSystem=strict`), runs at `Nice=10` with
+  `MemoryMax=200M` and `OOMScoreAdjust=500`, and no other unit depends on it.
+- **Side effect:** a boot summary goes to ntfy at every boot (at 3 minutes of
+  uptime), and alerts whenever the other services report faults.
+- **Verify:** `setup/check.py` (section "setup.sh: alerts"); `alertctl status`;
+  `alertctl test --wait 60`
+- **Revert:** `sudo systemctl disable --now radar-alerts && sudo rm /etc/systemd/system/radar-alerts.service /usr/local/bin/alertctl && sudo systemctl daemon-reload`.
+  Its state and queue (`/var/lib/radar-runner/user/alerts-*`) may be deleted.
 
 ## Deferred to later stages (not done by `setup.sh`)
 

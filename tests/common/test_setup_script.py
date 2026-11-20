@@ -929,3 +929,83 @@ def test_after_setup_the_watcher_is_enabled_the_manager_is_not_and_neither_is_st
         assert system.path(f"/etc/systemd/system/{unit}").is_file() and unit not in state["active"]
     assert WATCHER in state["enabled"] and MANAGER not in state["enabled"]
     assert not [c for c in system.log if ("radar-watcher" in c or "radar-manager" in c) and ("start" in c or "--now" in c)]
+
+
+# ---- the alerts service (stage 5): enabled and started, like the telemetry service
+
+ALERTS = "radar-alerts.service"
+ALERTCTL_LINK = "/usr/local/bin/alertctl"
+ALERTCTL_TARGET = "/home/englacial/englacial-radar-runner/bin/alertctl"
+
+
+def test_alerts_service_is_installed_enabled_and_started_with_alertctl(system):
+    r = system.run("--dry-run")
+    assert r.returncode == 0 and f"WOULD    run: systemctl enable {ALERTS}" in r.stdout
+    assert f"WOULD    run: systemctl start --no-block {ALERTS}" in r.stdout
+    assert f"WOULD    link {ALERTCTL_LINK} -> {ALERTCTL_TARGET}" in r.stdout
+    assert not system.path(ALERTCTL_LINK).is_symlink() and ALERTS not in system.state["enabled"]
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert filecmp.cmp(os.path.join(REPO, "systemd", ALERTS), system.path(f"/etc/systemd/system/{ALERTS}"),
+                       shallow=False)
+    assert system.mode(f"/etc/systemd/system/{ALERTS}") == 0o644
+    assert os.readlink(system.path(ALERTCTL_LINK)) == ALERTCTL_TARGET
+    assert ALERTS in system.state["enabled"] and ALERTS in system.state["active"]
+    assert "secrets.yaml is missing: alerts are queued but not sent" in r.stdout
+    log = system.log
+    assert (log.index("systemctl enable radar-watcher.service") < log.index(f"systemctl enable {ALERTS}")
+            < log.index(f"systemctl start --no-block {ALERTS}") < log.index(APT_INSTALL))   # before the internet step
+    system.path("/etc/radar-runner/secrets.yaml").write_text("alerts: {}\n")
+    system.set(log=[])
+    r = system.run()
+    assert "radar-alerts.service is enabled and running (not restarted)" in r.stdout
+    assert "/etc/radar-runner/secrets.yaml is there" in r.stdout
+    assert not [c for c in system.log if "alerts" in c]
+
+
+def test_running_alerts_service_is_never_restarted_or_stopped(system):
+    assert system.run().returncode == 0
+    system.path(f"/etc/systemd/system/{ALERTS}").write_text("[Unit]\nDescription=old\n")
+    system.set(log=[])
+    r = system.run()
+    assert r.returncode == 0 and f"replace /etc/systemd/system/{ALERTS}" in r.stdout
+    assert "keeps the old unit until it is restarted: systemctl restart radar-alerts" in r.stdout
+    assert system.log == ["systemctl daemon-reload"]
+    system.set(active=[u for u in system.state["active"] if u != ALERTS], log=[])      # stopped by hand
+    r = system.run()
+    assert "radar-alerts.service is enabled but inactive: left as it is" in r.stdout
+    assert not [c for c in system.log if "alerts" in c]
+
+
+def test_an_alertctl_that_is_not_a_link_is_left_alone_and_setup_goes_on(system):
+    link = system.path(ALERTCTL_LINK)
+    link.parent.mkdir(parents=True)
+    link.write_text("#!/bin/sh\n")
+    r = system.run()
+    assert r.returncode == 0 and f"NOT LINKED: {ALERTCTL_LINK} exists and is not a link" in r.stdout
+    assert link.read_text() == "#!/bin/sh\n" and APT_INSTALL in system.log
+
+
+@pytest.mark.parametrize("flag", ["alerts_wont_enable", "alerts_wont_start"])
+def test_a_failed_enable_or_start_of_the_alerts_service_never_stops_the_setup(system, flag):
+    system.set(**{flag: True})
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "FAILED: systemctl" in r.stdout and "setup goes on" in r.stdout
+    assert APT_INSTALL in system.log                       # the remaining steps ran
+    assert "setup: verify with: setup/check.py" in r.stdout
+
+
+def test_a_unit_file_that_cannot_be_installed_never_stops_the_setup(system):
+    assert system.run().returncode == 0
+    system.path(f"/etc/systemd/system/{ALERTS}").write_text("[Unit]\nDescription=old\n")
+    (system.bin / "mktemp").unlink()            # a full or broken card: no temporary file can be made
+    (system.bin / "mktemp").write_text("#!/bin/sh\necho 'mktemp: No space left on device' >&2\nexit 1\n")
+    (system.bin / "mktemp").chmod(0o755)
+    system.set(log=[])
+    r = system.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"FAILED: cannot install /etc/systemd/system/{ALERTS} (setup goes on)" in r.stdout
+    assert "the alerts service is left as it is" in r.stdout
+    assert "setup: verify with: setup/check.py" in r.stdout
+    assert system.path(f"/etc/systemd/system/{ALERTS}").read_text() == "[Unit]\nDescription=old\n"

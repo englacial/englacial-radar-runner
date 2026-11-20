@@ -340,6 +340,10 @@ class Manager(Service):
                 item[2]["done"].set()
         self._act()
         self._record({"event": "manager_stopped", "radar_stopped": done})
+        # The radar is stopped by now: wait (at most 1 s) for the last events to reach the drive.
+        if not self.event_log.close(1.0):
+            self.log.warning("the last events may not have reached the drive: %s",
+                             self.event_log.sync_error or "the sync did not finish within 1 s")
         if self.server is not None:
             self.server.close()
         self.panel.close()

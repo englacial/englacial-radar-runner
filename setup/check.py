@@ -1195,6 +1195,65 @@ def _(name):
             check(what, ok, observed, expected)
 
 
+section("setup.sh: alerts")
+
+
+@item("radar-alerts.service unit file")
+def _(name):
+    mine = read(os.path.join(REPO, "systemd", "radar-alerts.service"))
+    theirs = read("/etc/systemd/system/radar-alerts.service")
+    check(name, theirs is not None and mine == theirs,
+          "not installed" if theirs is None else "identical to systemd/radar-alerts.service" if mine == theirs
+          else "differs from systemd/radar-alerts.service")
+    enabled, active = unit_state("radar-alerts.service")
+    check("radar-alerts.service", (enabled, active) == ("enabled", "active"), f"{enabled}, {active}", "enabled, active")
+    # An observer: no other unit may need it, so that its failure changes nothing else.
+    rc, text, err = run("systemctl", "show", "-p", "RequiredBy,RequisiteOf,BoundBy,WantedBy", "radar-alerts.service")
+    if rc != 0:
+        raise Skip(f"systemctl show: {err or text}")
+    props = dict(line.split("=", 1) for line in text.split("\n") if "=" in line)
+    needed_by = [u for key in ("RequiredBy", "RequisiteOf", "BoundBy") for u in props.get(key, "").split()]
+    wanted_by = [u for u in props.get("WantedBy", "").split() if u != "multi-user.target"]
+    check("no other unit depends on radar-alerts.service", not needed_by and not wanted_by,
+          ", ".join(needed_by + wanted_by) or "none", "none (multi-user.target only wants it)")
+
+
+@item("alertctl command")
+def _(name):
+    link, target = "/usr/local/bin/alertctl", os.path.join(REPO, "bin", "alertctl")
+    real = os.path.realpath(link) if os.path.lexists(link) else None
+    check(name, real == os.path.realpath(target), f"{link} -> {real}" if real else f"{link} missing", target)
+
+
+@item("alerts status file")
+def _(name):
+    r = status_files.read_status(status_files.status_path("alerts"), 10.0)
+    if not r.ok:
+        report(FAIL, name, f"{r.state}: {r.error}")
+        return
+    d = r.data
+    check(name, True, f"fresh ({r.age_s:.1f} s old)")
+    ntfy = d.get("ntfy") or {}
+    check("ntfy settings", ntfy.get("configured") is True, "configured" if ntfy.get("configured") else ntfy.get("problem"),
+          "alerts: ntfy: {server, topic, token} in /etc/radar-runner/secrets.yaml")
+    link = d.get("link") or {}
+    check("alerts reach ntfy", link.get("state") in ("ok", "idle") and not link.get("failures_in_a_row"),
+          f"{link.get('state')}: {link.get('last_result') or 'nothing sent yet'}",
+          "ok or idle (failing is expected while the Pi is offline; the alerts wait in the queue)")
+    q = d.get("queue") or {}
+    check("alert queue", not q.get("error"), f"{q.get('length')} waiting, {q.get('dropped')} dropped"
+          + (f"; {q['error']}" if q.get("error") else ""))
+    errors = d.get("errors") or {}
+    check("alerts service errors", not errors, "; ".join(f"{k}: {v}" for k, v in errors.items()) or "none")
+    for source, e in sorted((d.get("events") or {}).items()):
+        check(f"alerts follows the {source} event log", not e.get("error"),
+              f"{e.get('file')}: {e.get('lines')} lines" + (f"; {e['error']}" if e.get("error") else ""))
+    report(INFO, "boot summary", "queued in this boot" if d.get("summary_sent") else "not yet (at 3 min of uptime)")
+    for problem in d.get("config_warnings") or []:
+        if "alerts" in problem:
+            report(FAIL, "alerts settings", problem)
+
+
 section("setup.sh: time (chrony, fake-hwclock)")
 
 

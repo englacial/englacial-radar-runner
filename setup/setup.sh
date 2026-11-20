@@ -630,6 +630,121 @@ EOF
     note "Worst case, every step at its limit: power-off command 37 s after the loss, last resort at 47 s)"
 }
 
+# Like put_file, for the alerts step only: a failure is reported and returns 1
+# instead of stopping the setup (the alerts service is an observer). Sets CHANGED.
+alerts_put_unit() {
+    local src=$1 dst=$DESTDIR$2 want have tmp
+    CHANGED=0
+    if [ ! -f "$src" ]; then note "FAILED: missing in the repository: $src"; return 1; fi
+    want="644 root root"
+    [ -z "$DESTDIR" ] || want="644"
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+        have=$(stat -c '%a %U %G' "$dst" 2>/dev/null || true)
+        [ -z "$DESTDIR" ] || have=$(stat -c '%a' "$dst" 2>/dev/null || true)
+        if [ "$have" = "$want" ]; then ok "$2 is in place"; return 0; fi
+        change "$2: owner and mode $have -> $want"
+    elif [ -e "$dst" ]; then
+        change "replace $2 (differs from ${src#"$REPO"/}):"
+        diff -u "$dst" "$src" | sed -n '3,$p' | sed 's/^/             /' || true
+    else
+        change "install $2 (from ${src#"$REPO"/})"
+    fi
+    CHANGED=1
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    if install -d -m 0755 "$(dirname "$dst")" && tmp=$(mktemp "$(dirname "$dst")/.radar-setup.XXXXXX") &&
+       { TMP_FILE=$tmp; cat "$src" > "$tmp"; } && chmod 0644 "$tmp" &&
+       { [ -n "$DESTDIR" ] || chown root:root "$tmp"; } && sync "$tmp" && mv -f "$tmp" "$dst"; then
+        TMP_FILE=""
+        return 0
+    fi
+    [ -z "${tmp:-}" ] || rm -f "$tmp"
+    TMP_FILE=""
+    note "FAILED: cannot install $2 (setup goes on)"
+    return 1
+}
+
+# (m) The alerts service (stage 5): its unit and the alertctl command. It only
+# reads what the other services publish, so it is enabled and started like the
+# telemetry service; a running one is never restarted or stopped. Its files go
+# in /var/lib/radar-runner/user and /run/radar-runner/user (item 1). It is an
+# observer: nothing in this step stops the setup; a problem is reported and the
+# remaining steps run.
+step_alerts_service() {
+    step "Alerts service unit and alertctl"
+    local unit=/etc/systemd/system/radar-alerts.service link=/usr/local/bin/alertctl
+    local target=$UNIT_REPO/bin/alertctl enabled active have
+    if [ "$REPO" != "$UNIT_REPO" ] && [ -z "$DESTDIR" ]; then
+        note "NOT INSTALLED: the unit file expects this repository at $UNIT_REPO, but it is at $REPO"
+        return 0
+    fi
+    if [ -z "$DESTDIR" ] && [ ! -x "$REPO/.venv/bin/python" ]; then
+        note "NOT INSTALLED: the Python environment is missing: run setup/build_venv.sh as $SERVICE_USER first"
+        return 0
+    fi
+    if [ -e "$DESTDIR/etc/radar-runner/secrets.yaml" ]; then
+        ok "/etc/radar-runner/secrets.yaml is there (alerts.ntfy: server, topic, token; not read here)"
+    else
+        note "/etc/radar-runner/secrets.yaml is missing: alerts are queued but not sent until it has"
+        note "alerts: ntfy: {server, topic, token} (radar_runner/alerts/README.md)"
+    fi
+    if ! alerts_put_unit "$REPO/systemd/radar-alerts.service" "$unit"; then
+        note "the alerts service is left as it is; the remaining steps run"
+        return 0
+    fi
+    [ "$CHANGED" -eq 0 ] || RELOAD_NEEDED=1
+    have=$(readlink "$DESTDIR$link" 2>/dev/null || true)
+    if [ "$have" = "$target" ]; then
+        ok "$link points to $target"
+    else
+        [ -z "$have" ] || log "           $link points to $have"
+        if [ -z "$have" ] && [ -e "$DESTDIR$link" ]; then
+            note "NOT LINKED: $link exists and is not a link: remove it or move it away, then run setup again"
+        else
+            change "link $link -> $target"
+            if [ "$DRY_RUN" -eq 0 ]; then
+                install -d -m 0755 "$(dirname "$DESTDIR$link")" && ln -sfn "$target" "$DESTDIR$link" ||
+                    note "FAILED: cannot link $link (setup goes on)"
+            fi
+        fi
+    fi
+    enabled=$(systemctl is-enabled radar-alerts.service 2>/dev/null || true)
+    active=$(systemctl is-active radar-alerts.service 2>/dev/null || true)
+    if [ "$CHANGED" -eq 1 ] && [ "$active" = active ]; then
+        note "the running service keeps the old unit until it is restarted: systemctl restart radar-alerts"
+    fi
+    case "$enabled" in
+        enabled)
+            if [ "$active" = active ]; then
+                ok "radar-alerts.service is enabled and running (not restarted)"
+            else
+                note "radar-alerts.service is enabled but ${active:-not running}: left as it is."
+                note "to start it: systemctl start radar-alerts"
+            fi ;;
+        masked)
+            note "radar-alerts.service is masked: left as it is" ;;
+        *)
+            log "           radar-alerts.service is ${enabled:-not enabled}, ${active:-not running}"
+            note "once started it sends a boot summary to ntfy (at 3 minutes of uptime, or at once if later)"
+            if [ "$RELOAD_NEEDED" -eq 1 ]; then
+                change "run: systemctl daemon-reload"
+                if [ "$DRY_RUN" -eq 1 ] || systemctl daemon-reload; then
+                    RELOAD_NEEDED=0
+                else
+                    note "FAILED: systemctl daemon-reload (setup goes on; the last step tries it again)"
+                fi
+            fi
+            # Enabled, then started without waiting for it; a failure of either is reported, not fatal.
+            change "run: systemctl enable radar-alerts.service"
+            if [ "$DRY_RUN" -eq 0 ] && ! systemctl enable radar-alerts.service; then
+                note "FAILED: systemctl enable radar-alerts.service (setup goes on; see systemctl status radar-alerts)"
+            fi
+            change "run: systemctl start --no-block radar-alerts.service"
+            if [ "$DRY_RUN" -eq 0 ] && ! systemctl start --no-block radar-alerts.service; then
+                note "FAILED: systemctl start radar-alerts.service (setup goes on; see journalctl -u radar-alerts)"
+            fi ;;
+    esac
+}
+
 # (j) Time. chrony takes time from gpsd and, when the internet is up, from
 # NTP; fake-hwclock saves the clock every minute and at shutdown and restores
 # it at boot (the Pi's clock has no battery). Both replace systemd-timesyncd,
@@ -817,6 +932,7 @@ step_gpsd
 step_telemetry_service
 step_watcher_service
 step_manager
+step_alerts_service
 [ "$OPT_NVME" -eq 0 ] || optional_nvme_by_label
 [ "$OPT_HOLD" -eq 0 ] || optional_hold_packages
 step_time           # last: the only step that needs the internet
