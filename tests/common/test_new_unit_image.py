@@ -786,3 +786,14 @@ def test_cached_cloud_config_quoted_hostname_is_edited(unit):
     write(os.path.join(root, path.lstrip("/")), f"#cloud-config\nhostname: '{OLD}'  # set by imager\n", 0o600)
     assert run(root, boot) == 0
     assert read(root, path) == f"#cloud-config\nhostname: {NEW}  # set by imager\n"
+
+
+def test_scan_for_the_old_hostname_stays_in_the_image(shm, capsys):
+    root, boot = make_unit(os.path.join(shm, "unit"))
+    host = os.path.join(shm, "host-cloud")          # stands for a directory of the imaging computer
+    write(os.path.join(host, "data", "host-only-file"), f"{OLD}\n")
+    shutil.rmtree(os.path.join(root, "var/lib/cloud"))
+    os.symlink(host, os.path.join(root, "var/lib/cloud"))
+    os.symlink(host, os.path.join(root, "etc/linked-dir"))      # a link inside a walked directory
+    assert run(root, boot) == 0
+    assert "host-only-file" not in capsys.readouterr().out

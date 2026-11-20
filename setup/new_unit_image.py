@@ -834,10 +834,11 @@ class Unit:
             return []
         hits = []
         for tree, top in ((self.root, "/etc"), (self.root, "/var/lib/cloud"), (self.boot, "/")):
-            base = tree.path(top)
-            if not os.path.isdir(base):
+            base = tree.path(top, follow_last=True)        # resolved inside the image
+            st = os.lstat(base) if os.path.lexists(base) else None
+            if st is None or not stat.S_ISDIR(st.st_mode):
                 continue
-            for dirpath, dirnames, filenames in os.walk(base):
+            for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
                 if tree is self.boot:
                     dirnames[:] = []
                 for name in filenames:
