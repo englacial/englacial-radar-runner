@@ -200,7 +200,13 @@ def manager_alert(event, previous=None, error_rate_warn=None):
     if name == "fault":
         return Alert(f"manager.fault.{kind}", HIGH, f"radar FAULT: {kind}",
                      f"The radar manager is in fault ({kind}): {_text(event, 'reason')}. "
-                     "The radar stays off until the fault is cleared (radar_runner/manager/README.md, \"Faults\").")
+                     "The radar stays off until the fault is cleared (radar_runner/manager/README.md, \"Faults\")"
+                     + (": the next button press, radarctl start or motion trigger clears it and checks again."
+                        if kind == "turn_on_check" else "."))
+    if name == "turn_on_check" and event.get("passed") is False and not event.get("blocked"):
+        return Alert("manager.turn_on_check", LOW, "turn-on check failed (record only)",
+                     f"The turn-on check failed and the radar started anyway: {_text(event, 'reason')}"
+                     + (f" (collection {_text(event, 'collection')})" if _text(event, "collection") else ""))
     if name == "fault_cleared":
         return Alert(f"manager.fault_cleared.{kind}", LOW, f"radar fault cleared: {kind}",
                      f"Fault {kind} cleared by {_text(event, 'by') or 'unknown'}.", clears=f"manager.fault.{kind}")
