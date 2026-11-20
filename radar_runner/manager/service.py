@@ -7,6 +7,7 @@ the service loop, so the state machine is only ever touched from one thread.
     button / radarctl / runner / auto  ->  queue  ->  tick()  ->  logic  ->  runner, LEDs,
                                                                              status file, event log
 """
+import json
 import logging
 import os
 import queue
@@ -14,11 +15,16 @@ import threading
 import time
 
 from radar_runner.common.service import Service
+from radar_runner.common.status import current_boot_id, read_status
 
-from . import ampsafe, control, gates, logic as L, panel as panel_module, turnon
+from . import ampsafe, control, gates, logic as L, motion as motion_module, panel as panel_module, turnon
 from .runner import Runner
 
 REPLY_TIMEOUT_S = 1.5       # shorter than radarctl waits for an answer (2 s)
+# With the motion trigger on: the block after a manual stop, kept across a restart of the manager
+# within the same boot. A new boot starts without it (a block from before a power cycle must not
+# keep the radar off for the first drive).
+BLOCK_FILE = "auto-blocked"
 
 
 class Manager(Service):
@@ -38,6 +44,17 @@ class Manager(Service):
         self.check_settings, refused = turnon.Settings.from_config(config)
         self.config_warnings += refused
         self.last_check = None                  # the last turn-on check's summary (turnon.py)
+        # The GPS motion trigger: only when it is enabled. Disabled, nothing of it runs.
+        self.motion = None
+        if L.AUTO in logic_cfg.sources:
+            motion_cfg, refused = motion_module.MotionConfig.from_config(self.cfg["motion"])
+            self.config_warnings += refused
+            self.motion = motion_module.Motion(motion_cfg)
+            self._motion_file = gates.status_file(self.cfg["gates"]["telemetry"], "telemetry",
+                                                  config["paths"]["run_dir"])
+            self._block_file = os.path.join(config["paths"]["state_dir"], BLOCK_FILE)
+            self.logic.auto_blocked = self._kept_block()
+            self._block_kept = self.logic.auto_blocked
         self.overrides = gates.Overrides(config["paths"]["state_dir"])
         self.sdr_state = ampsafe.SdrState(config["paths"]["state_dir"],
                                           ampsafe.tool_lock_path(self.cfg["amp_safe"]))
@@ -137,9 +154,14 @@ class Manager(Service):
         if now >= self._next_gates:
             self._check_gates(now)
             self._keep_sdr_safe(now)
+            if self.motion is not None:
+                self._look_for_motion(now)
         else:
             self.logic.tick(now)
         changed = self._act() or changed
+        if self.motion is not None and self.logic.auto_blocked != self._block_kept:
+            self._block_kept = self.logic.auto_blocked
+            self._keep_block(self._block_kept)
 
         leds = L.LEDS[self.logic.state]
         if self.panel.shown != leds:
@@ -166,6 +188,47 @@ class Manager(Service):
             self.runner.add_flag("no_amp_telemetry")
         self.logic.gates(now, results)
         self.runner.hurry = self.logic.power_fail or self.logic.closing
+
+    def _kept_block(self):
+        """The block kept by an earlier manager of this boot; a record from another boot is removed."""
+        try:
+            with open(self._block_file) as f:
+                kept = json.load(f)
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError) as e:
+            self.log.warning("cannot read %s (%s): no block assumed", self._block_file, e)
+            kept = {}
+        if isinstance(kept, dict) and kept.get("boot_id") == current_boot_id():
+            self.log.info("motion trigger blocked since %s (a manual stop while driving)", kept.get("since"))
+            return True
+        self._keep_block(False)
+        return False
+
+    def _keep_block(self, blocked):
+        """Write or remove the record of the block. In memory only if that fails; never raises."""
+        try:
+            if blocked:
+                tmp = self._block_file + ".tmp"
+                with open(tmp, "w") as f:       # no sync: it only has to outlive the manager, not the boot
+                    json.dump({"boot_id": current_boot_id(),
+                               "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, f)
+                os.replace(tmp, self._block_file)
+            else:
+                os.unlink(self._block_file)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            self.log.warning("cannot keep the motion trigger's block in %s: %s", self._block_file, e)
+
+    def _look_for_motion(self, now):
+        """The motion trigger's view of the telemetry service's latest fix, reported on a change."""
+        before = self.motion.state
+        read = read_status(self._motion_file, self.cfg["gates"]["telemetry"]["max_age_s"])
+        state = self.motion.update(now, read)
+        if state != before:
+            self.log.info("motion trigger: %s (%s)", state, self.motion.reason)
+            self.report_auto(state, self.motion.label)
 
     def _sdr_presence(self):
         found = self.sdr_gate.find()
@@ -316,6 +379,8 @@ class Manager(Service):
             "amp_enabled_while_idle": self.enabled_idle,
             "turn_on_check": dict(self.check_settings.public(), last=self.last_check),
             "panel": self.panel.snapshot(),
+            # What the motion trigger reports, and why; only {"enabled": false} when it is off.
+            "motion": dict(self.motion.snapshot(), enabled=True) if self.motion else {"enabled": False},
             "socket": self.socket_path,
             "events": {"file": self.event_log.path, "written": self.event_log.written,
                        "error": self.event_log.error},

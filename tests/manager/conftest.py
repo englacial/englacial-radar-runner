@@ -67,6 +67,9 @@ class Env:
                              retry_s=0.3, idle_enabled_s=0.3, assume_enabled_retries=1,
                              unavailable_retries=1, unavailable_delay_s=0.1)
         m["panel"]["enabled"] = False
+        # Never the live gpsd: the tests that log raw GPS data give their own gpsd stand-in.
+        m["gps_log"]["enabled"] = False
+        self.config["telemetry"]["gps"].update(host="127.0.0.1", port=1)
         self.sdr(speed=5000, product="USRP B200")
         self._writers = {}
 

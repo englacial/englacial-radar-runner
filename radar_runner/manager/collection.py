@@ -13,6 +13,8 @@ One directory per collection under the data root:
         prepare.log             chirp generation and build output
         amp_safe.log            output of the "make the amplifier safe" command
         gps_log.txt             created (empty) by the radar
+        gps_raw.ubx             the receiver's raw messages for PPK (radar_runner/gpsraw), and
+        gps_raw.log             the raw GPS logger's own messages; "gps_raw" in collection.json
 
 The name carries the boot counter and a sequence number within the boot, so
 names are unique and sort in the order of recording even when the clock is

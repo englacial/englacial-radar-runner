@@ -8,12 +8,21 @@ from it, and the receiver settings this system depends on.
     setup/gps_receiver.py --apply --ram   NAV-PVT and UART1 NMEA in RAM only (run 20 s after every
                                      start of gpsd, and by the telemetry service a little after
                                      every OLA start and when gpsd delivers no position)
+    setup/gps_receiver.py --comms    the receiver's port statistics (MON-COMMS, a poll that sets
+                                     nothing), twice 10 s apart: transmit-buffer usage and peak,
+                                     bytes per second, error flags
 
 The settings are the USB output tested on this unit, which gpsd without -p used to set: the
 messages gpsd needs (NAV-PVT, SAT, SIG, EOE, POSECEF, VELECEF, DOP and TIMEGPS at every epoch,
 NAV-TIMELS every 255 epochs), the six NMEA sentences that a receiver at factory settings sends on
-USB (GGA, GLL, GSA, GSV, RMC, VTG) off, UBX output on USB, and no NMEA output on the unused UART1.
-gpsd runs passive (-p) and sets none of them. Left on, the NMEA sentences would come at every
+USB (GGA, GLL, GSA, GSV, RMC, VTG) off, UBX output on USB, and no NMEA output on the unused UART1;
+and for the raw GPS log (PPK, radar_runner/gpsraw) RXM-RAWX every `manager.gps_log.rawx_every`
+epochs (a setting, read from the repository's config and /etc/radar-runner/local.yaml; 10 = 1 Hz
+at 10 Hz) and RXM-SFRBX (the broadcast navigation data) as it comes; rawx_every 0 sets both off. gpsd runs passive (-p) and
+sets none of them. The value of rawx_every, the file it came from and every warning of the config
+loader are printed. Without a usable rawx_every, and with --apply while the config loads with a
+warning about /etc/radar-runner/local.yaml or manager.gps_log, the raw pair is neither read nor
+written, the other 17 settings are checked (and provisioned) alone, and the run ends with status 1. Left on, the NMEA sentences would come at every
 epoch at the OLA's 10 Hz on top of the UBX messages, which already fill most of the USB transmit
 buffer. The OLA copies the receiver's settings from RAM to battery-backed memory and flash at
 every OLA start (measured 2026-11-20), so what is in RAM then is what the receiver powers up with
@@ -63,8 +72,14 @@ Why CFG-UART1OUTPROT-NMEA: the receiver runs at 10 Hz (the OLA sets that). With 
 the unused UART1 its transmit buffer overflows and USB carries only part of the messages: gpsd
 delivers fewer fixes, or none.
 
-Everything goes through gpsd: its JSON socket and ubxtool. Standard library only. The run takes
-seconds normally and at most about 100 s (about 170 s without --ram). Exit status:
+The RAM-only run after every start of gpsd keeps to NAV-PVT and UART1 NMEA: those two decide
+whether gpsd has positions at all, and every write reaches flash at the next OLA start. The raw
+messages missing show in each collection's collection.json (`gps_raw.no_raw_data`) and in
+`setup/check.py --receiver`.
+
+Everything goes through gpsd: its JSON socket and ubxtool. Standard library only; the setting
+`rawx_every` is read with the repository's Python environment, as setup/check.py does. The run
+takes seconds normally and at most about 100 s (about 170 s without --ram). Exit status:
     0  gpsd has identified the receiver (already, or after the request) and every setting checked
        is right (after any correction)
     1  a setting checked is not right after the run, or the receiver did not answer
@@ -90,9 +105,13 @@ SETTINGS = {f"CFG-MSGOUT-UBX_NAV_{m}_USB": 1
 SETTINGS["CFG-MSGOUT-UBX_NAV_TIMELS_USB"] = 255
 SETTINGS.update({f"CFG-MSGOUT-NMEA_ID_{m}_USB": 0 for m in ("GGA", "GLL", "GSA", "GSV", "RMC", "VTG")})
 SETTINGS.update({"CFG-USBOUTPROT-UBX": 1, KEY: 0})
+# The raw GPS log: RXM-RAWX every `rawx_every` epochs (manager.gps_log.rawx_every), RXM-SFRBX as it comes.
+RAWX, SFRBX = "CFG-MSGOUT-UBX_RXM_RAWX_USB", "CFG-MSGOUT-UBX_RXM_SFRBX_USB"
 # One read (4 bytes a key) and one write (5 bytes a key: all of these are one-byte values) must
 # each fit in the 255 bytes that gpsd passes on per message, with 12 bytes of frame and header.
-assert 12 + 5 * len(SETTINGS) <= 255
+assert 12 + 5 * (len(SETTINGS) + 2) <= 255
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VENV_PYTHON = os.path.join(REPO, ".venv", "bin", "python")
 LAYERS = ("RAM", "battery-backed", "flash")
 NOT_STORED = "not stored"   # left out of the reply: that layer holds no value and the default applies
 # RAM holds every setting the firmware knows: one left out of a RAM reply, or a refused RAM read,
@@ -247,18 +266,92 @@ def show(key, values, now=""):
                                       for name, v in zip(LAYERS, values)), flush=True)
 
 
+# Which layer set rawx_every, and the loader's warnings, from the repository's environment.
+RAWX_SETTING_CODE = """
+import json, yaml
+from radar_runner.common import config as C
+c, w = C.load(secrets_file=None)
+source = "built-in default"
+for path in (C.REPO_FILE, C.LOCAL_FILE):
+    try:
+        with open(path) as f:
+            d = yaml.safe_load(f)
+        if "rawx_every" in d["manager"]["gps_log"]:
+            source = path
+    except Exception:
+        pass
+print(json.dumps({"value": c["manager"]["gps_log"]["rawx_every"], "source": source, "warnings": w}))
+"""
+LOCAL_FILE = "/etc/radar-runner/local.yaml"
+
+
+def rawx_setting():
+    """{"value", "source", "warnings", "why"}: manager.gps_log.rawx_every from the merged config (value None
+    and `why` if it cannot be had), the file that set it, and every warning of the config loader."""
+    try:
+        out = subprocess.run([VENV_PYTHON, "-B", "-c", RAWX_SETTING_CODE], cwd=REPO, capture_output=True, text=True,
+                             timeout=60)
+        found = json.loads(out.stdout)
+        value, source, warnings = found["value"], found["source"], [str(w) for w in found["warnings"]]
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as e:
+        return {"value": None, "source": "", "warnings": [],
+                "why": f"cannot read manager.gps_log.rawx_every with {VENV_PYTHON}: {e}"}
+    if type(value) is not int or not 0 <= value <= 255:
+        return {"value": None, "source": source, "warnings": warnings,
+                "why": f"manager.gps_log.rawx_every is {value!r}: it must be a whole number from 0 to 255"}
+    return {"value": value, "source": source, "warnings": warnings, "why": ""}
+
+
+def rawx_every():
+    """(manager.gps_log.rawx_every, "") from the merged config, or (None, why not)."""
+    found = rawx_setting()
+    return found["value"], found["why"]
+
+
+def with_raw(every):
+    """The settings to provision for a rawx_every; without the raw pair if it is None."""
+    if every is None:
+        return dict(SETTINGS)
+    return dict(SETTINGS, **{RAWX: every, SFRBX: 1 if every else 0})     # 0: no raw messages
+
+
+def wanted():
+    return with_raw(rawx_setting()["value"])
+
+
 def provision(apply):
-    """Check SETTINGS in the three layers and, with `apply`, write the wrong ones to all three; True if all are right."""
+    """Check the settings in the three layers and, with `apply`, write the wrong ones to all three; True if all are
+    right. Without a usable rawx_every the raw pair is left out (not checked: False). A config warning about
+    the unit's file or the raw log refuses the write: every write here is permanent."""
+    found = rawx_setting()
+    for warning in found["warnings"]:
+        print(f"config warning: {warning}", flush=True)
+    every = found["value"]
+    if every is None:
+        print(f"RXM-RAWX and RXM-SFRBX: not checked ({found['why']})", flush=True)
+    elif apply and any(LOCAL_FILE in w or "gps_log" in w for w in found["warnings"]):
+        # The other 17 do not depend on the config: they are still provisioned.
+        print(f"RXM-RAWX and RXM-SFRBX: not checked and not written: the configuration loads with a warning "
+              f"about {LOCAL_FILE} or manager.gps_log (above), so rawx_every ({every}) may not be the one meant. "
+              f"Correct it (`.venv/bin/python -m radar_runner.common.config` shows the settings and warnings), "
+              f"then run --apply again", flush=True)
+        every = None
+    else:
+        print(f"manager.gps_log.rawx_every: {every} (from {found['source']})", flush=True)
+    return _provision(apply, with_raw(every)) and every is not None
+
+
+def _provision(apply, settings):
     args = gpsd_args()
     if apply and args and "-p" not in args[1:]:
         print(f"warning: gpsd is not running passive (-p): at its next start it sets part of this again "
               f"({' '.join(args)}; setup/setup.sh installs it with -p)", flush=True)
-    table = layers(SETTINGS)
+    table = layers(settings)
     for key, values in table.items():
         show(key, values)
-    wrong = {key: SETTINGS[key] for key, values in table.items() if any(v != SETTINGS[key] for v in values)}
+    wrong = {key: settings[key] for key, values in table.items() if any(v != settings[key] for v in values)}
     if not wrong:
-        print(f"all {len(SETTINGS)} settings are right in RAM, battery-backed memory and flash", flush=True)
+        print(f"all {len(settings)} settings are right in RAM, battery-backed memory and flash", flush=True)
         return True
     if any(values[0] == UNKNOWN for values in table.values()):
         print("the receiver refused the read of RAM, which holds every setting it knows: a setting unknown to "
@@ -275,13 +368,51 @@ def provision(apply):
     table = layers(wrong)
     for key, values in table.items():
         show(key, values, " now")
-    return all(v == SETTINGS[key] for key, values in table.items() for v in values)
+    return all(v == settings[key] for key, values in table.items() for v in values)
+
+
+PORT_RE = re.compile(r"Port: \S+ \((\w+)\)\s+txPending (\d+) txBytes (\d+) txUsage (\d+) txPeakUsage (\d+)")
+COMMS_GAP_S = 10.0
+
+
+def parse_comms(text):
+    """(txErrors or None, {port: (txBytes, txUsage %, txPeakUsage %)}) from ubxtool's MON-COMMS decode."""
+    m = re.search(r"txErrors x([0-9a-fA-F]+)", text)
+    ports = {p: (int(b), int(u), int(k)) for p, _, b, u, k in PORT_RE.findall(text)}
+    return (int(m.group(1), 16) if m else None), ports
+
+
+def comms():
+    """Report the port statistics twice, COMMS_GAP_S apart; 0 if read with no error flags, 1 if not."""
+    polls = []
+    for n in range(2):
+        if n:
+            time.sleep(COMMS_GAP_S)
+        for _ in range(2):          # asked once more if the reply was lost
+            errors, ports = parse_comms(ubxtool("-p", "MON-COMMS"))
+            if errors is not None:
+                break
+        polls.append((time.monotonic(), errors, ports))
+        if errors is None:
+            print("no MON-COMMS reply from the receiver", flush=True)
+            return 1
+    (t0, _, first), (t1, errors, last) = polls
+    for port, (sent, usage, peak) in last.items():
+        rate = (sent - first[port][0]) / (t1 - t0) if port in first and sent >= first[port][0] else None
+        print(f"{port}: transmit buffer {usage} % (highest in the last period), peak {peak} % (since the "
+              f"receiver started)" + (f", {rate:.0f} bytes/s" if rate is not None else ""), flush=True)
+    flags = [name for bit, name in ((0x40, "memory"), (0x80, "allocation")) if errors & bit]
+    print(f"txErrors 0x{errors:02x}" + (f": {' and '.join(flags)} errors (output lost)" if flags else ": none"),
+          flush=True)
+    return 1 if flags else 0
 
 
 def main(argv):
-    if set(argv) - {"--apply", "--ram"}:
+    if set(argv) - {"--apply", "--ram", "--comms"} or ("--comms" in argv and len(argv) > 1):
         print(__doc__, file=sys.stderr)
         return 4
+    if "--comms" in argv:
+        return comms()
     apply, ram_only = "--apply" in argv, "--ram" in argv
     status = identify(apply)
     if status == 3:

@@ -41,6 +41,43 @@ radar" below, with the user present.
   radar that finished by itself, it is blocked until it has said "stationary".
   `radarctl start` during an automatic run takes the run over as a manual one.
 
+### The GPS motion trigger
+
+Off unless `manager.triggers.gps` is true; off, none of it runs and the status
+shows `"motion": {"enabled": false}`. `motion.py` reads the fixes in the
+telemetry status file (`sources.gps`, one a second from gpsd) at every gate
+check and reports a change to the logic above. It has no gpsd connection of
+its own. A fix counts if the GPS source is healthy, the fix is new and at most
+`stale_s` (5 s) old, 3D (`min_mode`), with gpsd's horizontal error estimate at
+most `max_eph_m` (5 m). Settings in `manager.motion`, times in receiver time:
+
+* "moving": every counting fix at least `start_speed_mps` (2 m/s) for
+  `start_s` (20 s);
+* "stationary": every counting fix at most `stop_speed_mps` (0.5 m/s) for
+  `stop_s` (120 s);
+* "unknown": nothing that counts for `stale_s`, and at start-up. A fix that
+  does not count, a speed between the two, a gap of more than `max_gap_s`
+  (3 s; below the smaller of `start_s` and `stop_s`, at most `stale_s`)
+  between counting fixes, or `stale_s` without a counting fix starts both
+  counts again. Each answer holds
+  until another is reached: a truck creeping between the two speeds keeps
+  the last one.
+
+The defaults come from 30 h of fixes with the antenna parked indoors
+(2026-11-19/20, telemetry logs): 93 % of fixes under 0.3 m/s and 99.5 % under
+1 m/s, but stretches of up to 11 s in a row above 2 m/s (9 s with the error
+estimate at most 5 m; with it at most 3 m, nothing above 1.5 m/s for more
+than a second) and single fixes up to 10 m/s. `start_s` is at least 5 and
+`stop_s` at least 30 (refused below, with a warning, and the default used).
+`radarctl status` shows the answer, why, and how the newest fix counts.
+
+The block after a manual stop (and after a fault or a radar that finished by
+itself) is kept in `<state_dir>/auto-blocked` while the trigger is on, so a
+restart of the manager while driving does not start the radar again. The
+record carries the boot ID: at a new boot it is removed and the trigger starts
+unblocked, so a block from before a power cycle cannot keep the radar off for
+the first drive. It goes when the trigger reports "stationary".
+
 A manual run ends with a manual stop, after `run.manual_timeout_s` (14 h), or
 when a radar with a pulse count finishes by itself. A radar that runs until
 stopped (`num_pulses: -1`) and exits with status 0 unasked is an interruption:
@@ -462,9 +499,11 @@ the command's own 4 s and the hook's 5 s.
 | `/run/radar-runner/user/manager.sock` | command socket (mode 0660) |
 | `/var/lib/radar-runner/user/manager-events.jsonl` | event log: state changes, requests, starts, stops, faults, gate changes. Each line is synced to the drive by a thread of its own (never holding up a stop); at its own stop, once the radar is stopped, the manager waits up to 1 s for the last lines to be synced |
 | `/var/lib/radar-runner/user/override-no-amp-telemetry` | the override |
+| `/var/lib/radar-runner/user/auto-blocked` | the motion trigger's block after a manual stop, with the boot ID (only with the trigger on) |
 | `/var/lib/radar-runner/user/sdr-state` | is the SDR's amplifier pin known to be safe: first line `safe` or `unknown` |
 | `/var/lib/radar-runner/user/amp_safe.log` | output of the tool when it ran outside a collection |
 | `/etc/radar-runner/radar.yaml` | the ORCA config to run (not created by anything here) |
+| `<collection>/gps_raw.ubx` | the raw GPS log for PPK, from just before the radar's launch to its exit (`radar_runner/gpsraw/README.md`) |
 
 ## Tests
 
