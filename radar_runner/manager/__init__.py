@@ -6,6 +6,8 @@
     runner.py      runs ORCA: chirp, build, radar process, output log, stop
     ampsafe.py     when the reset tool runs, and the record of whether the amplifier pin is safe
     collection.py  collection directories, names and the metadata file
+    gpslog.py      the raw GPS logger of a collection (radar_runner/gpsraw), for the runner
+    motion.py      the GPS motion trigger: "moving", "stationary" or "unknown" from the telemetry status
     panel.py       front-panel button and LEDs
     control.py     the Unix socket that `radarctl` talks to, and the event log
     radarctl.py    the command-line tool (standard library only)

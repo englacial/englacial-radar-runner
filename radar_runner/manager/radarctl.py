@@ -99,8 +99,12 @@ def format_status(s):
         lines.append("sdr:        the make-amplifier-safe tool is running")
     auto = s.get("auto") or {}
     if auto.get("enabled"):
+        motion = s.get("motion") or {}
         lines.append(f"auto:       {auto.get('source')} says {auto.get('state')}"
+                     + (f" ({motion['reason']})" if motion.get("reason") else "")
                      + (", blocked until stationary" if auto.get("blocked") else ""))
+        if motion.get("counting") or motion.get("problem"):
+            lines.append(f"            newest fix: {motion.get('problem') or motion.get('counting')}")
     lines.append("gates:")
     for name, gate in (s.get("gates") or {}).items():
         text = "ok" if gate.get("ok") else f"NOT OK: {gate.get('reason')}"

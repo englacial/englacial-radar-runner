@@ -14,8 +14,9 @@ import threading
 import time
 
 from radar_runner.common.service import Service
+from radar_runner.common.status import read_status
 
-from . import ampsafe, control, gates, logic as L, panel as panel_module
+from . import ampsafe, control, gates, logic as L, motion as motion_module, panel as panel_module
 from .runner import Runner
 
 REPLY_TIMEOUT_S = 1.5       # shorter than radarctl waits for an answer (2 s)
@@ -35,6 +36,14 @@ class Manager(Service):
         logic_cfg, refused = L.LogicConfig.from_config(self.cfg, minimums)
         self.config_warnings += refused
         self.logic = L.ManagerLogic(logic_cfg)
+        # The GPS motion trigger: only when it is enabled. Disabled, nothing of it runs.
+        self.motion = None
+        if L.AUTO in logic_cfg.sources:
+            motion_cfg, refused = motion_module.MotionConfig.from_config(self.cfg["motion"])
+            self.config_warnings += refused
+            self.motion = motion_module.Motion(motion_cfg)
+            self._motion_file = gates.status_file(self.cfg["gates"]["telemetry"], "telemetry",
+                                                  config["paths"]["run_dir"])
         self.overrides = gates.Overrides(config["paths"]["state_dir"])
         self.sdr_state = ampsafe.SdrState(config["paths"]["state_dir"],
                                           ampsafe.tool_lock_path(self.cfg["amp_safe"]))
@@ -130,6 +139,8 @@ class Manager(Service):
         if now >= self._next_gates:
             self._check_gates(now)
             self._keep_sdr_safe(now)
+            if self.motion is not None:
+                self._look_for_motion(now)
         else:
             self.logic.tick(now)
         changed = self._act() or changed
@@ -159,6 +170,15 @@ class Manager(Service):
             self.runner.add_flag("no_amp_telemetry")
         self.logic.gates(now, results)
         self.runner.hurry = self.logic.power_fail or self.logic.closing
+
+    def _look_for_motion(self, now):
+        """The motion trigger's view of the telemetry service's latest fix, reported on a change."""
+        before = self.motion.state
+        read = read_status(self._motion_file, self.cfg["gates"]["telemetry"]["max_age_s"])
+        state = self.motion.update(now, read)
+        if state != before:
+            self.log.info("motion trigger: %s (%s)", state, self.motion.reason)
+            self.report_auto(state, self.motion.label)
 
     def _sdr_presence(self):
         found = self.sdr_gate.find()
@@ -302,6 +322,8 @@ class Manager(Service):
             # "" or the reading: enabled current with no radar process. The safety watcher acts on it.
             "amp_enabled_while_idle": self.enabled_idle,
             "panel": self.panel.snapshot(),
+            # What the motion trigger reports, and why; only {"enabled": false} when it is off.
+            "motion": dict(self.motion.snapshot(), enabled=True) if self.motion else {"enabled": False},
             "socket": self.socket_path,
             "events": {"file": self.event_log.path, "written": self.event_log.written,
                        "error": self.event_log.error},

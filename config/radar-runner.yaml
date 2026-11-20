@@ -166,6 +166,21 @@ manager:
     command: true             # radarctl start/toggle; stop and clear-fault always work
     gps: false                # the motion trigger (stage 6)
 
+  # The GPS motion trigger (radar_runner/manager/motion.py), used only when
+  # triggers.gps is true. It reads the fixes in the telemetry status file.
+  # Times are receiver time between fixes. Parked indoors on the bench (30 h,
+  # 2026-11-19/20) the receiver reported up to 11 s in a row above 2 m/s (9 s
+  # with eph at most 5 m), and up to 10 m/s for a moment.
+  motion:
+    start_speed_mps: 2.0      # "moving": every fix at least this fast ...
+    start_s: 20.0             # ... for this long (at least 5)
+    stop_speed_mps: 0.5       # "stationary": every fix at most this fast ...
+    stop_s: 120.0             # ... for this long (at least 30)
+    min_mode: 3               # a fix counts with this mode or better (2 = 2D, 3 = 3D) ...
+    max_eph_m: 5.0            # ... and a horizontal error estimate (gpsd eph) at most this
+    max_gap_s: 3.0            # counting fixes further apart than this start the counts again
+    stale_s: 5.0              # nothing that counts for this long (Pi time): "unknown"
+
   # Raw GPS log for PPK in every collection (radar_runner/gpsraw/README.md).
   # gpsd's address is telemetry.gps.host and port.
   gps_log:
