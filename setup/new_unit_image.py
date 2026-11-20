@@ -406,10 +406,12 @@ class Unit:
 
     def plan_cloud_init(self, old, new):
         """The image got its hostname from cloud-init (`hostname:` in the boot partition's
-        user-data, with manage_etc_hosts). update_hostname and update_etc_hosts run at every boot,
-        from cloud-init's cached copy of the user-data (obj.pkl) for as long as the instance ID
-        stays the same. So: the seed is edited, the cache removed (cloud-init reads the seed again
-        at the next boot), and cloud-init's own records of the hostname follow. The instance ID is
+        user-data, with manage_etc_hosts). At every boot (cloud-init 26.1, NoCloud) init-local
+        reads the boot partition again, but first sets the hostname from the previous boot's
+        cloud-config.txt in the instance directory; update_hostname and update_etc_hosts then run
+        from the new user-data. So the boot partition's user-data, that cached cloud-config.txt
+        (the run stops if it still names the old host after the edit) and cloud-init's records of
+        the hostname (previous-hostname, set-hostname) all get the new name. The instance ID is
         never changed: a new one would run every first-boot module again."""
         b, r = self.boot, self.root
         for name, keys in (("/user-data", ["hostname"]), ("/meta-data", ["local-hostname", "local_hostname",
@@ -466,18 +468,34 @@ class Unit:
         base = "/" + real
         pkl = f"{base}/obj.pkl"
         if r.exists(pkl):
-            self.plan.add(f"{pkl}: removed (cloud-init's cache of the old user-data; it reads the "
-                          "boot partition again at the next boot, same instance ID, no first-boot modules)",
+            self.plan.add(f"{pkl}: removed (a pickled copy of the old user-data; for NoCloud cloud-init "
+                          "finds it invalid at boot and reads the boot partition anyway)",
                           lambda: r.remove(pkl), r, pkl)
-        for name in ("user-data.txt", "user-data.txt.i", "cloud-config.txt"):
+        if old == new:
+            return
+        # Read at boot, before the new user-data: the hostname in these must be the new one.
+        for name in ("cloud-config.txt", "vendor-cloud-config.txt", "vendor2-cloud-config.txt"):
             path = f"{base}/{name}"
-            if not r.exists(path) or old == new:
+            if not r.exists(path):
+                continue
+            text = r.text(path)
+            edited, _ = self._edit_key(text, ["hostname"], old, new, path)
+            self._no_old_name(f"{path} (cloud-init sets the hostname from it at boot)", edited)
+            if edited != text:
+                self.plan.add(f"{path}: hostname: {old} -> {new} (cloud-init sets the hostname from the "
+                              "previous boot's copy before it reads the new user-data)",
+                              lambda p=path, e=edited: r.write(p, e.encode()), r, path)
+        # Raw copies of the user-data, written again from the boot partition at every boot.
+        for name in ("user-data.txt", "user-data.txt.i"):
+            path = f"{base}/{name}"
+            if not r.exists(path):
                 continue
             data = r.read(path)
             edited = re.sub(rb"(?m)^hostname:(\s*)" + re.escape(old.encode()) + rb"(\s*)$",
                             rb"hostname:\g<1>" + new.encode() + rb"\g<2>", data)
             if edited != data:
-                self.plan.add(f"{path}: hostname: {old} -> {new} (cloud-init's copy; rewritten at boot anyway)",
+                self.plan.add(f"{path}: hostname: {old} -> {new} (a copy of the user-data; cloud-init writes "
+                              "it again from the boot partition at boot)",
                               lambda p=path, e=edited: r.write(p, e), r, path)
 
     def plan_machine_id(self):

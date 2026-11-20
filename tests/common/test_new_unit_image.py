@@ -762,3 +762,27 @@ def test_broken_pipe_in_the_wrapper_still_cleans_up(fake_system, monkeypatch, ca
     assert fake.mounted == set() and fake.attached == []
     err = capsys.readouterr().err
     assert "partly changed" in err and "image unmounted and detached" in err
+
+
+@pytest.mark.parametrize("name, text", [
+    ("cloud-config.txt", f"#cloud-config\nhostname: {OLD}\nfqdn: {OLD}.lab\n"),
+    ("cloud-config.txt", f"#cloud-config\nwrite_files:\n- content: {OLD}\n"),
+    ("vendor-cloud-config.txt", f"#cloud-config\nhostname: {OLD}\n#{OLD}\n"),
+])
+def test_cached_cloud_config_naming_the_old_hostname_stops(unit, capsys, name, text):
+    """cloud-init sets the hostname at boot from the previous boot's cloud-config.txt, before it
+    reads the new user-data: a copy still naming the old host would bring that name back."""
+    root, boot = unit
+    write(os.path.join(root, f"var/lib/cloud/instances/{IID}/{name}"), text, 0o600)
+    before = snapshot(root, boot)
+    assert run(root, boot) == 2
+    assert name in capsys.readouterr().err
+    assert snapshot(root, boot) == before
+
+
+def test_cached_cloud_config_quoted_hostname_is_edited(unit):
+    root, boot = unit
+    path = f"/var/lib/cloud/instances/{IID}/cloud-config.txt"
+    write(os.path.join(root, path.lstrip("/")), f"#cloud-config\nhostname: '{OLD}'  # set by imager\n", 0o600)
+    assert run(root, boot) == 0
+    assert read(root, path) == f"#cloud-config\nhostname: {NEW}  # set by imager\n"
