@@ -186,6 +186,9 @@ class _Reader(threading.Thread):
 
 class _Run:
     """State of one start request."""
+    parent = None           # set on the low-power radar of the turn-on check (_CheckRun)
+    check_run = None        # that radar, while and after it runs
+    max_run_s = None        # a radar that has printed its start line must have exited this long after it
 
     def __init__(self, request, flags):
         self.request = dict(request)
@@ -238,6 +241,25 @@ class _Run:
                 "output_tail": list(self.tail)}
 
 
+class _CheckRun(_Run):
+    """The low-power radar of the turn-on check (turnon.py): a process and an outcome of its own.
+
+    The stop belongs to the start request: a stop asked for the request, urgent or
+    from the power service, stops this radar in the same way.
+    """
+
+    def __init__(self, parent, directory, max_run_s):
+        self.parent = parent
+        super().__init__(parent.request, parent.flags)
+        self.stop = parent.stop
+        self.directory, self.name = directory, parent.name
+        self.continuous = False         # a pulse count: exit status 0 after the start line is the normal end
+        self.max_run_s = max_run_s
+
+    urgent_at = property(lambda self: self.parent.urgent_at, lambda self, value: None)
+    power = property(lambda self: self.parent.power, lambda self, value: None)
+
+
 class Runner:
     def __init__(self, config, post, *, wall=time.time, turn_on_check=None, boot_number=coll.boot_count,
                  amp_telemetry=None, uptime=boottime_s, sdr_state=None):
@@ -259,10 +281,12 @@ class Runner:
         # reading counts only if it is newer than this (ampsafe.AmpTelemetry.now).
         self.last_activity_uptime = uptime()
         self._pending = 0
-        # HOOK (stage 7, turn-on check): called after the build and before the
-        # radar is launched, with the _Run. Returns (passed, text). A failure
-        # is a fault ("turn_on_check"); the radar is not launched. The SDR's
-        # state is recorded as unknown before the hook is called.
+        # The turn-on check (turnon.py): called after the build and before the
+        # radar is launched, with the _Run. Returns (passed, text). A refusal
+        # is a fault ("turn_on_check") unless the hook has recorded another
+        # failure first (run.fail); the radar is not launched. The SDR's state
+        # is recorded as unknown before the hook is called. The hook runs its
+        # low-power radar with `check_radar`.
         self.turn_on_check = turn_on_check
         self._queue = queue.Queue()
         self._lock = threading.Lock()
@@ -326,7 +350,12 @@ class Runner:
         """True if no radar process of this manager exists, and none is about to be started."""
         with self._lock:
             run = self._current
-            if run is None or run.radar_over:
+            if run is None:
+                return True
+            check = run.check_run           # the turn-on check's low-power radar
+            if check is not None and check.launching and not check.radar_over:
+                return False
+            if run.radar_over:
                 return True
             if run.launching:
                 return False
@@ -343,14 +372,46 @@ class Runner:
             run = self._current
         if run is None:
             return {"active": False}
-        proc = run.proc
+        proc, check = run.proc, run.check_run
+        checking = check is not None and check.launched and not check.radar_over
         out = {"active": True, "collection": run.name, "directory": run.directory,
-               "pid": proc.pid if proc is not None and not run.radar_over else None,
+               "pid": check.proc.pid if checking else proc.pid if proc is not None and not run.radar_over else None,
                "recording": run.started.is_set(), "chunks_closed": run.chunks_closed,
                "writing": run.open_file, "flags": list(run.flags), "usb_speed_mbps": run.usb_speed}
         if run.stdout_log is not None:
             out["log"] = run.stdout_log.snapshot()
+        if checking:
+            out["turn_on_check"] = "low-power radar running"
         return out
+
+    def check_radar(self, run, directory, config_path, max_run_s):
+        """Run the turn-on check's low-power radar to its end, on the runner's thread. Returns its _CheckRun.
+
+        Everything that applies to a radar applies to it: the same binary and
+        launch prefix (the safety watcher sees it), the record set to unknown
+        before the launch, the stop of `run` (held until the start line, urgent,
+        from the power service), the USB and rate checks, and the amplifier step
+        after its exit. It never posts "started". A radar that has printed its
+        start line and has not exited `max_run_s` later is stopped (failure
+        kind "check_timeout").
+        """
+        check = _CheckRun(run, directory, max_run_s)
+        with self._lock:
+            run.check_run = check
+        orca_cfg = self.cfg["orca"]
+        radar_cwd = os.path.join(os.path.realpath(orca_cfg["dir"]), orca_cfg["radar_cwd"])
+        try:
+            self._radar(check, list(orca_cfg["launch_prefix"]) + self._fill(orca_cfg["radar_command"], check,
+                                                                            config_path), radar_cwd)
+        finally:
+            if check.proc is not None and check.proc.poll() is None:
+                self._kill(check)       # only after an internal error: no radar may outlive its run
+                with self._lock:
+                    check.radar_over = True
+                self.last_activity_uptime = self._uptime()
+            if check.launched and check.amp_safe is None and not check.amp_safe_detail:
+                self._after_radar(check)
+        return check
 
     # ------------------------------------------------------------------- thread
 
@@ -559,8 +620,8 @@ class Runner:
         run.meta.data["radar_binary"] = {"path": binary, "sha256": coll.sha256_file(binary)}
         run.meta.write()
 
-        # 6. HOOK: the turn-on check of stage 7 goes here (see __init__). It runs a
-        # radar of its own, so the SDR's state is unknown from here on.
+        # 6. The turn-on check (see __init__). It runs a radar of its own, so the
+        # SDR's state is unknown from here on.
         if self.turn_on_check is not None:
             if run.stop.is_set():
                 return
@@ -661,7 +722,8 @@ class Runner:
             thread.start()
 
         start_deadline = time.monotonic() + orca_cfg["start_timeout_s"]
-        announced = False
+        end_deadline = None
+        announced = run.parent is not None      # the turn-on check's radar is never announced as recording
         usb_checked = not orca_cfg["require_usb3"]
         usb_deadline = None
         while True:
@@ -683,6 +745,10 @@ class Runner:
                     if problem is None:
                         log.warning("the SDR's USB speed could not be read from sysfs")
                         self.add_flag("usb_speed_unknown")
+            if started and run.max_run_s is not None:
+                end_deadline = end_deadline or now + run.max_run_s
+                if now >= end_deadline:
+                    run.fail("check_timeout", f"the radar had not finished {run.max_run_s:.0f} s after its start line")
             if run.stop.is_set() or run.failure:
                 if started:
                     self._stop_radar(run)
