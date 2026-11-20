@@ -617,6 +617,39 @@ EOF
     note "Worst case, every step at its limit: power-off command 37 s after the loss, last resort at 47 s)"
 }
 
+# Like put_file, for the alerts step only: a failure is reported and returns 1
+# instead of stopping the setup (the alerts service is an observer). Sets CHANGED.
+alerts_put_unit() {
+    local src=$1 dst=$DESTDIR$2 want have tmp
+    CHANGED=0
+    if [ ! -f "$src" ]; then note "FAILED: missing in the repository: $src"; return 1; fi
+    want="644 root root"
+    [ -z "$DESTDIR" ] || want="644"
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+        have=$(stat -c '%a %U %G' "$dst" 2>/dev/null || true)
+        [ -z "$DESTDIR" ] || have=$(stat -c '%a' "$dst" 2>/dev/null || true)
+        if [ "$have" = "$want" ]; then ok "$2 is in place"; return 0; fi
+        change "$2: owner and mode $have -> $want"
+    elif [ -e "$dst" ]; then
+        change "replace $2 (differs from ${src#"$REPO"/}):"
+        diff -u "$dst" "$src" | sed -n '3,$p' | sed 's/^/             /' || true
+    else
+        change "install $2 (from ${src#"$REPO"/})"
+    fi
+    CHANGED=1
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    if install -d -m 0755 "$(dirname "$dst")" && tmp=$(mktemp "$(dirname "$dst")/.radar-setup.XXXXXX") &&
+       { TMP_FILE=$tmp; cat "$src" > "$tmp"; } && chmod 0644 "$tmp" &&
+       { [ -n "$DESTDIR" ] || chown root:root "$tmp"; } && sync "$tmp" && mv -f "$tmp" "$dst"; then
+        TMP_FILE=""
+        return 0
+    fi
+    [ -z "${tmp:-}" ] || rm -f "$tmp"
+    TMP_FILE=""
+    note "FAILED: cannot install $2 (setup goes on)"
+    return 1
+}
+
 # (m) The alerts service (stage 5): its unit and the alertctl command. It only
 # reads what the other services publish, so it is enabled and started like the
 # telemetry service; a running one is never restarted or stopped. Its files go
@@ -641,7 +674,10 @@ step_alerts_service() {
         note "/etc/radar-runner/secrets.yaml is missing: alerts are queued but not sent until it has"
         note "alerts: ntfy: {server, topic, token} (radar_runner/alerts/README.md)"
     fi
-    put_file "$REPO/systemd/radar-alerts.service" "$unit" 0644
+    if ! alerts_put_unit "$REPO/systemd/radar-alerts.service" "$unit"; then
+        note "the alerts service is left as it is; the remaining steps run"
+        return 0
+    fi
     [ "$CHANGED" -eq 0 ] || RELOAD_NEEDED=1
     have=$(readlink "$DESTDIR$link" 2>/dev/null || true)
     if [ "$have" = "$target" ]; then
@@ -676,7 +712,14 @@ step_alerts_service() {
         *)
             log "           radar-alerts.service is ${enabled:-not enabled}, ${active:-not running}"
             note "once started it sends a boot summary to ntfy (at 3 minutes of uptime, or at once if later)"
-            reload_systemd
+            if [ "$RELOAD_NEEDED" -eq 1 ]; then
+                change "run: systemctl daemon-reload"
+                if [ "$DRY_RUN" -eq 1 ] || systemctl daemon-reload; then
+                    RELOAD_NEEDED=0
+                else
+                    note "FAILED: systemctl daemon-reload (setup goes on; the last step tries it again)"
+                fi
+            fi
             # Enabled, then started without waiting for it; a failure of either is reported, not fatal.
             change "run: systemctl enable radar-alerts.service"
             if [ "$DRY_RUN" -eq 0 ] && ! systemctl enable radar-alerts.service; then

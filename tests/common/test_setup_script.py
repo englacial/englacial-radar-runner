@@ -932,3 +932,20 @@ def test_a_failed_enable_or_start_of_the_alerts_service_never_stops_the_setup(sy
     assert "FAILED: systemctl" in r.stdout and "setup goes on" in r.stdout
     assert APT_INSTALL in system.log                       # the remaining steps ran
     assert "setup: verify with: setup/check.py" in r.stdout
+
+
+def test_a_unit_file_that_cannot_be_installed_never_stops_the_setup(system):
+    assert system.run().returncode == 0
+    units = system.path("/etc/systemd/system")
+    system.path(f"/etc/systemd/system/{ALERTS}").write_text("[Unit]\nDescription=old\n")
+    units.chmod(0o555)                          # nothing can be written there now
+    try:
+        system.set(log=[])
+        r = system.run()
+    finally:
+        units.chmod(0o755)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"FAILED: cannot install /etc/systemd/system/{ALERTS} (setup goes on)" in r.stdout
+    assert "the alerts service is left as it is" in r.stdout
+    assert "setup: verify with: setup/check.py" in r.stdout
+    assert not [n for n in os.listdir(units) if n.startswith(".radar-setup.")]
