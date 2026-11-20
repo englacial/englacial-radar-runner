@@ -807,6 +807,22 @@ def test_an_open_collection_when_no_run_is_under_way(tmp_path, server, manager, 
     assert wording in summaries(server)[0]["message"]
 
 
+@pytest.mark.parametrize("name, wording", [
+    ("b00042_s001_20261120T054629Z", "no end recorded yet (started 05:46:29 UTC; a run is starting)"),
+    ("b00041_s003_20261120T054629Z", "cut off (no end recorded: power cut or crash)"),     # from a boot before
+])
+def test_a_collection_just_created_by_a_run_that_is_starting_is_not_called_cut_off(tmp_path, server, name, wording):
+    # The runner has made the directory; the manager names it only once the runner's event has come.
+    rig = Rig(tmp_path, server.url)
+    col = rig.collections / name
+    col.mkdir()
+    (col / "collection.json").write_text(json.dumps({"created": {"time_utc": "2026-11-20T05:46:29Z"}, "end": None}))
+    rig.manager = {"state": "starting", "not_ready": [], "collection": None}
+    rig.start()
+    rig.tick(3)
+    assert wording in summaries(server)[0]["message"]
+
+
 def test_a_late_start_during_a_restart_of_the_other_services_waits_until_they_have_settled(tmp_path, server):
     rig = Rig(tmp_path, server.url, summary_after_s=180.0, summary_settle_s=30.0)
     rig.clock.up = 2700.0                       # 45 min after boot (the service's first start, or a restart)

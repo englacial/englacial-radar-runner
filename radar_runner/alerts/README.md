@@ -245,8 +245,9 @@ restart of the others, waits for them. It waits at most `summary_wait_max_s`
 what was missing ("unknown" then means not reported, not a fault). Priority 3.
 A restart of the service in the same boot does not send another. A collection
 without an end is "recording now" when the manager's status names it as its
-current run, "no end recorded yet" when the manager's state is not known, and
-"cut off" only otherwise. Contents:
+current run, "no end recorded yet" when the manager's state is not known or a
+run of this boot is starting and the manager has not named its collection yet
+(the first second of a run), and "cut off" only otherwise. Contents:
 
 * boot number, uptime, whether the clock is set;
 * the boot before: how long it ran (at least: the state file is updated every

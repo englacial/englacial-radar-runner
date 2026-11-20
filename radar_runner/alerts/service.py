@@ -95,7 +95,7 @@ def scan_collections(root):
             found.append((int(m.group(1)), int(m.group(2)), name))
     if not found:
         return {"count": 0, "last": None}
-    name = max(found)[2]
+    boot, _, name = max(found)
     directory = os.path.join(root, name)
     meta = {}
     try:
@@ -122,7 +122,7 @@ def scan_collections(root):
            "cut off (no end recorded: power cut or crash)" if meta else "no collection.json")
     began = started or (meta.get("created") if isinstance(meta.get("created"), dict) else {})
     began = began.get("time_utc") if isinstance(began.get("time_utc"), str) else ""
-    return {"count": len(found), "last": {"name": name, "how": how, "open": bool(meta) and end is None,
+    return {"count": len(found), "last": {"name": name, "boot": boot, "how": how, "open": bool(meta) and end is None,
                                           "started_utc": began,
                                           "reason": str(end.get("reason") or "") if end else "",
                                           "recorded_s": recorded, "data_gb": size / 1e9}}
@@ -548,9 +548,12 @@ class Alerts(Service):
             # No end in collection.json: being recorded, or cut off. The manager's status tells which.
             started = last.get("started_utc", "")
             started = f"started {started[11:19]} UTC" if len(started) >= 19 else "start time not known"
-            if man.ok and man.data.get("state") in ("starting", "running", "stopping") \
-                    and man.data.get("collection") == last.get("name"):
+            run = man.ok and man.data.get("state") in ("starting", "running", "stopping")
+            if run and man.data.get("collection") == last.get("name"):
                 last["how"] = f"recording now ({started})"
+            elif run and man.data.get("collection") is None and self.boot in (None, last.get("boot")):
+                # The runner has made the directory; the manager names it once the runner's event is in.
+                last["how"] = f"no end recorded yet ({started}; a run is starting)"
             elif not man.ok:
                 last["how"] = f"no end recorded yet ({started}; the radar manager's state is not known)"
         values = L._get(tel.data, "sources", "pi", "values") if tel.ok else None
