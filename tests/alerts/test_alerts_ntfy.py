@@ -161,6 +161,21 @@ def test_a_send_reading_an_answer_ended_by_the_close_is_cancelled_at_once():
     assert ended and time.monotonic() - t < 1.5 and s.result.kind == ntfy.RETRY
 
 
+def test_a_long_chunked_answer_is_read_only_up_to_the_limit():
+    # A chunk far longer than the limit, then the connection held open: read without a limit, the send
+    # would wait for the end and time out; read up to the limit, it is taken as sent at once.
+    def endless(conn):
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n100000\r\n" + b"x" * 200000)
+        time.sleep(30)
+    url, sock = raw_server(endless)
+    t = time.monotonic()
+    r = send(url, timeout=3.0)
+    elapsed = time.monotonic() - t
+    sock.close()
+    assert r.kind == ntfy.SENT and elapsed < 1.5, (r, elapsed)
+
+
 def test_redirects_are_not_followed(server):
     # A redirect would carry the token to another address.
     server.mode = "redirect"

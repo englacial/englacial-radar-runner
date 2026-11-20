@@ -779,8 +779,18 @@ def test_an_exit_that_asks_for_a_restart_is_not_a_clean_stop(tmp_path, server, e
     svc = rig.start()
     rig.tick(3)
     if exit_for == "dns":
-        svc.exit_status = 1                     # as _reap sets it
-        svc.request_stop()
+        import threading
+        from radar_runner.alerts import service as alerts_service
+
+        class Stuck:                            # sends whose DNS lookup never returns
+            done = threading.Event()
+            result = None
+
+            def cancel(self):
+                pass
+        svc.stale = [{"send": Stuck(), "name": f"p3-00000000000{i}.json", "item": {}, "since": 0.0} for i in range(2)]
+        rig.tick(int(alerts_service.STALE_EXIT_S) + 5)
+        assert svc._stop.is_set() and svc.exit_status == 1      # _reap asks for the exit
         rig.stop()
     else:
         def broken(now):
@@ -814,7 +824,7 @@ def test_odd_fields_in_the_other_services_status_do_not_keep_the_summary_from_go
     rig.start()
     status = rig.tick(3)
     [s] = summaries(server)
-    assert "summary" not in status["errors"] and "not ready: 5" in s["message"] and "Telemetry: {'x': 1}: 7." in s["message"]
+    assert status["errors"] == {} and "not ready: 5" in s["message"] and "Telemetry: {'x': 1}: 7." in s["message"]
     assert "Config warnings: 4" in s["message"]
 
 
