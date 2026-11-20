@@ -324,13 +324,10 @@ DEFAULTS = {
             "analysis_command": ["/home/englacial/miniforge3/envs/orca/bin/python", "-I",
                                  "/home/englacial/englacial-radar-runner/tools/turn_on_check/measure.py"],
             "analysis_timeout_s": 30.0,
-            # Before the run (the telemetry status): the 28 V rail, the idle current and both temperatures.
-            "voltage_min_v": 26.0,
-            "voltage_max_v": 30.5,
+            # Before the run (the telemetry status): the idle current; the 28 V rail and both temperatures
+            # against the safety watcher's own limits (watcher.voltage_min_v, voltage_max_v, temp_trip_c).
             "idle_current_min_a": 0.10,         # 0.144-0.156 A measured (2026-11-20)
             "idle_current_max_a": 0.20,
-            "temp_min_c": -40.0,
-            "temp_max_c": 50.0,
             # During the pulses: the highest reading at least this far above the idle reading, none above the
             # maximum. Fewer readings than this (one every 0.5 s): not judged. 0.25-0.31 A at 6.5 % enable duty.
             "current_rise_min_a": 0.05,

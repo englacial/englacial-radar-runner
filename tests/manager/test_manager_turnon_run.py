@@ -197,6 +197,8 @@ def test_amplifier_current_that_does_not_rise_fails_the_check(env, events, check
     r.start(REQUEST)
     info = events.wait("ended")
     assert info["kind"] == "turn_on_check" and "amplifier current did not rise" in info["failure"]
+    # An amplifier matter before the antenna is judged: a failed start, retried, not the latched fault.
+    assert not info["fatal"] and "the start is tried again" in events.wait("turn_on_check")["text"]
 
 
 def test_the_default_pulse_count_gives_readings_at_the_real_telemetry_rate(env, events, check_env):

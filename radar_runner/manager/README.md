@@ -161,7 +161,7 @@ limit counts two SDR starts for each start (`max_starts_per_hour`).
 
 | Criterion | From | Fails when |
 |---|---|---|
-| `amplifier_before` | the telemetry status just before the low-power run | 28 V outside 26-30.5 V; idle current outside 0.10-0.20 A; amplifier or case temperature outside -40 to 50 C; no reading |
+| `amplifier_before` | the telemetry status just before the low-power run | idle current outside 0.10-0.20 A; the 28 V rail or a temperature beyond the safety watcher's own limits (outside 26-30.5 V; 55 C or more; no cold limit); no reading |
 | `amplifier_during` | telemetry readings during its pulses (after `CHIRP.time_offset`) | the highest not 0.05 A above the idle reading (not enabled); one above 0.6 A. Fewer than `min_current_readings` (2) readings: not judged, with a warning |
 | `data` | the data file | fewer records than the pulse count asks for |
 | `clipping` | the raw maximum of the low-power data | at or above `clip_fs` (0.9 of full scale) |
@@ -202,7 +202,8 @@ whether the direct wave clips at full power.
 |---|---|
 | passed | the radar starts at the requested power |
 | failed, record only (`blocking: false`, or the expected values not set) | the radar starts anyway; the collection carries the flag `turn_on_check_failed`; a low alert |
-| failed, blocking (`blocking: true` and `expected.verified`) | the radar stays off: fault `turn_on_check` (fast blink, high alert with the reason); the next button press, `radarctl start` or motion trigger clears it and checks again |
+| failed, blocking (`blocking: true` and `expected.verified`), on the signal, clipping or data | the radar stays off: fault `turn_on_check` (fast blink, high alert with the reason); the next button press, `radarctl start` or motion trigger clears it and checks again |
+| failed, blocking, on the amplifier readings only, or the analysis failed | a failed start, retried as any (below): a matter of telemetry or the amplifier, not of the antenna |
 | the low-power radar failed (did not start, exited with an error, killed, USB 2, not finished within `time_offset` + twice its pulse time + 5 s) | a failed start, retried as any (10, 30, 90 s, then `start_failures`) |
 | the amplifier not confirmed safe after it | fault `amp_unsafe`, as after any radar |
 | a stop at any point | nothing more is started |
@@ -251,7 +252,7 @@ cables, receive chain or radar config), with `blocking: false`:
 
    It takes the strongest peak as the direct one and the strongest peak up to 40
    samples before it (and at most 40 dB weaker) as the leakage; `--direct` and
-   `--leakage` override that, `--margin-db` (6) sets the minimum level below the
+   `--leakage` override that, `--margin-db` (12) sets the minimum level below the
    measured one.
 4. The next start: `radarctl status` shows "check blocking; last: passed ...".
 
@@ -270,12 +271,20 @@ manager:
       delay_samples: 0.0
       tolerance_samples: 1.5
       level_tx_gain: 70
-      min_level_db: -11.9      # -5.9 dB measured, less a margin of 6 dB
+      min_level_db: -17.9      # -5.9 dB measured, less a margin of 12 dB
 ```
 
-The level of the reference run stayed within 0.4 dB over every run and power
-cycle of 2026-11-20 (`docs/transit-reference/`), so 6 dB leaves room for
-temperature and still fails on a disconnected cable (about 30 dB). With the
+**Before turning blocking on, know what the thresholds rest on.** The idle-current
+window (0.10-0.20 A), the current rise (0.05 A) and the levels were all set from
+bench readings at room temperature. The rise comes from the enable duty (6.5 %
+here, about 0.1 A) and becomes marginal below about 3 % duty. How the amplifier's
+gain changes with temperature is not known (the load on the VVA node may change in
+the cold), so the level at -30 C may be several dB lower than on the bench. Use a
+level margin of 12 to 15 dB, not less: on the bench the level stayed within 0.4 dB
+over every run and power cycle of 2026-11-20 (`docs/transit-reference/`), and with
+the amplifier off (the 28 V gone, only the leakage left; b00013_s003) the peak is
+27.6 dB down and 3 samples early, so 12 to 15 dB still fails that case and a
+disconnected cable (about 30 dB). With the
 earlier 50 m cable the same tool finds the two peaks: leakage 74.98, delay 15.18
 samples (81 m of path in air), -10.6 dB.
 

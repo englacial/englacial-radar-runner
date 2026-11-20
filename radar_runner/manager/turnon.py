@@ -26,8 +26,10 @@ What follows from the outcome:
   * passed, or failed while not blocking ("record only"): (True, text); the
     radar is launched at the requested power. A collection after a failed
     check carries the flag `turn_on_check_failed`;
-  * failed while blocking: (False, text): the runner records the fatal failure
-    "turn_on_check", the manager's fault;
+  * failed while blocking, on the signal, clipping or data: (False, text): the
+    runner records the fatal failure "turn_on_check", the manager's fault;
+  * failed while blocking on the amplifier readings only, or the analysis
+    failed: a failed start (non-fatal "turn_on_check"), retried;
   * the low-power radar did not run properly (did not start, timed out, exited
     with an error, was killed, the SDR on USB 2): that failure is recorded as the
     run's own (run.fail), exactly as it would be for the radar at power: a
@@ -81,6 +83,7 @@ WINDOW_START_S, WINDOW_END_S = 0.25, 0.15
 # pulses, counted from its start line (lost pulses are sent again: a third lost still fits).
 RUN_MARGIN_S = 5.0
 TEMP_FIELDS = ("amp.temp_c", "amp.case_temp_c")
+FAULT_CRITERIA = ("signal", "clipping", "data")     # a blocking failure of these is the fault turn_on_check
 
 
 def _number(value):
@@ -103,12 +106,11 @@ class Settings:
     pulses: int
     analysis_command: list
     analysis_timeout_s: float
-    voltage_min_v: float
+    voltage_min_v: float            # the safety watcher's limits: never stricter than it
     voltage_max_v: float
+    temp_trip_c: float
     idle_current_min_a: float
     idle_current_max_a: float
-    temp_min_c: float
-    temp_max_c: float
     current_rise_min_a: float
     current_max_a: float
     min_current_readings: int
@@ -155,9 +157,9 @@ class Settings:
         take("current_rise_min_a", lambda v: 0 <= v <= 5, "must be between 0 and 5 A")
         for name in ("enabled", "blocking"):
             out[name] = c[name]
-        pairs = (("voltage_min_v", "voltage_max_v"), ("idle_current_min_a", "idle_current_max_a"),
-                 ("temp_min_c", "temp_max_c"))
-        for low, high in pairs:
+        w = config["watcher"]
+        out.update(voltage_min_v=w["voltage_min_v"], voltage_max_v=w["voltage_max_v"], temp_trip_c=w["temp_trip_c"])
+        for low, high in (("idle_current_min_a", "idle_current_max_a"),):
             if c[low] < c[high]:
                 out[low], out[high] = c[low], c[high]
             else:
@@ -356,8 +358,8 @@ def judge(s, facts, before, override, during, measurement, analysis_error=""):
             if value is None:
                 if key == "temp_c":
                     wrong.append("no amplifier temperature")
-            elif not s.temp_min_c <= value <= s.temp_max_c:
-                wrong.append(f"{what} temperature {value:.1f} C (allowed {s.temp_min_c:g} to {s.temp_max_c:g})")
+            elif value >= s.temp_trip_c:
+                wrong.append(f"{what} temperature {value:.1f} C (the safety watcher stops at {s.temp_trip_c:g} C)")
         add("amplifier_before", not wrong, "; ".join(wrong) or
             f"{reading['voltage_v']:.1f} V, {idle:.3f} A idle, {reading.get('temp_c')} C")
     currents = [r["current_a"] for r in during]
@@ -412,7 +414,11 @@ def judge(s, facts, before, override, during, measurement, analysis_error=""):
                     + (f"(at least {s.min_level_db:g})" if ok else
                        f"below the minimum of {s.min_level_db:g} dB: antenna or cable disconnected or damaged?"))
     passed = all(c["ok"] is not False for c in criteria)
+    # Only what the antenna, the cable and the receiver show raises the fault; a reading of the
+    # amplifier out of its window, or a failed analysis, makes the start a failed one, retried.
+    fault = any(c["ok"] is False and c["name"] in FAULT_CRITERIA for c in criteria)
     out = {"passed": passed, "blocking": s.blocks, "blocked": s.blocks and not passed,
+           "retry": s.blocks and not passed and not fault,
            "mode": m.get("mode", "none") if s.verified else "none", "criteria": criteria}
     measured = {"idle_current_a": idle, "current_readings": len(currents),
                 "current_max_a": max(currents) if currents else None}
@@ -445,7 +451,8 @@ def summary_text(result):
     if result["passed"]:
         signal = next((c for c in result["criteria"] if c["name"] == "signal"), None)
         return "passed" + (f": {signal['text']}" if signal else "") + warnings
-    return ("FAILED, the radar stays off: " if result["blocked"] else
+    return ("FAILED, the start is tried again: " if result.get("retry") else
+            "FAILED, the radar stays off: " if result["blocked"] else
             "FAILED (record only, the radar starts anyway): ") + result["reason"] + warnings
 
 
@@ -585,6 +592,10 @@ class TurnOnCheck:
         if result["passed"]:
             return True, text
         runner.add_flag(FLAG)
+        if result["retry"]:
+            run.fail("turn_on_check", f"turn-on check failed: {result['reason']} (collection {run.name}; "
+                     "the start is tried again)")
+            return False, result["reason"]
         if result["blocked"]:
             return False, f"{result['reason']} (collection {run.name}; the next button press or trigger tries again)"
         return True, text

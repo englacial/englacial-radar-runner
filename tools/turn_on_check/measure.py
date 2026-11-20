@@ -2,7 +2,7 @@
 """Turn-on check: the direct-signal peak in a short collection (radar_runner/manager/README.md, "Turn-on check").
 
     PY=~/miniforge3/envs/orca/bin/python
-    $PY tools/turn_on_check/measure.py DIR [--leakage SAMPLE] [--direct SAMPLE] [--margin-db 6]
+    $PY tools/turn_on_check/measure.py DIR [--leakage SAMPLE] [--direct SAMPLE] [--margin-db 12]
         DIR is a collection, or the turn_on_check directory of one. Prints the peaks and the
         settings (manager.turn_on_check.expected) that would make this the expected result.
     $PY tools/turn_on_check/measure.py --input analysis_input.json --output analysis.json
@@ -243,7 +243,7 @@ def main(argv=None):
                         help="closer peaks are judged as one (default %(default)s samples)")
     parser.add_argument("--leakage-db", type=float, default=40.0,
                         help="a leakage peak may be this far below the direct one (default %(default)s dB)")
-    parser.add_argument("--margin-db", type=float, default=6.0,
+    parser.add_argument("--margin-db", type=float, default=12.0,
                         help="minimum level = measured level less this (default %(default)s dB)")
     parser.add_argument("--clip-fs", type=float, default=0.9)
     args = parser.parse_args(argv)

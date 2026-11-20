@@ -307,13 +307,11 @@ manager:
     analysis_command: [/home/englacial/miniforge3/envs/orca/bin/python, -I,
                        /home/englacial/englacial-radar-runner/tools/turn_on_check/measure.py]
     analysis_timeout_s: 30.0
-    # Before the run, from the telemetry status: 28 V rail, idle current, amplifier and case temperature.
-    voltage_min_v: 26.0
-    voltage_max_v: 30.5
-    idle_current_min_a: 0.10  # PER UNIT. 0.144-0.156 A measured (2026-11-20)
+    # Before the run, from the telemetry status: the idle current. The 28 V rail and the amplifier and
+    # case temperatures are judged against the safety watcher's limits (watcher.voltage_min_v,
+    # voltage_max_v, temp_trip_c; no cold limit), so the check is never stricter than the watcher.
+    idle_current_min_a: 0.10  # PER UNIT. 0.144-0.156 A measured (2026-11-20, room temperature)
     idle_current_max_a: 0.20
-    temp_min_c: -40.0
-    temp_max_c: 50.0
     # During the pulses: the highest reading at least current_rise_min_a above the idle one, none above
     # current_max_a. Fewer than min_current_readings (one every 0.5 s): not judged, a warning. Measured at 6.5 %
     # enable duty: 0.25-0.31 A at any tx_gain from 30 to 72 (the enable, not the drive, sets it).

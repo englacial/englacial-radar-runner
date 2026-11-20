@@ -191,14 +191,42 @@ def test_not_verified_judges_everything_but_the_signal():
 @pytest.mark.parametrize("change,name,words", [
     (dict(voltage_v=25.0), "amplifier_before", "28 V rail at 25.0 V"),
     (dict(current_a=0.39), "amplifier_before", "idle current 0.390 A"),
-    (dict(temp_c=52.0), "amplifier_before", "amplifier temperature 52.0 C"),
-    (dict(case_temp_c=-45.0), "amplifier_before", "case temperature -45.0 C"),
+    (dict(voltage_v=30.6), "amplifier_before", "28 V rail at 30.6 V"),
+    (dict(temp_c=55.0), "amplifier_before", "amplifier temperature 55.0 C"),
+    (dict(case_temp_c=56.0), "amplifier_before", "case temperature 56.0 C"),
     (dict(temp_c=None), "amplifier_before", "no amplifier temperature"),
 ])
 def test_amplifier_before_the_run(change, name, words):
     r = judged(s=settings(blocking=True, **VERIFIED), before=(dict(IDLE[0], **change), ""))
-    assert failing(r)[0] == name and words in r["reason"] and r["blocked"]
-    assert turnon.summary_text(r).startswith("FAILED, the radar stays off")
+    assert failing(r)[0] == name and words in r["reason"] and r["blocked"] and r["retry"]
+    assert turnon.summary_text(r).startswith("FAILED, the start is tried again")
+
+
+@pytest.mark.parametrize("change", [dict(case_temp_c=-45.0), dict(temp_c=-41.0, case_temp_c=-48.0),
+                                    dict(temp_c=54.0, case_temp_c=54.5), dict(voltage_v=26.0)])
+def test_amplifier_before_is_never_stricter_than_the_safety_watcher(change):
+    # The watcher stops at 55 C and outside 26-30.5 V, and has no cold limit: a cold start is no fault.
+    assert judged(s=settings(blocking=True, **VERIFIED), before=(dict(IDLE[0], **change), ""))["passed"]
+
+
+def test_the_watchers_limits_are_used():
+    c = config(**VERIFIED)
+    c["watcher"].update(temp_trip_c=45.0, voltage_min_v=27.0)
+    s, _ = turnon.Settings.from_config(c)
+    assert failing(turnon.judge(s, FACTS, (dict(IDLE[0], temp_c=46.0), ""), False, during(0.3, 0.3),
+                                measurement())) == ["amplifier_before"]
+    assert failing(turnon.judge(s, FACTS, (dict(IDLE[0], voltage_v=26.5), ""), False, during(0.3, 0.3),
+                                measurement())) == ["amplifier_before"]
+
+
+def test_only_the_signal_clipping_and_data_raise_the_fault():
+    s = settings(blocking=True, **VERIFIED)
+    assert judged(s=s, readings=during(0.156, 0.16))["retry"]               # amplifier not enabled: retried
+    for r in (judged(s=s, m=measurement(found=False)), judged(s=s, m=measurement(raw=0.95)),
+              judged(s=s, m=measurement(records=4))):
+        assert r["blocked"] and not r["retry"]
+        assert turnon.summary_text(r).startswith("FAILED, the radar stays off")
+    assert judged(s=s, error="no result within 30 s")["retry"]
 
 
 def test_no_reading_before_fails_unless_the_override_is_set():

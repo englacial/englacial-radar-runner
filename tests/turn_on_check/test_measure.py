@@ -116,7 +116,7 @@ def test_by_hand_on_the_portable_loopback_prints_the_settings(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "one peak at 78.4" in out and "cannot be told apart" in out
     assert "      verified: true\n      leakage_sample: 78.4\n      delay_samples: 0.0\n" in out
-    assert "      level_tx_gain: 70\n      min_level_db: -12.0" in out
+    assert "      level_tx_gain: 70\n      min_level_db: -18.0" in out
 
 
 def test_by_hand_finds_the_leakage_before_the_direct_peak(tmp_path, capsys):
@@ -124,4 +124,4 @@ def test_by_hand_finds_the_leakage_before_the_direct_peak(tmp_path, capsys):
     assert measure.main([str(d)]) == 0
     out = capsys.readouterr().out
     assert "leakage peak at 74.98" in out and "15.18 samples after the leakage (about 81.3 m of path in air)" in out
-    assert "      delay_samples: 15.18" in out and "      min_level_db: -16.6" in out
+    assert "      delay_samples: 15.18" in out and "      min_level_db: -22.6" in out
