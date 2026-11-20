@@ -187,8 +187,8 @@ manager:
     enabled: true
     file: gps_raw.ubx
     messages: [RXM-RAWX, RXM-SFRBX, NAV-PVT, NAV-TIMELS]   # written; [] = every UBX message
-    fsync_interval_s: 10.0    # the log is forced to the drive this often
-    stop_wait_s: 1.0          # at the end of a run, wait this long for the logger to exit
+    fsync_interval_s: 10.0    # the log is forced to the drive this often (at least 1)
+    stop_wait_s: 1.0          # at the end of a run, wait this long for the logger to exit (0.1 to 5)
     # Receiver setting, written by setup/gps_receiver.py --apply and checked by
     # setup/check.py --receiver: RXM-RAWX at every Nth navigation epoch (at
     # 10 Hz: 1 = 10 Hz, 2 = 5 Hz, 10 = 1 Hz), and RXM-SFRBX on. 0: both off.

@@ -428,10 +428,16 @@ RESERVED = ("offload",)
 _EMPTY_ALLOWED = {"telemetry.gps.receiver_fix_command"}         # "": never run it
 # Lower limits: a smaller value is raised to the limit, with a warning.
 _MINIMUM = {
+    "manager.gps_log.fsync_interval_s": 1.0,            # 0 would sync without pause
+    "manager.gps_log.stop_wait_s": 0.1,
     "telemetry.gps.no_position_retry_s": 30.0,          # 0 would run the receiver command back to back
     "telemetry.gps.no_position_retry_max_s": 30.0,
     "telemetry.gps.receiver_fix_timeout_s": 30.0,       # shorter would stop every run
 }
+# Upper limits: a larger value is lowered to the limit, with a warning.
+_MAXIMUM = {"manager.gps_log.stop_wait_s": 5.0}       # the end of every run waits for it
+# Lists whose entries must all be text; otherwise the list is refused.
+_TEXT_LISTS = {"manager.gps_log.messages"}
 
 _TYPE_NAMES = {bool: "true or false", int: "a whole number", float: "a number", str: "text",
                list: "a list", dict: "a section"}
@@ -469,6 +475,9 @@ def _merge(base, layer, where, prefix, warnings):
             elif value is not None:     # "section:" with nothing under it is an empty section
                 warnings.append(f"{where}: {name} must be a section, not {_type_name(value)}: ignored")
         else:
+            if name in _TEXT_LISTS and isinstance(value, list) and not all(isinstance(v, str) for v in value):
+                warnings.append(f"{where}: {name} must be a list of text: ignored")
+                continue
             try:
                 base[key] = _convert(base[key], value, name in _EMPTY_ALLOWED)
             except ValueError:
@@ -478,6 +487,9 @@ def _merge(base, layer, where, prefix, warnings):
             if name in _MINIMUM and base[key] < _MINIMUM[name]:
                 warnings.append(f"{where}: {name} must be at least {_MINIMUM[name]:g}: {_MINIMUM[name]:g} used")
                 base[key] = _MINIMUM[name]
+            if name in _MAXIMUM and base[key] > _MAXIMUM[name]:
+                warnings.append(f"{where}: {name} must be at most {_MAXIMUM[name]:g}: {_MAXIMUM[name]:g} used")
+                base[key] = _MAXIMUM[name]
 
 
 def _read_layer(path, optional, secret, warnings):

@@ -396,6 +396,8 @@ class Runner:
             except Exception as e:
                 log.exception("internal error while ending the run")
                 run.fail("internal", f"internal error while ending the run: {type(e).__name__}: {e}")
+                if run.gps_log is not None:
+                    run.gps_log.finish()        # never outlives its run (finish does not raise)
                 if run.launched and run.amp_safe is None:
                     run.amp_safe, run.amp_safe_detail = False, "not attempted: internal error"
             info = run.info()
@@ -900,9 +902,12 @@ class Runner:
         if run.meta is None:
             return
         if run.gps_log is not None:
-            run.meta.data["gps_raw"] = run.gps_log.finish()
-            if run.meta.data["gps_raw"]["no_raw_data"]:
-                run.meta.add_flag("no_raw_gps")
+            try:
+                run.meta.data["gps_raw"] = run.gps_log.finish()
+                if run.meta.data["gps_raw"].get("no_raw_data") is True:
+                    run.meta.add_flag("no_raw_gps")
+            except Exception:           # the end of the collection is written whatever happens here
+                log.exception("internal error in the raw GPS log's summary")
         if run.failure:
             how = "failed"
         elif not run.launched:

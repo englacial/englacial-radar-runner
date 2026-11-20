@@ -117,4 +117,77 @@ def test_settings_that_cannot_work_are_reported_and_nothing_is_started(tmp_path)
     log.start()
     assert log.proc is None
     out = log.finish()
-    assert "NAV-NOPE" in out["error"] and "plain file name" in out["error"] and "rawx_every" in out["error"]
+    assert "NAV-NOPE" in out["error"] and "plain file name" in out["error"]
+
+
+# ------------------------------------------------------------------ nothing of it may hold up or fail a run
+
+SLOW_LOGGER = ("import signal, sys, time\n"
+               "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+               "open(sys.argv[1], 'ab').write(b'\\xb5\\x62' + bytes(100))\n"
+               "time.sleep(30)\n")
+
+
+def slow_logger(monkeypatch):
+    """A logger that ignores SIGTERM and never prints a summary: longer than any bound."""
+    monkeypatch.setattr(gpslog.GpsLog, "_argv", lambda self: [sys.executable, "-c", SLOW_LOGGER, self.path])
+
+
+def test_a_messages_entry_that_is_not_text_does_not_stop_the_radar(env, events, runner):
+    env.config["manager"]["gps_log"].update(enabled=True, messages=[{"RXM-RAWX": None}])
+    info, _ = record(env, events, runner, seconds=0.3)
+    assert info["failure"] == "" and info["amp_safe"] is True
+    meta = env.metadata()
+    assert meta["end"]["how"] == "stopped" and "messages" in meta["gps_raw"]["error"]
+
+
+def test_the_settings_loader_refuses_entries_that_are_not_text_and_bounds_the_times(tmp_path):
+    from radar_runner.common import config as C
+    local = tmp_path / "local.yaml"
+    local.write_text("manager:\n  gps_log:\n    messages:\n      - RXM-RAWX:\n    fsync_interval_s: 0\n"
+                     "    stop_wait_s: 60\n")
+    config, warnings = C.load(local_file=str(local), secrets_file=None)
+    g = config["manager"]["gps_log"]
+    assert g["messages"] == C.DEFAULTS["manager"]["gps_log"]["messages"]
+    assert g["fsync_interval_s"] == 1.0 and g["stop_wait_s"] == 5.0
+    assert len(warnings) == 3 and any("manager.gps_log.messages" in w for w in warnings)
+
+
+def test_a_logger_that_hangs_holds_up_neither_the_stop_nor_the_record(env, events, runner, gpsd, monkeypatch):
+    slow_logger(monkeypatch)
+    env.config["manager"]["gps_log"]["stop_wait_s"] = 0.5
+    info, gone = record(env, events, runner, seconds=0.3)
+    assert gone < 1.0 and info["failure"] == ""
+    raw = env.metadata()["gps_raw"]
+    assert env.metadata()["end"]["how"] == "stopped"
+    assert "did not exit within 0.5 s: killed" in raw["error"] and "summary missing" in raw["error"]
+    # The file has data: a missing summary is not "no raw data".
+    assert raw["bytes"] > 0 and raw["no_raw_data"] is None and "no_raw_gps" not in env.metadata()["flags"]
+
+
+def test_the_logger_is_stopped_when_the_end_of_a_run_fails(env, events, runner, gpsd, monkeypatch):
+    slow_logger(monkeypatch)
+    env.config["manager"]["gps_log"]["stop_wait_s"] = 0.3
+    started = []
+    real = gpslog.GpsLog.start
+
+    def start(self):
+        real(self)
+        started.append(self)
+    monkeypatch.setattr(gpslog.GpsLog, "start", start)
+
+    def broken(run):
+        raise RuntimeError("broken")
+    runner._after_radar = broken
+    record(env, events, runner, seconds=0.2)
+    assert started and started[0].proc.poll() is not None
+
+
+def test_the_logger_is_given_the_managers_pid_and_an_odd_rawx_every_does_not_disable_it(env, events, runner, gpsd):
+    env.config["manager"]["gps_log"]["rawx_every"] = 999
+    log = gpslog.GpsLog(env.config["manager"]["gps_log"], env.config["telemetry"]["gps"], env.tmp)
+    argv = log._argv()
+    assert argv[argv.index("--parent-pid") + 1] == str(os.getpid())
+    record(env, events, runner, seconds=0.3)
+    raw = env.metadata()["gps_raw"]
+    assert raw["rawx_epochs"] == 30 and raw["rawx_every"] == 999
