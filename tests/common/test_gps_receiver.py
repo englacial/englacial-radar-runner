@@ -128,7 +128,7 @@ def tool(tmp_path):
     stand_in.write_text(UBXTOOL_STAND_IN.replace("STATE", repr(str(state))))
     stand_in.chmod(0o755)
     module.UBXTOOL = str(stand_in)
-    module.rawx_every = lambda: (10, "")       # manager.gps_log.rawx_every, as in the repository's config
+    module.rawx_setting = lambda: setting(10)  # manager.gps_log.rawx_every, as in the repository's config
     module.IDENTIFY_WAIT_S, module.CONFIGURE_WAIT_S, module.POLL_S = 1.5, 0.2, 0.1
     module.gpsd_args = lambda: ["/usr/sbin/gpsd", "-n", "-p", "/dev/ttyACM0"]     # not this machine's gpsd
     module.calls_file = state / "calls"
@@ -157,6 +157,10 @@ def tool(tmp_path):
     yield module
     for server in servers:
         server.close()
+
+
+def setting(value, warnings=(), why="", source="config/radar-runner.yaml"):
+    return {"value": value, "source": source, "warnings": list(warnings), "why": why}
 
 
 def calls(tool):
@@ -397,18 +401,45 @@ def test_parse_valget_ignores_a_reply_for_another_layer_and_sees_a_refusal(tool)
     assert tool.parse_valget(other_nak, 0) is None
 
 
-def test_the_raw_message_rate_is_the_setting_and_an_unreadable_setting_writes_nothing(tool, capsys):
+def test_the_raw_message_rate_is_the_setting_and_where_it_came_from_is_shown(tool, capsys):
     tool.gpsd([IDENTIFIED])
-    tool.rawx_every = lambda: (1, "")                       # 10 Hz raw data
+    tool.rawx_setting = lambda: setting(1, source="/etc/radar-runner/local.yaml")      # 10 Hz raw data
     assert tool.main(["--apply"]) == 0
     assert tool.all_layers(RAWX) == ["1", "1", "1"]
     assert [c for c in calls(tool) if "-z" in c] == [["-z", f"{RAWX},1"]]
-    tool.calls_file.unlink()
-    tool.rawx_every = lambda: (None, "cannot read manager.gps_log.rawx_every")
-    assert tool.main(["--apply"]) == 1
-    assert calls(tool) == []
-    assert "cannot read manager.gps_log.rawx_every" in capsys.readouterr().out
+    assert "manager.gps_log.rawx_every: 1 (from /etc/radar-runner/local.yaml)" in capsys.readouterr().out
     assert tool.main(["--apply", "--ram"]) == 0             # the boot-time run does not need it
+
+
+def test_an_unreadable_setting_leaves_the_raw_pair_unchecked_and_the_rest_is_done(tool, capsys):
+    tool.gpsd([IDENTIFIED])
+    tool.stored(SIG, 2, 0)
+    tool.stored(RAWX, 0, 0)
+    tool.rawx_setting = lambda: setting(None, why="cannot read manager.gps_log.rawx_every")
+    assert tool.main([]) == 1                               # reported: the 17, and the pair not checked
+    out = capsys.readouterr().out
+    assert f"{SIG}: RAM 1, battery-backed 1, flash 0\n" in out and RAWX + ":" not in out
+    assert "RXM-RAWX and RXM-SFRBX: not checked (cannot read manager.gps_log.rawx_every)" in out
+    tool.calls_file.unlink()
+    assert tool.main(["--apply"]) == 1                      # the 17 provisioned; still not all checked
+    assert [c for c in calls(tool) if "-z" in c] == [["-z", f"{SIG},1"]]
+    assert tool.all_layers(SIG) == ["1", "1", "1"] and tool.ram(RAWX) == "0"
+
+
+def test_a_config_warning_about_the_unit_or_the_raw_log_refuses_the_write(tool, capsys):
+    tool.gpsd([IDENTIFIED])
+    tool.stored(SIG, 2, 0)
+    for warning in ("/etc/radar-runner/local.yaml: not valid YAML (mapping values are not allowed here at line 3): "
+                    "skipped", "config/radar-runner.yaml: manager.gps_log.rawx_every must be a whole number, not text: "
+                    "ignored"):
+        tool.rawx_setting = lambda: setting(10, warnings=[warning])
+        assert tool.main(["--apply"]) == 1
+        assert [c for c in calls(tool) if "-z" in c] == []
+        out = capsys.readouterr().out
+        assert "config warning: " + warning in out and "nothing written" in out and "local.yaml" in out
+    tool.rawx_setting = lambda: setting(10, warnings=["config/radar-runner.yaml: unknown setting alerts.x: ignored"])
+    assert tool.main(["--apply"]) == 0                      # a warning about something else: shown, not refused
+    assert "config warning: config/radar-runner.yaml: unknown setting alerts.x" in capsys.readouterr().out
 
 
 def test_the_rawx_setting_is_read_from_the_repository_config():
@@ -419,7 +450,10 @@ def test_the_rawx_setting_is_read_from_the_repository_config():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.VENV_PYTHON = sys.executable
-    assert module.rawx_every() == (C.load(secrets_file=None)[0]["manager"]["gps_log"]["rawx_every"], "")
+    config, warnings = C.load(secrets_file=None)
+    found = module.rawx_setting()
+    assert module.rawx_every() == (config["manager"]["gps_log"]["rawx_every"], "")
+    assert found["warnings"] == warnings and found["source"]
 
 
 COMMS = """UBX-MON-COMMS:

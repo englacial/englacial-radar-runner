@@ -19,7 +19,10 @@ USB (GGA, GLL, GSA, GSV, RMC, VTG) off, UBX output on USB, and no NMEA output on
 and for the raw GPS log (PPK, radar_runner/gpsraw) RXM-RAWX every `manager.gps_log.rawx_every`
 epochs (a setting, read from the repository's config and /etc/radar-runner/local.yaml; 10 = 1 Hz
 at 10 Hz) and RXM-SFRBX (the broadcast navigation data) as it comes; rawx_every 0 sets both off. gpsd runs passive (-p) and
-sets none of them. Left on, the NMEA sentences would come at every
+sets none of them. The value of rawx_every, the file it came from and every warning of the config
+loader are printed; --apply writes nothing while the config loads with a warning about
+/etc/radar-runner/local.yaml or manager.gps_log, and without a usable rawx_every the other
+settings are checked (and provisioned) alone and the run ends with status 1. Left on, the NMEA sentences would come at every
 epoch at the OLA's 10 Hz on top of the UBX messages, which already fill most of the USB transmit
 buffer. The OLA copies the receiver's settings from RAM to battery-backed memory and flash at
 every OLA start (measured 2026-11-20), so what is in RAM then is what the receiver powers up with
@@ -263,34 +266,79 @@ def show(key, values, now=""):
                                       for name, v in zip(LAYERS, values)), flush=True)
 
 
+# Which layer set rawx_every, and the loader's warnings, from the repository's environment.
+RAWX_SETTING_CODE = """
+import json, yaml
+from radar_runner.common import config as C
+c, w = C.load(secrets_file=None)
+source = "built-in default"
+for path in (C.REPO_FILE, C.LOCAL_FILE):
+    try:
+        with open(path) as f:
+            d = yaml.safe_load(f)
+        if "rawx_every" in d["manager"]["gps_log"]:
+            source = path
+    except Exception:
+        pass
+print(json.dumps({"value": c["manager"]["gps_log"]["rawx_every"], "source": source, "warnings": w}))
+"""
+LOCAL_FILE = "/etc/radar-runner/local.yaml"
+
+
+def rawx_setting():
+    """{"value", "source", "warnings", "why"}: manager.gps_log.rawx_every from the merged config (value None
+    and `why` if it cannot be had), the file that set it, and every warning of the config loader."""
+    try:
+        out = subprocess.run([VENV_PYTHON, "-B", "-c", RAWX_SETTING_CODE], cwd=REPO, capture_output=True, text=True,
+                             timeout=60)
+        found = json.loads(out.stdout)
+        value, source, warnings = found["value"], found["source"], [str(w) for w in found["warnings"]]
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as e:
+        return {"value": None, "source": "", "warnings": [],
+                "why": f"cannot read manager.gps_log.rawx_every with {VENV_PYTHON}: {e}"}
+    if type(value) is not int or not 0 <= value <= 255:
+        return {"value": None, "source": source, "warnings": warnings,
+                "why": f"manager.gps_log.rawx_every is {value!r}: it must be a whole number from 0 to 255"}
+    return {"value": value, "source": source, "warnings": warnings, "why": ""}
+
+
 def rawx_every():
     """(manager.gps_log.rawx_every, "") from the merged config, or (None, why not)."""
-    code = ("import json; from radar_runner.common import config as C\n"
-            "c, w = C.load(secrets_file=None); print(json.dumps(c['manager']['gps_log']['rawx_every']))")
-    try:
-        out = subprocess.run([VENV_PYTHON, "-B", "-c", code], cwd=REPO, capture_output=True, text=True, timeout=60)
-        value = json.loads(out.stdout)
-    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
-        return None, f"cannot read manager.gps_log.rawx_every with {VENV_PYTHON}: {e}"
-    if type(value) is not int or not 0 <= value <= 255:
-        return None, f"manager.gps_log.rawx_every is {value!r}: it must be a whole number from 0 to 255"
-    return value, ""
+    found = rawx_setting()
+    return found["value"], found["why"]
 
 
-def wanted():
-    """The settings to provision ({key: value}), or None with the reason printed."""
-    every, why = rawx_every()
-    if why:
-        print(why, flush=True)
-        return None
+def with_raw(every):
+    """The settings to provision for a rawx_every; without the raw pair if it is None."""
+    if every is None:
+        return dict(SETTINGS)
     return dict(SETTINGS, **{RAWX: every, SFRBX: 1 if every else 0})     # 0: no raw messages
 
 
+def wanted():
+    return with_raw(rawx_setting()["value"])
+
+
 def provision(apply):
-    """Check the settings in the three layers and, with `apply`, write the wrong ones to all three; True if all are right."""
-    settings = wanted()
-    if settings is None:
+    """Check the settings in the three layers and, with `apply`, write the wrong ones to all three; True if all are
+    right. Without a usable rawx_every the raw pair is left out (not checked: False). A config warning about
+    the unit's file or the raw log refuses the write: every write here is permanent."""
+    found = rawx_setting()
+    if found["value"] is None:
+        print(f"RXM-RAWX and RXM-SFRBX: not checked ({found['why']})", flush=True)
+    else:
+        print(f"manager.gps_log.rawx_every: {found['value']} (from {found['source']})", flush=True)
+    for warning in found["warnings"]:
+        print(f"config warning: {warning}", flush=True)
+    if apply and any(LOCAL_FILE in w or "gps_log" in w for w in found["warnings"]):
+        print(f"the configuration loads with a warning about {LOCAL_FILE} or manager.gps_log: nothing written. "
+              f"Correct it (`.venv/bin/python -m radar_runner.common.config` shows the settings and warnings), "
+              f"then run --apply again", flush=True)
         return False
+    return _provision(apply, with_raw(found["value"])) and found["value"] is not None
+
+
+def _provision(apply, settings):
     args = gpsd_args()
     if apply and args and "-p" not in args[1:]:
         print(f"warning: gpsd is not running passive (-p): at its next start it sets part of this again "
