@@ -198,10 +198,13 @@ def test_scripts_parse():
 # ---- check.py: read-only, so it is safe to run for real
 
 def test_check_script_runs_and_reports_every_item():
+    # COLUMNS as an interactive shell exports it: ps would cut gpsd's 95-character command line.
     r = subprocess.run(["/usr/bin/python3", "-B", os.path.join(REPO, "setup", "check.py")],
-                       capture_output=True, text=True, timeout=300, cwd="/")
+                       capture_output=True, text=True, timeout=300, cwd="/", env=dict(os.environ, COLUMNS="80"))
     assert r.returncode in (0, 1), r.stderr
     assert r.stderr == ""
+    gpsd_line = next(line for line in r.stdout.split("\n") if "gpsd keeps reading without clients" in line)
+    assert gpsd_line.endswith("gpsd is not running") or "u-blox_GNSS_receiver-if00" in gpsd_line, gpsd_line
     lines = [line for line in r.stdout.split("\n") if line and not line.startswith("==")]
     assert all(re.match(r"(PASS|FAIL|SKIP|INFO)  \S|check: \d+ pass", line) for line in lines), lines
     assert "the check itself failed" not in r.stdout
@@ -246,6 +249,8 @@ with open({log!r}, "a") as f:
     f.write(json.dumps(sys.argv[1:]) + "\\n")
 if "-g" in sys.argv:
     layer = int(sys.argv[-1].split(",")[1])
+    if layer == {lost_layer} and sum('"-g"' in line for line in open({log!r})) == {lost_layer} + 1:
+        sys.exit(0)                 # this reply is lost; the next read of that layer is answered
     if layer == 1 and {flash_nmea!r} == "not stored":
         print("UBX-ACK-NAK:\\n  NAK to Class x06 (CFG) ID x8b (VALGET)")
     else:
@@ -269,7 +274,8 @@ def test_check_script_asks_the_receiver_only_when_told_and_only_reads(tmp_path, 
     """With --receiver: four polls through (a stand-in for) ubxtool, and never an option that sets anything."""
     log = tmp_path / "ubxtool.log"
     tool = tmp_path / "ubxtool"
-    tool.write_text(UBXTOOL_STAND_IN.format(log=str(log), value=value, flash_nmea=flash_nmea, errors=errors))
+    tool.write_text(UBXTOOL_STAND_IN.format(log=str(log), value=value, flash_nmea=flash_nmea, errors=errors,
+                                            lost_layer=-1))
     tool.chmod(0o755)
     env = dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}")
     r = subprocess.run(["/usr/bin/python3", "-B", os.path.join(REPO, "setup", "check.py"), "--receiver"],
@@ -285,6 +291,21 @@ def test_check_script_asks_the_receiver_only_when_told_and_only_reads(tmp_path, 
                      for n in range(3)] + [["-P", "27.50", "-w", "1.5", "-p", "MON-COMMS"]]
     for call in calls:
         assert not {"-z", "-x", "-e", "-d", "-c", "-S", "-s"} & set(call)
+
+
+def test_check_script_asks_once_more_after_a_lost_reply(tmp_path):
+    log = tmp_path / "ubxtool.log"
+    tool = tmp_path / "ubxtool"
+    tool.write_text(UBXTOOL_STAND_IN.format(log=str(log), value="0", flash_nmea="0", errors="10", lost_layer=1))
+    tool.chmod(0o755)
+    env = dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}")
+    r = subprocess.run(["/usr/bin/python3", "-B", os.path.join(REPO, "setup", "check.py"), "--receiver"],
+                       capture_output=True, text=True, timeout=300, cwd="/", env=env)
+    assert r.returncode in (0, 1) and r.stderr == ""
+    assert "PASS  GPS receiver: NMEA output on UART1 off: CFG-UART1OUTPROT-NMEA: RAM 0, battery-backed 0, flash 0" in r.stdout
+    reads = [json.loads(line)[-1] for line in log.read_text().splitlines() if "-g" in line]
+    assert reads == ["CFG-UART1OUTPROT-NMEA,0", "CFG-UART1OUTPROT-NMEA,1", "CFG-UART1OUTPROT-NMEA,1",
+                     "CFG-UART1OUTPROT-NMEA,2"]
 
 
 def test_check_script_rejects_unknown_options():

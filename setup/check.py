@@ -3,7 +3,8 @@
 
     setup/check.py               everything that can be checked by looking
     setup/check.py --receiver    also ask the GPS receiver for two settings in all three layers and its
-                                 buffer error flags (four read-only polls through gpsd; nothing is ever set)
+                                 buffer error flags (four read-only polls through gpsd, one more after
+                                 a lost reply; nothing is ever set)
 
 Prints one line per item:
 
@@ -32,7 +33,7 @@ sys.dont_write_bytecode = True
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [os.path.join(REPO, "setup"), REPO]
 import uvlock  # noqa: E402
-from gps_receiver import parse_valget  # noqa: E402  (standard library only)
+from gps_receiver import gpsd_args, parse_valget  # noqa: E402  (standard library only)
 from radar_runner.common import status as status_files  # noqa: E402  (standard library only)
 
 FILES = os.path.join(REPO, "setup", "files")
@@ -720,8 +721,9 @@ def _(name):
 
 @item("gpsd keeps reading without clients, passive, with the receiver named")
 def _(name):
-    # -p: gpsd leaves the receiver's settings alone (setup/SYSTEM_CHANGES.md, section 11).
-    args = out("ps", "-C", "gpsd", "-o", "args=")
+    # -p: gpsd leaves the receiver's settings alone (setup/SYSTEM_CHANGES.md, section 11). From /proc:
+    # ps cuts the line to $COLUMNS when that is set.
+    args = " ".join(gpsd_args())
     check(name, " -n " in args + " " and " -p " in args + " " and GPS_DEVICE in args, args or "gpsd is not running",
           f"gpsd -n -p {GPS_DEVICE}")
 
@@ -822,11 +824,14 @@ def _(name):
     keys = ("CFG-MSGOUT-UBX_NAV_PVT_USB", "CFG-UART1OUTPROT-NMEA")
     values = {key: [] for key in keys}
     for layer in range(3):
-        rc, text, err = run(*ubxtool, *[a for key in keys for a in ("-g", f"{key},{layer}")], timeout=30)
-        if rc is None:
-            report(FAIL, name, err)
-            return
-        got = parse_valget(text, layer)
+        for _ in range(2):          # asked once more if the reply was lost, as gps_receiver.py does
+            rc, text, err = run(*ubxtool, *[a for key in keys for a in ("-g", f"{key},{layer}")], timeout=30)
+            if rc is None:
+                report(FAIL, name, err)
+                return
+            got = parse_valget(text, layer)
+            if got is not None:
+                break
         for key in keys:
             values[key].append("no answer" if got is None else got.get(key, "not stored"))
 
