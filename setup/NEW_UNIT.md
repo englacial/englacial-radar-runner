@@ -60,9 +60,11 @@ elsewhere), and delete the working copy after flashing.
    ```
 
 2. **Dry run** on the copy. It attaches the image read-only, prints every change and the report,
-   and writes nothing:
+   and writes nothing. `set -o pipefail` makes the shell's exit status (`$?`, `&&`) the tool's
+   instead of `tee`'s:
 
    ```
+   set -o pipefail
    sudo python3 -u new_unit_image.py image englacial-radar-2.img --hostname englacial-radar-2 --disarm-power --dry-run | tee dry-run.txt
    ```
 
@@ -71,19 +73,26 @@ elsewhere), and delete the working copy after flashing.
    shutdown) has an ext4 journal that is not replayed yet: the dry run reads the state before the
    journal, so the real run may differ slightly from it.
 
-3. **Real run**, with the same options:
+3. **Real run**, with the same options (in the same shell, so `pipefail` is still set):
 
    ```
+   set -o pipefail
    sudo python3 -u new_unit_image.py image englacial-radar-2.img --hostname englacial-radar-2 --disarm-power | tee englacial-radar-2-report.txt
    ```
 
    Options: `--label`, `--max-tx-gain`, `--disarm-power` (recommended until the power-service
    bench tests pass on the new unit, as for a rebuild), `--ntfy-topic` or `--no-alerts`. The
-   report holds no secrets; keep it (it has the new SSH fingerprints). Exit status 0 means done
-   and cleaned up. 2 means stopped before anything was changed, unless the message says the image
-   is partly changed: then start again from a fresh copy. 3 means the image is still mounted or
-   attached: do not copy or flash it until `findmnt` shows nothing of it and `losetup -j` on it
-   prints nothing.
+   report holds no secrets; keep it (it has the new SSH fingerprints). Exit status:
+
+   | Status | Meaning |
+   |---|---|
+   | 0 | done (or, in a dry run, nothing to stop for) and cleaned up |
+   | 1 | a fault of the tool; the message says whether the image was changed |
+   | 2 | stopped before anything in the image was changed |
+   | 3 | the image is still mounted or attached: do not copy or flash it until `findmnt` shows nothing of it and `losetup -j` on it prints nothing |
+   | 4 | output lost (the pipe to `tee` broke); the message says whether the image was changed |
+   | 5 | stopped while making the changes: the image is partly changed, start again from a fresh copy |
+   | 130 | interrupted (Ctrl-C, SIGTERM); the message says whether the image was changed |
 
 4. **Check the root file system** of the result, read-only, before flashing:
 
@@ -93,10 +102,16 @@ elsewhere), and delete the working copy after flashing.
    sudo losetup -d /dev/loopN
    ```
 
+   If it reports errors, do not flash: start again from a fresh copy of the untouched image (and
+   check that one the same way). An `e2fsprogs` older than the image's may refuse its file
+   system features; run the check on a computer with a current release, or on the field unit.
+
 5. **Flash** the copy to the new card (at least as large as the first one). Unmount the new
    card's partitions first, as in step 1. Do not use an imager's OS customisation: it writes a
    new `user-data` with a new instance ID, and cloud-init would then run its first-boot modules
    again.
+
+   Check `/dev/sdY` with `lsblk` before this command: it overwrites that device.
 
    ```
    sudo umount /dev/sdY1 /dev/sdY2
@@ -107,8 +122,8 @@ For a card that is already mounted (both partitions), the same core runs on the 
 After a real run, sync and unmount both before removing the card:
 
 ```
-sudo python3 -u new_unit_image.py tree --root /media/$USER/writable --boot /media/$USER/system-boot --hostname englacial-radar-2 --dry-run
-sudo python3 -u new_unit_image.py tree --root /media/$USER/writable --boot /media/$USER/system-boot --hostname englacial-radar-2
+sudo python3 -u new_unit_image.py tree --root /media/$USER/writable --boot /media/$USER/system-boot --hostname englacial-radar-2 --disarm-power --dry-run
+sudo python3 -u new_unit_image.py tree --root /media/$USER/writable --boot /media/$USER/system-boot --hostname englacial-radar-2 --disarm-power
 sync
 sudo umount /media/$USER/writable /media/$USER/system-boot
 ```
@@ -130,7 +145,8 @@ In this order (the report prints the same list):
    partition and `sudo mkfs.ext4 -L radar-data <partition>`; a drive with a file system needs
    `sudo e2label <partition> radar-data`. After relabelling a mounted drive the device cache is
    stale: check the label with `setup/fs_label.py` if that file exists, and follow
-   SYSTEM_CHANGES.md, section `--nvme-by-label` (`sudo setup/setup.sh --nvme-by-label`). Then
+   SYSTEM_CHANGES.md, section `--nvme-by-label`, for the stale cache (this tool has already put
+   `LABEL=` in `/etc/fstab`). Then
    `sudo mount /mnt/nvme` (or reboot) and `sudo setup/setup.sh`, which creates
    `/mnt/nvme/radar-runner` on it.
 4. Provision the GPS receiver once: `setup/gps_receiver.py --apply`,

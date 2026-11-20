@@ -1029,3 +1029,21 @@ def test_wrapper_syncs_with_os_sync(fake_system):
     fake = make()
     assert nui.main(["image", image, "--hostname", NEW]) == 0
     assert ["os.sync"] in fake.calls
+
+
+def test_procedure_document_round_three():
+    with open(os.path.join(REPO, "setup", "NEW_UNIT.md")) as f:
+        doc = f.read()
+    for words in ("set -o pipefail", "130", "output lost", "check `/dev/sdY` with `lsblk` before this command",
+                  "e2fsprogs", "fresh copy of the untouched image"):
+        assert words.lower() in doc.lower(), words
+    assert "setup.sh --nvme-by-label" not in doc
+    tree_lines = [line for line in doc.split("\n") if "new_unit_image.py tree" in line]
+    assert tree_lines and all("--disarm-power" in line for line in tree_lines)
+
+
+def test_report_does_not_ask_for_nvme_by_label(unit, capsys):
+    root, boot = unit
+    assert run(root, boot, "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "setup.sh --nvme-by-label" not in out and "SYSTEM_CHANGES.md, section --nvme-by-label" in out
