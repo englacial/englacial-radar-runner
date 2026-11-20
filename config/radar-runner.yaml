@@ -296,6 +296,42 @@ manager:
     loop_gap_field: loop.last_gap_s
     max_loop_gap_s: 1.0
 
+  # The turn-on check: a short run at low power before every start, then the radar at the
+  # requested power (radar_runner/manager/README.md, "Turn-on check"). Levels are in dB relative
+  # to the chirp, as tools/turn_on_check/measure.py prints them. Off: the start is as without it.
+  turn_on_check:
+    enabled: false
+    blocking: false           # true: a failed check keeps the radar off (fault turn_on_check); needs expected.verified
+    max_tx_gain: 40.0         # PER UNIT. The low-power run at RF0.tx_gain min(requested, this): 30 dB under 70 (about 9 W)
+    pulses: 8000              # error-free pulses, rounded up to whole records (8 records at presum 1000; 1.6 s at 5 kHz)
+    analysis_command: [/home/englacial/miniforge3/envs/orca/bin/python, -I,
+                       /home/englacial/englacial-radar-runner/tools/turn_on_check/measure.py]
+    analysis_timeout_s: 30.0
+    # Before the run, from the telemetry status: 28 V rail, idle current, amplifier and case temperature.
+    voltage_min_v: 26.0
+    voltage_max_v: 30.5
+    idle_current_min_a: 0.10  # PER UNIT. 0.144-0.156 A measured (2026-11-20)
+    idle_current_max_a: 0.20
+    temp_min_c: -40.0
+    temp_max_c: 50.0
+    # During the pulses: the highest reading at least current_rise_min_a above the idle one, none above
+    # current_max_a, and at least min_current_readings of them (one every 0.5 s). Measured at 6.5 %
+    # enable duty: 0.25-0.31 A at any tx_gain from 30 to 72 (the enable, not the drive, sets it).
+    current_rise_min_a: 0.05
+    current_max_a: 0.6
+    min_current_readings: 2
+    clip_fs: 0.9              # a raw sample at or above this (of full scale) in the low-power run: clipping
+    min_separation_samples: 4.0   # peaks closer than this form one: the level of the combined peak is judged
+    # PER UNIT: the expected peak, from a start that the user has verified (measure.py prints this block).
+    # Until verified is true the check only records, whatever blocking says.
+    expected:
+      verified: false
+      leakage_sample: 0.0     # the leakage peak inside the SDR, in samples of the compressed profile
+      delay_samples: 0.0      # the direct peak this far after it; under min_separation_samples: one combined peak
+      tolerance_samples: 1.5
+      level_tx_gain: 0.0      # min_level_db applies at this tx_gain (the measured level is scaled 1 dB per step)
+      min_level_db: 0.0
+
   panel:
     enabled: true
     button_gpio: 4

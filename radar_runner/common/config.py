@@ -314,6 +314,43 @@ DEFAULTS = {
             "max_loop_gap_s": 1.0,
         },
 
+        # The turn-on check (radar_runner/manager/README.md, "Turn-on check"): a short low-power run
+        # before every start. Levels in dB relative to the chirp, as tools/turn_on_check/measure.py prints them.
+        "turn_on_check": {
+            "enabled": False,
+            "blocking": False,                  # a failed check keeps the radar off; needs expected.verified
+            "max_tx_gain": 40.0,                # the low-power run: RF0.tx_gain capped at this (70 is about 9 W)
+            "pulses": 8000,                     # error-free pulses (rounded up to whole records); 1.6 s at 5 kHz
+            "analysis_command": ["/home/englacial/miniforge3/envs/orca/bin/python", "-I",
+                                 "/home/englacial/englacial-radar-runner/tools/turn_on_check/measure.py"],
+            "analysis_timeout_s": 30.0,
+            # Before the run (the telemetry status): the 28 V rail, the idle current and both temperatures.
+            "voltage_min_v": 26.0,
+            "voltage_max_v": 30.5,
+            "idle_current_min_a": 0.10,         # 0.144-0.156 A measured (2026-11-20)
+            "idle_current_max_a": 0.20,
+            "temp_min_c": -40.0,
+            "temp_max_c": 50.0,
+            # During the pulses: the highest reading at least this far above the idle reading, none above the
+            # maximum, and at least this many readings (one every 0.5 s). 0.25-0.31 A at 6.5 % enable duty.
+            "current_rise_min_a": 0.05,
+            "current_max_a": 0.6,
+            "min_current_readings": 2,
+            "clip_fs": 0.9,                     # raw maximum at or above this (of full scale): clipping
+            # Peaks closer than this form one: the level of the combined peak is judged.
+            "min_separation_samples": 4.0,
+            # The expected peak, from a verified start (measure.py prints these). Until `verified` is true the
+            # check only records.
+            "expected": {
+                "verified": False,
+                "leakage_sample": 0.0,          # where the leakage peak inside the SDR is
+                "delay_samples": 0.0,           # the direct peak this far after it (0: one combined peak)
+                "tolerance_samples": 1.5,
+                "level_tx_gain": 0.0,           # the minimum level is for this tx_gain (scaled 1 dB per step)
+                "min_level_db": 0.0,
+            },
+        },
+
         "panel": {
             "enabled": True,
             "button_gpio": 4,

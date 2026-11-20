@@ -35,7 +35,16 @@ Control file (JSON, named by FAKE_ORCA_CONTROL):
               "slow_exit"      take 2 s to exit after SIGINT
               "flood"          print 200 error lines per loop round (about 20 000 lines a second)
               "stderr"         write more UHD-style noise to stderr
+              "hang"           ignore the pulse count: run until SIGINT
+              "no_data"        write no records; "short_data": only the first half of them
+  "radar_check"  as "radar", for the turn-on check's low-power run only (FILES.save_loc low_power.bin);
+              without it, "radar" applies to that run too
+  "records_from" a file of records (complex float32) recorded at tx_gain "records_gain": written in turn,
+              scaled by 1 dB per step of RF0.tx_gain, instead of the constant records
+  "tx_file"   this file exists while pulses go out (for a stand-in telemetry: the amplifier current)
+  "pulse_delay_s"  wait this long after the start line before the first pulse (ORCA: CHIRP.time_offset)
 """
+import array
 import json
 import os
 import signal
@@ -78,6 +87,8 @@ yaml_filename = "../../" + sys.argv[1] if len(sys.argv) >= 2 else "../../config/
 say("Reading from config file: " + yaml_filename)
 with open(yaml_filename) as f:
     config = yaml.safe_load(f)
+if str((config.get("FILES") or {}).get("save_loc")) == "low_power.bin":
+    mode = control.get("radar_check", mode)
 say("")
 say("Creating the usrp device with: " + str(config["DEVICE"]["device_args"]) + "...")
 uhd("[INFO] [UHD] linux; GNU C++ version 13.3.0; Boost_109000; UHD_4.11.0.0-0-c87abfbe")
@@ -149,7 +160,22 @@ if num_pulses < 0:
     say("num_pulses is < 0. Will continue to send chirps until stopped with Ctrl-C.")
 say("[START] Beginning main loop")
 
-record = b"\x01" * (num_rx_samps * 8)
+records = [b"\x01" * (num_rx_samps * 8)]
+if control.get("records_from"):
+    with open(control["records_from"], "rb") as f:
+        raw = f.read()
+    scale = 10 ** ((float(config["RF0"]["tx_gain"]) - float(control.get("records_gain", 0))) / 20)
+    records = []
+    for i in range(len(raw) // (num_rx_samps * 8)):
+        values = array.array("f", raw[i * num_rx_samps * 8:(i + 1) * num_rx_samps * 8])
+        records.append(array.array("f", (v * scale for v in values)).tobytes())
+written_records = 0
+wanted_records = num_pulses // num_presums if num_pulses > 0 else -1
+if mode == "hang":
+    num_pulses = -1
+time.sleep(float(control.get("pulse_delay_s", 0)))
+if control.get("tx_file"):
+    open(control["tx_file"], "w").close()
 t0 = time.monotonic()
 pulses_received = 0
 error_count = 0
@@ -167,7 +193,9 @@ while num_pulses < 0 or last_pulse_num_written < num_pulses:
         pulses_received += 1
         good = pulses_received - error_count
         if good % num_presums == 0:
-            outfile.write(record)
+            if not (mode == "no_data" or (mode == "short_data" and 2 * written_records >= wanted_records)):
+                outfile.write(records[written_records % len(records)])
+            written_records += 1
             last_pulse_num_written = good
         if max_per_file > 0 and last_pulse_num_written // max_per_file > save_file_index:
             outfile.close()
@@ -186,6 +214,11 @@ while num_pulses < 0 or last_pulse_num_written < num_pulses:
         say("[RX] Reached stop signal handling for outer RX loop -> break")
         break
 
+if control.get("tx_file"):
+    try:
+        os.unlink(control["tx_file"])
+    except OSError:
+        pass
 if mode == "slow_exit":
     time.sleep(2.0)
 say("[TX] stop signal called -> break")

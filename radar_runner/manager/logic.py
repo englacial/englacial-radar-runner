@@ -64,7 +64,8 @@ Rules
     that, at most `max_restarts_per_hour` automatic restarts (retries and
     resumes) are made in any hour: then fault (`restart_limit`). And at most
     `max_starts_per_hour` starts of any kind, fresh runs included: then fault
-    (`start_limit`). Nothing resets these counts but time, and a person
+    (`start_limit`); with the turn-on check each start counts twice (it opens
+    the SDR twice). Nothing resets these counts but time, and a person
     clearing that fault (button, start, clear-fault): both lists then start
     afresh. A fault cleared by the automatic source keeps them.
   * No start comes sooner than `min_start_gap_s` after the last run ended.
@@ -146,6 +147,7 @@ class LogicConfig:
     min_start_gap_s: float = 5.0
     manual_timeout_s: float = 50400.0       # 0 = no limit
     sources: tuple = (BUTTON, COMMAND)      # enabled trigger sources; add AUTO for the motion trigger
+    sdr_starts_per_run: int = 1             # 2 with the turn-on check: each start opens the SDR twice
 
     @classmethod
     def from_config(cls, manager_cfg, minimums=None):
@@ -193,10 +195,12 @@ class LogicConfig:
             timeout = default.manual_timeout_s
         sources = tuple(s for s, name in ((BUTTON, "button"), (COMMAND, "command"), (AUTO, "gps"))
                         if triggers[name])
+        check = (manager_cfg.get("turn_on_check") or {}).get("enabled") is True
         return cls(retry_delays_s=tuple(float(d) for d in delays), max_resumes=resumes,
                    resume_holdoff_s=float(holdoff), stable_run_s=float(stable),
                    max_restarts_per_hour=per_hour, max_starts_per_hour=starts, min_start_gap_s=float(gap),
-                   manual_timeout_s=float(timeout), sources=sources), warnings
+                   manual_timeout_s=float(timeout), sources=sources,
+                   sdr_starts_per_run=2 if check else 1), warnings
 
 
 class ManagerLogic:
@@ -325,13 +329,13 @@ class ManagerLogic:
             self._set_fault(t, "restart_limit", f"{len(self.restarts)} automatic restarts within an hour "
                             f"(limit {self.cfg.max_restarts_per_hour}); last end: {self.last_end}")
             return
-        if len(self.starts) >= self.cfg.max_starts_per_hour:
+        if len(self.starts) + self.cfg.sdr_starts_per_run > self.cfg.max_starts_per_hour:
             self._set_fault(t, "start_limit", f"{len(self.starts)} starts within an hour "
                             f"(limit {self.cfg.max_starts_per_hour}); last end: {self.last_end}")
             return
         if restart:
             self.restarts.append(t)
-        self.starts.append(t)
+        self.starts.extend([t] * self.cfg.sdr_starts_per_run)
         self.phase = STARTING
         self.collection = None
         data = {"trigger": self.intent["label"], "attempt": self.failures + 1, "resume": self.resume}
