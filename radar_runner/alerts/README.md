@@ -270,7 +270,9 @@ Contents:
   and the number of config warnings;
 * active alerts, and the queue: waiting, dropped, held back.
 
-A day without a summary is itself a sign of trouble.
+A field of the other services' status of an odd type is shown as text. A
+summary that cannot be put together all the same goes out short (boot, uptime
+and the error), once. A day without a summary is itself a sign of trouble.
 
 ## Event logs
 

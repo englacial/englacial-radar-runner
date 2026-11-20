@@ -794,6 +794,31 @@ def test_an_exit_that_asks_for_a_restart_is_not_a_clean_stop(tmp_path, server, e
     assert "ended without a clean stop" in summaries(server)[-1]["message"]
 
 
+def test_odd_fields_in_the_other_services_status_do_not_keep_the_summary_from_going_out(tmp_path, server):
+    rig = Rig(tmp_path, server.url)
+    rig.telemetry.update(state={"x": 1}, problems=7, config_warnings=3)
+    rig.telemetry["sources"]["pi"]["values"] = [900.0]
+    rig.manager = {"state": "not_ready", "not_ready": 5, "fault": None, "config_warnings": "one"}
+    rig.watcher["config_warnings"] = ["a", "b"]
+    rig.start()
+    status = rig.tick(3)
+    [s] = summaries(server)
+    assert "summary" not in status["errors"] and "not ready: 5" in s["message"] and "Telemetry: {'x': 1}: 7." in s["message"]
+    assert "Config warnings: 4" in s["message"]
+
+
+def test_a_summary_that_cannot_be_put_together_still_goes_out_once(tmp_path, server, monkeypatch):
+    def broken(facts):
+        raise ValueError("odd facts")
+    monkeypatch.setattr(L, "boot_summary", broken)
+    rig = Rig(tmp_path, server.url)
+    rig.start()
+    status = rig.tick(5)
+    [s] = summaries(server)
+    assert s["title"] == "test-unit: boot 42 summary" and "could not be put together (ValueError: odd facts)" in s["message"]
+    assert status["summary_sent"] is True
+
+
 # ---- the boot summary in real boots
 
 def summaries(server):

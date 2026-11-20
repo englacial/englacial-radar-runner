@@ -86,6 +86,13 @@ def _path(base, name):
     return os.path.join(base, name)         # a full path stays as it is
 
 
+def _texts(value):
+    """A list field of another service's status as texts; anything else that is set, as one text."""
+    if isinstance(value, list):
+        return [str(x) for x in value]
+    return [str(value)] if value else []
+
+
 def scan_collections(root):
     """The newest collection under `root`: {"count", "last": {...}} (raises OSError)."""
     found = []
@@ -540,14 +547,26 @@ class Alerts(Service):
             return []           # wait for the drive, at most SCAN_TIMEOUT_S
         collections = scan["result"].get("value") or {
             "error": f"the data drive did not answer within {SCAN_TIMEOUT_S:g} s"}
-        facts = self._summary_facts(now, collections)
-        if not settled:
-            facts["unsettled"] = (f"Sent before the other services had settled ({L._duration(now - self._started_at)} "
-                                  f"after this service started): {'; '.join(self._unsettled_now) or 'unsteady'}. "
-                                  "\"unknown\" below means not reported yet, not a fault of the radar.")
+        try:
+            facts = self._summary_facts(now, collections)
+            if not settled:
+                facts["unsettled"] = (f"Sent before the other services had settled "
+                                      f"({L._duration(now - self._started_at)} after this service started): "
+                                      f"{'; '.join(self._unsettled_now) or 'unsteady'}. \"unknown\" below means "
+                                      "not reported yet, not a fault of the radar.")
+            alert = L.boot_summary(facts)
+        except Exception as e:
+            # The one message per boot that says the unit is alive: a short one rather than none, and
+            # rather than trying again every round.
+            self.log.exception("cannot put the boot summary together; a short one goes out")
+            boot = self.boot if self.boot is not None else "?"
+            alert = L.Alert("summary", L.DEFAULT, f"boot {boot} summary",
+                            f"Boot {boot}, up {L._duration(now)}. The rest of the summary could not be put together "
+                            f"({type(e).__name__}: {str(e)[:200]}); the alerts service's log has more.",
+                            limited=False, tags=["summary"])
         self.summary_sent = True
         self._dirty = True
-        return [(L.boot_summary(facts), None)]
+        return [(alert, None)]
 
     def _summary_facts(self, now, collections):
         r = self._reads
@@ -574,6 +593,7 @@ class Alerts(Service):
             elif not man.ok:
                 last["how"] = f"no end recorded yet ({started}; the radar manager's state is not known)"
         values = L._get(tel.data, "sources", "pi", "values") if tel.ok else None
+        values = values if isinstance(values, dict) else {}
         previous = dict(self.previous) if self.previous else None
         last_shutdown = L._get(pwr.data, "guard", "last_shutdown") if pwr.data else None
         if previous is not None and isinstance(last_shutdown, dict) and last_shutdown != self.power_last_shutdown:
@@ -589,7 +609,7 @@ class Alerts(Service):
             elif isinstance(d.get("last_fault"), dict):
                 line += f" (last fault {d['last_fault'].get('kind')})"
             if d.get("not_ready"):
-                line += "; not ready: " + "; ".join(str(x) for x in d["not_ready"])
+                line += "; not ready: " + "; ".join(_texts(d["not_ready"]))
             services.append(line + ".")
         else:
             services.append(f"Radar manager: not running ({man.state}).")
@@ -599,9 +619,9 @@ class Alerts(Service):
         else:
             services.append(f"Safety watcher: NOT RUNNING ({wat.state}).")
         if tel.ok:
-            problems = tel.data.get("problems") or []
-            services.append("Telemetry: " + (tel.data.get("state") or "?")
-                            + (": " + ", ".join(map(str, problems)) if problems else "") + ".")
+            problems = _texts(tel.data.get("problems"))
+            services.append(f"Telemetry: {tel.data.get('state') or '?'}"
+                            + (": " + ", ".join(problems) if problems else "") + ".")
         else:
             services.append(f"Telemetry: NOT RUNNING ({tel.state}).")
         if pwr.ok:
@@ -613,7 +633,7 @@ class Alerts(Service):
                             + (f"; warnings: {', '.join(sorted(warnings))}" if warnings else "") + ".")
         else:
             services.append(f"Power service: NOT RUNNING ({pwr.state}).")
-        config_warnings = sum(len(x.data.get("config_warnings") or []) for x in (tel, wat, man) if x.ok)
+        config_warnings = sum(len(_texts(x.data.get("config_warnings"))) for x in (tel, wat, man) if x.ok)
         config_warnings += len(self.config_warnings)
         if config_warnings:
             services.append(f"Config warnings: {config_warnings} (setup/check.py lists them).")
@@ -623,7 +643,7 @@ class Alerts(Service):
         return {"boot": self.boot, "uptime_s": now,
                 "clock_synced": L._get(tel.data, "clock", "synced") if tel.ok else None,
                 "previous": previous,
-                "disk": {"nvme_free_gb": (values or {}).get("nvme_free_gb"), "sd_free_gb": (values or {}).get("sd_free_gb")},
+                "disk": {"nvme_free_gb": values.get("nvme_free_gb"), "sd_free_gb": values.get("sd_free_gb")},
                 "collections": collections, "services": services, "active": active,
                 "queue": {"length": len(self.queue.names()), "dropped": self.queue.dropped,
                           "held": self.limiter.held_total}}
