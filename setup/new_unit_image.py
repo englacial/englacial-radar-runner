@@ -23,6 +23,7 @@ first unexpected state stops the run.
 """
 import argparse
 import datetime
+import fcntl
 import json
 import os
 import re
@@ -1111,11 +1112,12 @@ def attached_loops(image):
     return [line.split(":", 1)[0] for line in out.split("\n") if line.strip()]
 
 
-def clean_up(image, mount_points):
-    """Unmount whatever is mounted at our mount points, detach every loop device of the image,
-    then check both. Returns what is left (empty: clean)."""
+def clean_up(image, loop, workdir, mount_points):
+    """Unmount whatever is mounted at our mount points, detach the loop device this run attached
+    (every one of the image only if the attach was interrupted before its name was known), then
+    check both. Returns what is left (empty: clean)."""
     left = []
-    subprocess.run(["sync"], check=False)
+    os.sync()
     for d in reversed(mount_points):
         for _ in range(5):
             if not os.path.ismount(d):
@@ -1127,16 +1129,20 @@ def clean_up(image, mount_points):
         if os.path.ismount(d):
             left.append(f"{d} still mounted")
     try:
+        mine = lambda: [d for d in attached_loops(image) if loop is None or d == loop]   # noqa: E731
         if not left:            # never detach a device with a file system mounted from it
-            for loop in attached_loops(image):
-                subprocess.run(["losetup", "-d", loop], check=False)
+            for d in mine():
+                subprocess.run(["losetup", "-d", d], check=False)
             for _ in range(10):         # a busy device is only marked for detaching: wait, then check
-                if not attached_loops(image):
+                if not mine():
                     break
                 time.sleep(0.5)
-        loops = attached_loops(image)
-        if loops:
-            left.append(f"{', '.join(loops)} still attached to {image}")
+        still = mine()
+        if still:
+            left.append(f"{', '.join(still)} still attached to {image}")
+        others = [d for d in attached_loops(image) if d not in still]
+        if others:
+            left.append(f"{', '.join(others)} also attached to {image}, not by this run: left as it is")
     except Stop as e:
         left.append(f"cannot ask which loop devices the image has ({e})")
     for d in reversed(mount_points):
@@ -1145,9 +1151,9 @@ def clean_up(image, mount_points):
                 os.rmdir(d)             # rmdir only: never deletes anything inside a mount
             except OSError:
                 pass
-    if mount_points and not left:
+    if workdir:
         try:
-            os.rmdir(os.path.dirname(mount_points[0]))
+            os.rmdir(workdir)           # only if empty
         except OSError:
             pass
     return left
@@ -1168,6 +1174,19 @@ def with_image(args):
     for tool in ("losetup", "mount", "umount", "blkid", "ssh-keygen"):
         if shutil.which(tool) is None:
             raise Stop(f"{tool} is not installed on this computer")
+    # One run per image at a time, held for the whole run (also keeps two runs from mounting it).
+    lock = os.open(image, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Stop(f"another run of this tool holds {image}; wait for it to end")
+        with_locked_image(args, image)
+    finally:
+        os.close(lock)
+
+
+def with_locked_image(args, image):
     if attached_loops(image):
         raise Stop(f"{image} is attached to a loop device already (losetup -j): detach it first")
 
@@ -1175,11 +1194,12 @@ def with_image(args):
         raise KeyboardInterrupt
     for s in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(s, interrupted)
-    mount_points, attaching = [], False
+    mount_points, attaching, run = [], False, {"loop": None, "workdir": None}
     try:
         attaching = True        # from here the clean-up asks the kernel what is attached
         loop = run_cmd(["losetup", "--find", "--show", "--partscan"] + (["--read-only"] if args.dry_run else [])
                        + [image])
+        run["loop"] = loop
         say(f"image attached as {loop}")
         if shutil.which("udevadm"):
             subprocess.run(["udevadm", "settle", "--timeout=10"], check=False)
@@ -1198,7 +1218,7 @@ def with_image(args):
             if info.get("TYPE") != fstype or info.get("LABEL") != label:
                 raise Stop(f"{dev}: {info.get('TYPE')} labelled {info.get('LABEL')}; expected {fstype} "
                            f"labelled {label}")
-        workdir = tempfile.mkdtemp(prefix="new-unit-image.")
+        workdir = run["workdir"] = tempfile.mkdtemp(prefix="new-unit-image.")
         root_dir, boot_dir = os.path.join(workdir, "root"), os.path.join(workdir, "boot")
         ro = ["-o", "ro,noload,nodev,nosuid"] if args.dry_run else ["-o", "nodev,nosuid"]
         for d, mount in ((root_dir, ["mount", "-t", "ext4", *ro, root_dev, root_dir]),
@@ -1212,7 +1232,7 @@ def with_image(args):
         for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             signal.signal(s, signal.SIG_IGN)        # a second Ctrl-C must not stop the clean-up
         try:
-            left = clean_up(image, mount_points) if attaching else []
+            left = clean_up(image, run["loop"], run["workdir"], mount_points) if attaching else []
         finally:
             signal.signal(signal.SIGINT, signal.default_int_handler)
             signal.signal(signal.SIGTERM, signal.SIG_DFL)

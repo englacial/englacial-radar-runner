@@ -688,7 +688,7 @@ def test_wrapper_always_unmounts_and_detaches(fake_system, capsys, trouble, core
     assert nui.main(["image", image, "--hostname", NEW]) == status
     err = capsys.readouterr().err
     assert fake.mounted == set() and fake.attached == []
-    assert ["sync"] in fake.calls
+    assert ["os.sync"] in fake.calls
     mounts = [c[-1] for c in fake.calls if c[0] == "mount"]
     assert all(not os.path.exists(m) for m in mounts)       # the empty mount points are gone
     assert "image unmounted and detached" in err and "INCOMPLETE" not in err
@@ -984,3 +984,48 @@ def test_absolute_dbus_link_of_the_real_unit_resolves_inside_the_image(shm, caps
     out = capsys.readouterr().out
     assert "/var/lib/dbus/machine-id is a link to /etc/machine-id" in out
     assert "would: /var/lib/dbus/machine-id" not in out
+
+
+def test_wrapper_refuses_an_image_another_run_holds(fake_system, capsys):
+    import fcntl
+    image, make = fake_system
+    fake = make()
+    with open(image, "rb") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert nui.main(["image", image, "--hostname", NEW]) == 2
+    assert "another run" in capsys.readouterr().err
+    assert not [c for c in fake.calls if c[0] == "mount" or "--find" in c]
+
+
+def test_wrapper_detaches_only_its_own_loop_device(fake_system, capsys):
+    image, make = fake_system
+    fake = make("operator_loop")
+    status = nui.main(["image", image, "--hostname", NEW])
+    err = capsys.readouterr().err
+    assert "/dev/loop5" in fake.attached and "/dev/loop9" not in fake.attached
+    assert ["losetup", "-d", "/dev/loop5"] not in fake.calls
+    assert status == 3 and "/dev/loop5" in err and "not by this run" in err
+
+
+def test_wrapper_removes_its_directory_after_an_early_interrupt(fake_system, monkeypatch):
+    image, make = fake_system
+    make()
+    made = []
+    real_mkdtemp = tempfile.mkdtemp
+    monkeypatch.setattr(nui.tempfile, "mkdtemp", lambda *a, **k: made.append(real_mkdtemp(*a, **k)) or made[-1])
+    real_mkdir = os.mkdir
+
+    def mkdir(path, *a, **k):           # the interrupt comes before the first mount point exists
+        if str(path).endswith("/root"):
+            raise KeyboardInterrupt
+        return real_mkdir(path, *a, **k)
+    monkeypatch.setattr(nui.os, "mkdir", mkdir)
+    assert nui.main(["image", image, "--hostname", NEW]) == 130
+    assert made and not os.path.exists(made[0])
+
+
+def test_wrapper_syncs_with_os_sync(fake_system):
+    image, make = fake_system
+    fake = make()
+    assert nui.main(["image", image, "--hostname", NEW]) == 0
+    assert ["os.sync"] in fake.calls
