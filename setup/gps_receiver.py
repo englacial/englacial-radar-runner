@@ -20,9 +20,9 @@ and for the raw GPS log (PPK, radar_runner/gpsraw) RXM-RAWX every `manager.gps_l
 epochs (a setting, read from the repository's config and /etc/radar-runner/local.yaml; 10 = 1 Hz
 at 10 Hz) and RXM-SFRBX (the broadcast navigation data) as it comes; rawx_every 0 sets both off. gpsd runs passive (-p) and
 sets none of them. The value of rawx_every, the file it came from and every warning of the config
-loader are printed; --apply writes nothing while the config loads with a warning about
-/etc/radar-runner/local.yaml or manager.gps_log, and without a usable rawx_every the other
-settings are checked (and provisioned) alone and the run ends with status 1. Left on, the NMEA sentences would come at every
+loader are printed. Without a usable rawx_every, and with --apply while the config loads with a
+warning about /etc/radar-runner/local.yaml or manager.gps_log, the raw pair is neither read nor
+written, the other 17 settings are checked (and provisioned) alone, and the run ends with status 1. Left on, the NMEA sentences would come at every
 epoch at the OLA's 10 Hz on top of the UBX messages, which already fill most of the USB transmit
 buffer. The OLA copies the receiver's settings from RAM to battery-backed memory and flash at
 every OLA start (measured 2026-11-20), so what is in RAM then is what the receiver powers up with
@@ -324,18 +324,21 @@ def provision(apply):
     right. Without a usable rawx_every the raw pair is left out (not checked: False). A config warning about
     the unit's file or the raw log refuses the write: every write here is permanent."""
     found = rawx_setting()
-    if found["value"] is None:
-        print(f"RXM-RAWX and RXM-SFRBX: not checked ({found['why']})", flush=True)
-    else:
-        print(f"manager.gps_log.rawx_every: {found['value']} (from {found['source']})", flush=True)
     for warning in found["warnings"]:
         print(f"config warning: {warning}", flush=True)
-    if apply and any(LOCAL_FILE in w or "gps_log" in w for w in found["warnings"]):
-        print(f"the configuration loads with a warning about {LOCAL_FILE} or manager.gps_log: nothing written. "
+    every = found["value"]
+    if every is None:
+        print(f"RXM-RAWX and RXM-SFRBX: not checked ({found['why']})", flush=True)
+    elif apply and any(LOCAL_FILE in w or "gps_log" in w for w in found["warnings"]):
+        # The other 17 do not depend on the config: they are still provisioned.
+        print(f"RXM-RAWX and RXM-SFRBX: not checked and not written: the configuration loads with a warning "
+              f"about {LOCAL_FILE} or manager.gps_log (above), so rawx_every ({every}) may not be the one meant. "
               f"Correct it (`.venv/bin/python -m radar_runner.common.config` shows the settings and warnings), "
               f"then run --apply again", flush=True)
-        return False
-    return _provision(apply, with_raw(found["value"])) and found["value"] is not None
+        every = None
+    else:
+        print(f"manager.gps_log.rawx_every: {every} (from {found['source']})", flush=True)
+    return _provision(apply, with_raw(every)) and every is not None
 
 
 def _provision(apply, settings):

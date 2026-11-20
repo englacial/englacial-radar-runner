@@ -426,18 +426,26 @@ def test_an_unreadable_setting_leaves_the_raw_pair_unchecked_and_the_rest_is_don
     assert tool.all_layers(SIG) == ["1", "1", "1"] and tool.ram(RAWX) == "0"
 
 
-def test_a_config_warning_about_the_unit_or_the_raw_log_refuses_the_write(tool, capsys):
+def test_a_config_warning_about_the_unit_or_the_raw_log_refuses_only_the_raw_pair(tool, capsys):
+    """The 17 settings gpsd needs are provisioned whatever the config says; the raw pair, which depends
+    on the config, is neither read nor written while it loads with such a warning."""
     tool.gpsd([IDENTIFIED])
-    tool.stored(SIG, 2, 0)
+    tool.stored(RAWX, 0, 0)
     for warning in ("/etc/radar-runner/local.yaml: not valid YAML (mapping values are not allowed here at line 3): "
-                    "skipped", "config/radar-runner.yaml: manager.gps_log.rawx_every must be a whole number, not text: "
-                    "ignored"):
+                    "skipped", "/etc/radar-runner/local.yaml: manager.gps_log.stop_wait_s must be at most 5: 5 used"):
+        tool.stored(SIG, 2, 0)
+        if tool.calls_file.exists():
+            tool.calls_file.unlink()
         tool.rawx_setting = lambda: setting(10, warnings=[warning])
         assert tool.main(["--apply"]) == 1
-        assert [c for c in calls(tool) if "-z" in c] == []
+        assert [c for c in calls(tool) if "-z" in c] == [["-z", f"{SIG},1"]]       # the 17: provisioned
+        assert not any(RAWX in a or SFRBX in a for c in calls(tool) for a in c)      # the pair: not touched
+        assert tool.all_layers(SIG) == ["1", "1", "1"] and tool.ram(RAWX) == "0"
         out = capsys.readouterr().out
-        assert "config warning: " + warning in out and "nothing written" in out and "local.yaml" in out
+        assert "config warning: " + warning in out
+        assert "RXM-RAWX and RXM-SFRBX: not checked and not written" in out and "then run --apply again" in out
     tool.rawx_setting = lambda: setting(10, warnings=["config/radar-runner.yaml: unknown setting alerts.x: ignored"])
+    tool.stored(RAWX, 0, 10)
     assert tool.main(["--apply"]) == 0                      # a warning about something else: shown, not refused
     assert "config warning: config/radar-runner.yaml: unknown setting alerts.x" in capsys.readouterr().out
 

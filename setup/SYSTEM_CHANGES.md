@@ -209,9 +209,10 @@ for the raw GPS log in each collection (`radar_runner/gpsraw/README.md`):
   10th epoch, 1 Hz at the OLA's 10 Hz; 2 = 5 Hz, 1 = 10 Hz). The script reads the setting
   from the repository's config and `/etc/radar-runner/local.yaml` with the repository's Python
   environment and prints the value, the file it came from and every warning of the config
-  loader. With a warning about `local.yaml` or `manager.gps_log`, `--apply` writes nothing.
-  If the setting cannot be read at all, the other 17 settings are still checked (and with
-  `--apply` provisioned), the raw pair is reported as not checked, and the exit status is 1.
+  loader. If the setting cannot be read, or with `--apply` while the config loads with a
+  warning about `local.yaml` or `manager.gps_log`, the raw pair is neither read nor written,
+  the other 17 settings are still checked (and with `--apply` provisioned), and the exit
+  status is 1.
 - `CFG-MSGOUT-UBX_RXM_SFRBX_USB` = 1 (the broadcast navigation data, as it comes); both 0
   with `rawx_every: 0`.
 - **Why 1 Hz by default:** the USB output is already 21 kB/s with its transmit buffer peaking at
