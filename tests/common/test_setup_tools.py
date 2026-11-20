@@ -368,7 +368,8 @@ def test_check_fails_an_fstab_line_that_would_not_mount_the_drive():
     status, text = found["NVMe fstab line names the mounted drive"]
     assert status == "FAIL" and "LABEL=orca-hil" in text and "radar-data" in text and "missing after the next boot" in text
     status, text = found["NVMe label in udev's cache"]
-    assert status == "INFO" and "sudo udevadm trigger --action=change /dev/nvme0n1p1 && sudo udevadm settle" in text
+    assert status == "INFO" and "the next boot refreshes it" in text and "udevadm trigger" not in text
+    assert "do not trigger udev for the mounted data drive" in text
     found = {name: status for status, name, _ in findings("LABEL=radar-data", dev, uuid, "radar-data", "radar-data")}
     assert found == {"NVMe fstab line names the mounted drive": "PASS", "NVMe label in udev's cache": "PASS"}
     assert findings(f"UUID={uuid}", dev, uuid, "radar-data", "radar-data")[0][0] == "PASS"

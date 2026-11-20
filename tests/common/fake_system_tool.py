@@ -209,7 +209,19 @@ if tool == "systemd-tmpfiles":
 
 if tool == "findmnt":
     if "--verify" in args:
-        done(0 if state["fstab_valid"] else 1)
+        if not state["fstab_valid"]:
+            print(f"findmnt: {args[-1]}: parse error at line 3 -- ignored", file=sys.stderr)
+            done(1, "\n1 parse error, 0 errors, 0 warnings")
+        # As root, libblkid also scans the devices for a LABEL= source; as a user ("verify_as_user")
+        # it only has udev's by-label links, which have the cached labels.
+        with open(args[-1]) as f:
+            sources = [line.split()[0] for line in f if line.split()[1:2] == ["/mnt/nvme"]]
+        cached = state["other_labels"] + [state["nvme_label"]]
+        errors = [f"[E] unreachable on boot required source: {s}" for s in sources
+                  if state.get("verify_as_user") and s.startswith("LABEL=") and s[6:] not in cached]
+        errors += state.get("verify_errors", [])
+        lines = [f"\n0 parse errors, {len(errors)} error{'' if len(errors) == 1 else 's'}, 0 warnings"]
+        done(1 if errors else 0, "\n".join(lines + (["/mnt/nvme"] if errors else []) + ["   " + e for e in errors]))
     done(0 if state["nvme_device"] else 1, state["nvme_device"] or None)
 
 # udev's cached labels ("nvme_label" for the data drive) and the label its filesystem really has
@@ -222,12 +234,6 @@ if tool == "lsblk":
 
 if tool == "python3" and args[-2:-1] and args[-2].endswith("/setup/fs_label.py"):
     done(0, state.get("nvme_fs_label", state["nvme_label"]))
-
-if tool == "udevadm":
-    if args[:2] == ["trigger", "--action=change"] and args[2] == state["nvme_device"]:
-        state["nvme_label"] = state.get("nvme_fs_label", state["nvme_label"])     # udev reads the device again
-        done(0, record=True)
-    done(0 if args == ["settle"] else 1, record=True)
 
 print(f"fake_system_tool: no stand-in for {tool}", file=sys.stderr)
 done(127, record=True)

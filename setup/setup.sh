@@ -858,6 +858,21 @@ step_time() {
 # line has "nofail", so that a missing drive cannot stop the boot. The label
 # is read from the filesystem itself: after e2label on a mounted drive, udev's
 # cache (lsblk, findmnt, /dev/disk/by-label/) still has the old one.
+verify_fstab() {        # verify_fstab FILE LABEL MOUNT_POINT: findmnt --verify on the new fstab
+    local out
+    out=$(findmnt --verify --tab-file "$1" 2>&1) && return 0
+    # Without root, and while udev's cache has the old label, findmnt cannot find the new one. Only that
+    # one error, for exactly the source written, is accepted, and only if the mounted filesystem has it.
+    if grep -Eqx '0 parse errors, 1 error, [0-9]+ warnings?' <<<"$out" \
+       && [ "$(grep -F '[E]' <<<"$out" | sed 's/^ *//')" = "[E] unreachable on boot required source: LABEL=$2" ] \
+       && [ "$(python3 -B "$REPO/setup/fs_label.py" "$3")" = "$2" ]; then
+        note "findmnt --verify cannot find LABEL=$2 yet (udev's cache has the old label); the filesystem at $3 has it"
+        return 0
+    fi
+    printf '%s\n' "$out" | sed 's/^/             /'
+    return 1
+}
+
 optional_nvme_by_label() {
     step "OPTIONAL: mount /mnt/nvme by label instead of UUID"
     local fstab=$DESTDIR/etc/fstab mnt=/mnt/nvme spec opts dev uuid label cached count
@@ -882,10 +897,9 @@ optional_nvme_by_label() {
     label=$(python3 -B "$REPO/setup/fs_label.py" "$mnt") || die "cannot read the label of the filesystem at $mnt"
     cached=$(lsblk -no LABEL "$dev")
     if [ "$cached" != "$label" ]; then
-        note "udev has the label '$cached' for $dev, its filesystem has '$label' (relabelled while mounted)"
-        [ "$DRY_RUN" -eq 0 ] || note "udev's cache is stale; the real run refreshes it:"
-        run udevadm trigger --action=change "$dev"
-        [ "$DRY_RUN" -eq 1 ] || udevadm settle || die "command failed: udevadm settle"
+        # Never refreshed here: a change event for the mounted data drive can make systemd unmount it.
+        note "udev's cache has the label '$cached' for $dev, the filesystem has '$label'"
+        note "the next boot refreshes udev's cache; until then lsblk and /dev/disk/by-label/ show the old label"
     fi
     if [ "$spec" = "LABEL=$label" ]; then
         ok "$mnt is already mounted by label ($spec)"
@@ -906,7 +920,7 @@ optional_nvme_by_label() {
     awk -v m="$mnt" -v old="$spec" -v new="LABEL=$label" \
         '$1 == old && $2 == m { sub(/^[^[:space:]]+/, new) } { print }' "$fstab" > "$TMP_FILE"
     [ "$(diff "$fstab" "$TMP_FILE" | grep -c '^>' || true)" -eq 1 ] || die "unexpected result when editing fstab; nothing changed"
-    findmnt --verify --tab-file "$TMP_FILE" >/dev/null || die "the new fstab does not pass 'findmnt --verify'; nothing changed"
+    verify_fstab "$TMP_FILE" "$label" "$mnt" || die "the new fstab does not pass 'findmnt --verify'; nothing changed"
     chmod 0644 "$TMP_FILE"
     [ -e "$fstab.before-radar-runner" ] || cp -p "$fstab" "$fstab.before-radar-runner"
     sync "$TMP_FILE"

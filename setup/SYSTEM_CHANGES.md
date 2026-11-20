@@ -672,15 +672,24 @@ relying on it.
 - **Why:** any drive with the right label then works as a replacement.
 - **Label cache:** `e2label` on a mounted drive sets the label through an
   ioctl, and udev is not told, so `lsblk`, `findmnt -o LABEL` and
-  `/dev/disk/by-label/` keep the old label until the next boot or a udev
-  refresh. The script therefore reads the label from the filesystem itself
-  (`setup/fs_label.py`, no root needed), and if udev's label differs, a real
-  run refreshes it with `udevadm trigger --action=change <device>` and
-  `udevadm settle` (a dry run says it would). `setup/check.py` fails a line
-  that would not mount the drive mounted now, and reports a stale cache.
-  By hand: `setup/fs_label.py /mnt/nvme` (the filesystem's label) against
-  `lsblk -no LABEL /dev/nvme0n1p1` (udev's) and the `/mnt/nvme` line of
-  `/etc/fstab`.
+  `/dev/disk/by-label/` keep the old label until the next boot. The script
+  therefore reads the label from the filesystem itself (`setup/fs_label.py`,
+  no root needed) and says when udev's differs; the next boot refreshes it.
+  Without root, `findmnt --verify` cannot find the new label yet; the script
+  accepts that one error, for that line only, when the mounted filesystem has
+  the label. `setup/check.py` fails a line that would not mount the drive
+  mounted now, and reports a stale cache. By hand: `setup/fs_label.py
+  /mnt/nvme` (the filesystem's label) against `lsblk -no LABEL
+  /dev/nvme0n1p1` (udev's) and the `/mnt/nvme` line of `/etc/fstab`.
+- **Do not refresh udev by hand** (`udevadm trigger`) for the mounted data
+  drive. On a unit that booted with a `LABEL=` line, `mnt-nvme.mount` requires
+  `systemd-fsck@dev-disk-by\x2dlabel-<label>.service`, which is bound to the
+  `/dev/disk/by-label/<label>` device. A change event after a relabel removes
+  that link, and systemd can then stop the fsck service and with it unmount
+  the drive. For the same reason, do not relabel the data drive while it is
+  mounted on a unit that booted by label, unless a reboot follows directly.
+  On a unit that booted by `UUID=` (as before this option), relabel, run the
+  script, and reboot.
 - **Risk:** `/etc/fstab` is not a drop-in file; a broken line can stop the boot
   and with it SSH. The script therefore only touches a line that has `nofail`,
   changes one field, checks the result with `findmnt --verify`, refuses a label

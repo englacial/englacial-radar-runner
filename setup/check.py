@@ -347,9 +347,10 @@ def nvme_fstab_findings(spec, device, uuid, label, cached_label):
     if label is not None and label != cached_label:
         # INFO, not FAIL: udev reads the label again at the next boot; until then lsblk, findmnt and
         # /dev/disk/by-label show the old one. The fstab finding above covers what matters for the boot.
+        # A udev refresh is not suggested: with a LABEL= line it can make systemd unmount the drive.
         found.append((INFO, "NVMe label in udev's cache",
-                      f"udev has '{cached_label}', the filesystem has '{label}' (relabelled while mounted); refresh: "
-                      f"sudo udevadm trigger --action=change {device} && sudo udevadm settle"))
+                      f"udev has '{cached_label}', the filesystem has '{label}'; the next boot refreshes it "
+                      "(do not trigger udev for the mounted data drive: it can unmount it; setup/SYSTEM_CHANGES.md)"))
     elif label is not None:
         found.append((PASS, "NVMe label in udev's cache", f"'{label}', as the filesystem has it"))
     return found
