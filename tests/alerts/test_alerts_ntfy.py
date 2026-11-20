@@ -184,11 +184,27 @@ def test_an_unconfigured_server_or_topic_sends_nothing(server):
     (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"id\"\r\n", False),  # chunked, cut
     (b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{\"id\": 12}", True),               # whole
     (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3\r\n: 1\r\n1\r\n}\r\n0\r\n\r\n", True),
+    (b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"id\": \"m1\"}", True),                # ended by the close
+    (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"id\": \"m1\"}", True),
+    (b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n", False),      # no body: cannot tell from a cut
+    (b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + b"x" * 100000, True),               # over-long: taken
+    (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + b"10000\r\n" + b"x" * 65536 + b"\r\n"
+     + b"10000\r\n" + b"x" * 65536 + b"\r\n0\r\n\r\n", True),
+    (b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n" + b"x" * 100000, True),
+    (b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n" + b"x" * 1000, False),           # over-long, cut short
 ])
 def test_only_a_whole_answer_counts_as_sent(answer, sent):
     def reply(conn):
+        import socket
         conn.recv(65536)
         conn.sendall(answer)
+        conn.shutdown(socket.SHUT_WR)       # an orderly close: unread request bytes would make it a reset
+        conn.settimeout(5.0)
+        try:
+            while conn.recv(65536):
+                pass
+        except OSError:
+            pass
         conn.close()
     url, sock = raw_server(reply)
     r = send(url, timeout=3.0)

@@ -181,9 +181,12 @@ that way: a connect or handshake ends at the 10 s socket timeout, a lookup when
 the resolver gives up; the send runs on in its thread meanwhile (the loop and a
 stop do not wait for it), and no new send starts while two are left like that.
 Sent means a complete 2xx answer: the end of the headers and the whole body
-(Content-Length matched, or the end of a chunked body). A connection that
-closes before that, or a send that was cut off before its answer was whole, is
-never counted as sent.
+(Content-Length matched, the end of a chunked body, or a body that ends where
+the server closes the connection). A connection that closes before that, a 2xx
+without Content-Length that closes before any body (it cannot be told from one
+cut off in the headers), or a send that was cut off before its answer was
+whole, is never counted as sent. A body over 64 kB is not read to its end but
+counts as sent: the server took the alert.
 
 | Answer | Then |
 |---|---|
