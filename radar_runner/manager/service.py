@@ -15,7 +15,7 @@ import time
 
 from radar_runner.common.service import Service
 
-from . import ampsafe, control, gates, logic as L, panel as panel_module
+from . import ampsafe, control, gates, logic as L, panel as panel_module, turnon
 from .runner import Runner
 
 REPLY_TIMEOUT_S = 1.5       # shorter than radarctl waits for an answer (2 s)
@@ -35,6 +35,9 @@ class Manager(Service):
         logic_cfg, refused = L.LogicConfig.from_config(self.cfg, minimums)
         self.config_warnings += refused
         self.logic = L.ManagerLogic(logic_cfg)
+        self.check_settings, refused = turnon.Settings.from_config(config)
+        self.config_warnings += refused
+        self.last_check = None                  # the last turn-on check's summary (turnon.py)
         self.overrides = gates.Overrides(config["paths"]["state_dir"])
         self.sdr_state = ampsafe.SdrState(config["paths"]["state_dir"],
                                           ampsafe.tool_lock_path(self.cfg["amp_safe"]))
@@ -60,7 +63,11 @@ class Manager(Service):
         self.gate_list = self._given["gates"] or gates.build(self.config, self.overrides)
         # One record object for both: what the runner learns (the tool said OK
         # but the record was not written) the idle rule here must know.
-        self.runner = self._given["runner"] or Runner(self.config, self._from_runner, sdr_state=self.sdr_state)
+        check = turnon.TurnOnCheck(self.config, self.check_settings) if self.check_settings.enabled else None
+        self.runner = self._given["runner"] or Runner(self.config, self._from_runner, sdr_state=self.sdr_state,
+                                                      turn_on_check=check)
+        if check is not None:
+            check.runner = self.runner
         if self._given["panel"] is not None:
             self.panel = self._given["panel"]
         elif self.cfg["panel"]["enabled"]:
@@ -235,6 +242,9 @@ class Manager(Service):
         elif name == "ended":
             self._record({"event": "ended", **data})
             self.logic.ended(now, data)
+        elif name == "turn_on_check":
+            self.last_check = data
+            self._record({"event": "turn_on_check", **data})
         elif name == "safe_done":
             self._record({"event": "amp_safe_done", **data})
             if not data.get("ok"):
@@ -276,6 +286,9 @@ class Manager(Service):
                 "gate %s: %s", event.get("gate"), "ok" if event.get("ok") else event.get("reason"))
         elif name == "ended" and event.get("failure"):
             self.log.warning("run ended: %s", event.get("failure"))
+        elif name == "turn_on_check":
+            (self.log.info if event.get("passed") is not False and not event.get("warnings") else self.log.warning)(
+                "turn-on check, collection %s: %s", event.get("collection"), event.get("text"))
         elif name != "ended":
             self.log.info("%s", {k: v for k, v in event.items()})
         error = self.event_log.write(event)
@@ -301,6 +314,7 @@ class Manager(Service):
             "making_amp_safe": bool(getattr(self.runner, "making_safe", False)),
             # "" or the reading: enabled current with no radar process. The safety watcher acts on it.
             "amp_enabled_while_idle": self.enabled_idle,
+            "turn_on_check": dict(self.check_settings.public(), last=self.last_check),
             "panel": self.panel.snapshot(),
             "socket": self.socket_path,
             "events": {"file": self.event_log.path, "written": self.event_log.written,

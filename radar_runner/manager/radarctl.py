@@ -80,8 +80,17 @@ def format_status(s):
     if radar.get("active"):
         lines.append(f"collection: {radar.get('collection')}  (pid {radar.get('pid')}, "
                      f"{radar.get('chunks_closed')} data files closed)")
+    if radar.get("turn_on_check"):
+        lines.append(f"turn-on:    {radar['turn_on_check']}")
     if s.get("last_end"):
         lines.append(f"last run:   {s['last_end']}")
+    check = s.get("turn_on_check") or {}
+    if check.get("enabled"):
+        mode = "blocking" if check.get("blocks") else "record only" + (
+            "" if check.get("verified") else ", expected peak not set")
+        last = check.get("last") or {}
+        lines.append(f"turn-on:    check {mode}; last: "
+                     + (f"{last.get('text')} ({last.get('collection')})" if last else "none since the manager started"))
     r = s.get("retries") or {}
     if r.get("failed_starts") or r.get("interruptions"):
         lines.append(f"retries:    {r.get('failed_starts')} failed starts (limit {r.get('max_retries')}), "

@@ -133,6 +133,22 @@ def test_manager_faults_are_high_and_failed_runs_low():
         assert L.manager_alert({"event": name}) is None
 
 
+def test_turn_on_check_alerts():
+    # Blocking: the fault says why and what tries again; the check's own event adds nothing.
+    reason = "turn-on check failed: no combined peak at sample 78.4 +/- 1.5: antenna or cable disconnected?"
+    fault = L.manager_alert({"event": "fault", "kind": "turn_on_check", "reason": reason})
+    assert fault.priority == L.HIGH and fault.title == "radar FAULT: turn_on_check"
+    assert reason in fault.message and "the next button press, radarctl start or motion trigger" in fault.message
+    assert L.manager_alert({"event": "turn_on_check", "passed": False, "blocked": True, "reason": "x"}) is None
+    # Record only: a low alert, the radar ran anyway.
+    alert = L.manager_alert({"event": "turn_on_check", "passed": False, "blocked": False,
+                             "reason": "amplifier current did not rise", "collection": "b00042_s003_x"})
+    assert alert.priority == L.LOW and "(record only)" in alert.title
+    assert "amplifier current did not rise" in alert.message and "b00042_s003_x" in alert.message
+    for passed in (True, None):                 # passed, or stopped before it was judged
+        assert L.manager_alert({"event": "turn_on_check", "passed": passed, "blocked": False}) is None
+
+
 def ended(errors, attempted, failure=""):
     # As in the bench's manager-events.jsonl on 2026-11-19.
     return {"event": "ended", "failure": failure, "collection": "b00004_s001_20261119T165343Z", "output_tail": [

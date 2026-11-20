@@ -4,7 +4,8 @@ Path rule copied from the real one: the chirp goes to
     os.path.join(<checkout>, FILES.output_dir, GENERATE.out_file)
 where <checkout> is the parent of this script's directory.
 
-Control file key "chirp": "fail" (exit 1), "slow" (sleep 30 s first), "nofile" (write nothing).
+Control file key "chirp": "fail" (exit 1), "slow" (sleep 30 s first), "nofile" (write nothing);
+"chirp_from": copy this file as the chirp (otherwise zeros of the right length).
 """
 import json
 import os
@@ -36,6 +37,10 @@ os.makedirs(output_dir, exist_ok=True)
 filename = os.path.join(output_dir, config["GENERATE"]["out_file"])
 samples = int(float(config["GENERATE"]["sample_rate"]) * float(config["GENERATE"]["pulse_length"]))
 with open(filename, "wb") as f:
-    f.write(b"\x00" * (8 * max(1, samples)))
+    if control.get("chirp_from"):           # a real chirp, for the turn-on check's analysis
+        with open(control["chirp_from"], "rb") as real:
+            f.write(real.read())
+    else:
+        f.write(b"\x00" * (8 * max(1, samples)))
 print("--- Converting Chirp to File ---")
 print("\tChirp successfully stored in %s" % filename)

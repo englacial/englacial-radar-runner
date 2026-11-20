@@ -114,9 +114,10 @@ setting; set the unit's value in `/etc/radar-runner/local.yaml`.**
 
 ## Starting and stopping the radar
 
-Start: config check, collection directory, derived config, chirp, build, (the
-turn-on check hook of stage 7,) launch, wait for the radar's `[START]` line,
-check the USB speed.
+Start: config check, collection directory, derived config, chirp, build, the
+turn-on check if it is enabled (its low-power radar, then its analysis: see
+"Turn-on check"), launch, wait for the radar's `[START]` line, check the USB
+speed.
 
 ORCA installs its SIGINT handler only after the SDR set-up (firmware and FPGA
 load, tuning). A SIGINT before that kills it in mid set-up, with the SDR's
@@ -136,6 +137,162 @@ below assume the worse case. So:
   resort (logged, collection marked `killed`).
 
 `docs/orca-proposals/0003-...` would let ORCA take a SIGINT at any time.
+
+## Turn-on check
+
+`turnon.py` and `tools/turn_on_check/measure.py`; settings `manager.turn_on_check`
+(**off by default**: with `enabled: false` the start is exactly as without it).
+**It has not run on the real radar yet.**
+
+At every start, after the build, a short run at low power, then the analysis,
+then the radar at the requested power. The low-power run is the collection's own
+config (as written and checked) with three changes, and nothing else (checked):
+`RF0.tx_gain` capped at `max_tx_gain` (40: 30 dB under the cap of 70, about
++9.6 dBm, 9 mW peak, at the amplifier output), `CHIRP.num_pulses` set to
+`pulses` rounded up to whole records (15000: 15 records at presum 1000, 3 s at
+5 kHz), and its output in `<collection>/turn_on_check/` with the data file
+`low_power.bin.0`. The waveform is unchanged, so every peak is at the delay it
+has at full power. It passes the same config limits, and is the same binary
+started the same way: the safety watcher sees a radar process, the record says
+`unknown` before it, the amplifier step follows its exit, and every stop (button,
+command, a gate, the power service's hook, the manager's exit) stops it exactly
+as it stops the radar at power, after which nothing more is started. The start
+limit counts two SDR starts for each start (`max_starts_per_hour`).
+
+| Criterion | From | Fails when |
+|---|---|---|
+| `amplifier_before` | the telemetry status just before the low-power run | idle current outside 0.10-0.20 A; the 28 V rail or a temperature beyond the safety watcher's own limits, as the watcher checks its settings (outside 26-30.5 V; 55 C or more; no cold limit); no reading |
+| `amplifier_during` | telemetry readings during its pulses (after `CHIRP.time_offset`) | the highest not 0.05 A above the idle reading (not enabled); one above 0.6 A. Fewer than `min_current_readings` (2) readings: not judged, with a warning |
+| `data` | the data file | fewer records than the pulse count asks for |
+| `clipping` | the raw maximum of the low-power data | at or above `clip_fs` (0.9 of full scale) |
+| `signal` | the pulse-compressed profile (the chirp correlated with each record, magnitudes averaged; dB relative to the chirp, as `tools/transit_check`) | see below; not judged until `expected.verified` |
+| `analysis` | | the analysis failed or ran out of time (30 s) |
+
+Without amplifier telemetry and with the override set, the two amplifier
+criteria are not judged. The raw maximum scaled to the requested `tx_gain`
+(1 dB per step) is shown, and is a warning (not a failure) when it would clip.
+Telemetry writes one reading every 0.5 s (`telemetry.status_interval_s`): pulses
+that last less than 0.4 s plus that many readings' worth (1.4 s for 2) give a
+warning in the result, since they cannot be relied on for the readings.
+
+**The signal.** `expected.leakage_sample` is where the leakage inside the SDR
+peaks, `expected.delay_samples` how much later the direct signal between the
+antennas peaks. If the delay is at least `min_separation_samples` (4), the
+leakage peak is looked for within `tolerance_samples` (1.5) of its place, and the
+direct peak within the tolerance of the found leakage peak plus the delay (the
+tolerance must then be below the delay, else the expected values are refused). If it
+is shorter, the two form one peak (one sample is 5.4 m of path in air, and a
+30 MHz chirp spreads each peak over about 3 samples): the level of that combined
+peak, at `leakage_sample + delay_samples`, is judged. Either way the direct (or
+combined) peak must be a local maximum inside the tolerance, and its level, scaled
+from the low-power `tx_gain` to `expected.level_tx_gain`, at least
+`expected.min_level_db`.
+
+What the bench loopback can show: the amplifier criteria, data, clipping (the
+measurement; it does not clip at 40), every failure and stop path, and the
+signal only as one combined peak: the portable loopback's 30 ft cable puts the
+loopback about 3 samples after the leakage (combined peak at 78.4, -5.9 dB at
+`tx_gain` 70). Disconnecting it leaves the leakage, about 30 dB lower and 3
+samples earlier (the 50 m cable showed it on its own: sample 75, -35 dB at 70),
+so the combined peak at 78.4 is gone. Only antennas can show the separate direct
+peak after the leakage (4 samples or more: about 21 m of path in air, cables
+counted by their velocity factor), the real levels, a partly damaged feed, and
+whether the direct wave clips at full power.
+
+| Outcome | Then |
+|---|---|
+| passed | the radar starts at the requested power |
+| failed, record only (`blocking: false`, or the expected values not set) | the radar starts anyway; the collection carries the flag `turn_on_check_failed`; a low alert |
+| failed, blocking (`blocking: true` and `expected.verified`), on the signal, clipping or data | the radar stays off: fault `turn_on_check` (fast blink, high alert with the reason); the next button press, `radarctl start` or motion trigger clears it and checks again |
+| failed, blocking, on the amplifier readings only, or the analysis failed | a failed start ("FAILED (amplifier readings): a failed start"), retried as any (below): a matter of telemetry or the amplifier, not of the antenna. If `amplifier_before` fails, the low-power run is not made at all (in record-only mode it is made and recorded) |
+| passed or failed with warnings (too few readings, pulses too short, clipping predicted at full power, the check at the requested gain) | the collection carries the flag `turn_on_check_warning`; a warning in the journal |
+| the low-power radar failed (did not start, exited with an error, killed, USB 2, not finished within `time_offset` + twice its pulse time + 5 s) | a failed start, retried as any (10, 30, 90 s, then `start_failures`) |
+| the amplifier not confirmed safe after it | fault `amp_unsafe`, as after any radar |
+| a stop at any point | nothing more is started |
+| its directory cannot be written | a failed start (`directory`) |
+
+What it adds to a start, warm SDR: SDR set-up 4.9 s, `CHIRP.time_offset` 1 s,
+the pulses 3 s, the exit 0.1 s, the amplifier step after its exit (a reading
+taken 2 s after the exit: 2-2.7 s), the analysis 0.3 s: about 11.5 s. On the first
+start after power-up the firmware and FPGA load (about 14 s) happens in the
+low-power run instead of the radar at power, so it adds nothing. Nothing of the
+check runs while the radar records.
+
+**Files** in `<collection>/turn_on_check/`: `config.yaml`, `chirp.bin` (a copy),
+`low_power.bin.0`, `uhd_stdout.log`, `uhd_stderr.log`, `gps_log.txt`,
+`analysis_input.json`, `analysis.json`, `analysis.log`, `amp_safe.log` if the
+tool ran, and `result.json` (settings, readings, measurement, every criterion).
+`collection.json` gets the summary under `turn_on_check`, the event log an
+event `turn_on_check`, and the status the last summary (`turn_on_check.last`).
+About 0.2 MB per start.
+
+**What the technician sees:** yellow breathing for the whole start (low-power run
+included), green only at full power, fast blink after a blocking failure.
+`radarctl status`:
+
+```
+state:      fault
+fault:      turn_on_check: turn-on check failed: no combined peak at sample 78.4 +/- 1.5 ...
+turn-on:    check blocking; last: FAILED, the radar stays off: ... (b00042_s003_20261201T101500Z)
+```
+
+### Setting the expected values
+
+After the first start in the field (or after any change to the antennas,
+cables, receive chain or radar config), with `blocking: false`:
+
+1. Start the radar and let it record for a minute; stop it.
+2. Verify the collection by hand: the direct signal where the antenna spacing and
+   cables put it, at a sensible level.
+3. Measure it, and copy the block that it prints into `/etc/radar-runner/local.yaml`
+   (with `blocking: true` beside `expected` to make the check block); restart the
+   manager:
+
+   ```
+   ~/miniforge3/envs/orca/bin/python tools/turn_on_check/measure.py <collection>   # or <collection>/turn_on_check
+   ```
+
+   It takes the strongest peak as the direct one and the strongest peak up to 40
+   samples before it (and at most 40 dB weaker) as the leakage; `--direct` and
+   `--leakage` override that. If any other peak is within 40 dB of the strongest,
+   it lists them and prints `verified: false` until the direct peak is chosen
+   with `--direct` (the leakage may be the strongest peak in the field: judging it
+   would pass with the antenna gone). `--margin-db` (12) sets the minimum level below the
+   measured one.
+4. The next start: `radarctl status` shows "check blocking; last: passed ...".
+
+On the bench (portable loopback, `b00017_s003_20261120T085831Z`, `tx_gain` 70):
+
+```
+peaks (sample, dB relative to the chirp):
+     78.40     -5.9
+one peak at 78.4 (-5.9 dB): the leakage and the direct signal cannot be told apart ...
+
+manager:
+  turn_on_check:
+    expected:
+      verified: true
+      leakage_sample: 78.4
+      delay_samples: 0.0
+      tolerance_samples: 1.5
+      level_tx_gain: 70
+      min_level_db: -17.9      # -5.9 dB measured, less a margin of 12 dB
+```
+
+**Before turning blocking on, know what the thresholds rest on.** The idle-current
+window (0.10-0.20 A), the current rise (0.05 A) and the levels were all set from
+bench readings at room temperature. The rise comes from the enable duty (6.5 %
+here, about 0.1 A) and becomes marginal below about 3 % duty. How the amplifier's
+gain changes with temperature is not known (the load on the VVA node may change in
+the cold), so the level at -30 C may be several dB lower than on the bench. Use a
+level margin of 12 to 15 dB, not less: on the bench the level stayed within 0.4 dB
+over every run and power cycle of 2026-11-20 (`docs/transit-reference/`), and with
+the amplifier off (the 28 V gone, only the leakage left; b00013_s003) the peak is
+27.6 dB down and 3 samples early, so 12 to 15 dB still fails that case and a
+disconnected cable (about 30 dB). With the
+earlier 50 m cable the same tool, given `--direct 90.16`, finds the two peaks: leakage 74.98, delay 15.18
+samples (81 m of path in air), -10.6 dB.
+
 
 ## Making the amplifier safe
 
@@ -220,7 +377,7 @@ the last resort.
 | `rate` | the SDR does not run at the requested sample rate (ORCA's warning before `[START]`) |
 | `amp_unsafe` | the amplifier pin could not be confirmed safe |
 | `config` | the config failed its limits at the start itself |
-| `turn_on_check` | the turn-on check refused (stage 7; no hook is installed yet) |
+| `turn_on_check` | the turn-on check failed while blocking (see "Turn-on check") |
 
 Leaving a fault:
 
@@ -313,6 +470,7 @@ the command's own 4 s and the hook's 5 s.
 
 ```
 .venv/bin/python -B -m pytest tests/manager        # about 5 minutes; no SDR, no real pins, never the real tool
+~/miniforge3/envs/orca/bin/python -B -m pytest tests/turn_on_check     # the analysis of the turn-on check (numpy)
 .venv/bin/python -B -m radar_runner.manager.panel_test    # live: LEDs and button; see its --help
 ```
 

@@ -64,7 +64,7 @@ The plan's fault table, row by row. "After" is how long a condition must last.
 | UPS monitor unreadable | `power.json` `warnings.current_unreadable` | 3 after 30 s | "power service: current unreadable" | covered |
 | SDR missing or on a USB 2 link | `manager.json` `state` `not_ready`, `not_ready` reasons | 3 after 10 min | "radar not ready: sdr: ..." | covered |
 | Build fails, radar exits with an error or crashes | `manager-events`: `ended` with `failure`; `fault` once the retries are used up | 2; 4 | "radar run failed"; "radar FAULT: start_failures" | covered |
-| Turn-on check fails | `manager-events`: `fault` kind `turn_on_check` | 4 | "radar FAULT: turn_on_check" | **not available yet** (stage 7 does not exist; the rule needs no change when it does) |
+| Turn-on check fails | `manager-events`: `fault` kind `turn_on_check` (blocking); `turn_on_check` with `passed` false and `blocked` false (record only: the radar started anyway) | 4; 2 | "radar FAULT: turn_on_check", with the reason and that the next button press, `radarctl start` or motion trigger checks again; "turn-on check failed (record only)" | covered |
 | High late-command rate | `manager-events`: `ended`, ORCA's last lines in `output_tail`: `[RX] Error count` over `[RX] Total pulses attempted`, above `error_rate_warn` (5 %) | 3 | "radar error rate high" | covered **after each run** only (nothing publishes the rate during a run). That the error count is the late-command count is assumed; the bench runs of 2026-11-19 show 2.0-2.3 % |
 | Output drift | none | | | **not available yet** |
 | Pi hot or throttling | `telemetry.json` `sources.pi`: `throttled_now` not empty, or `values.soc_temp_c` at or above 80 C | 3 after 1 min | "Pi hot or throttling" | covered |
