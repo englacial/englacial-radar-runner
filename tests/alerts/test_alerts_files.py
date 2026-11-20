@@ -230,3 +230,61 @@ def test_the_follower_never_writes(tmp_path):
         append(log, {"n": 2})
     assert sorted(os.listdir(tmp_path)) == before[2]
     assert log.read_bytes().startswith(before[1])
+
+
+def test_a_log_cut_short_and_written_on_past_the_old_offset_is_noticed(tmp_path):
+    log = tmp_path / "events.jsonl"
+    append(log, {"n": 0, "text": "x" * 80})
+    t = EventTail(str(log))
+    t.begin_at_end()
+    append(log, *({"n": i} for i in range(1, 9)))
+    synced = log.stat().st_size
+    append(log, {"n": 9}, {"n": 10})
+    assert names(t.read()) == list(range(1, 11))
+    os.truncate(log, synced)                    # 9 and 10 lost in the cut ...
+    append(log, *({"n": 100 + i, "pad": "p" * 20} for i in range(6)))     # ... and the next boot writes on
+    assert log.stat().st_size > t.offset
+    assert names(t.read()) == [100 + i for i in range(6)] and t.lost == 1
+
+
+def test_a_rotated_file_cut_short_and_written_on_is_noticed(tmp_path):
+    log = tmp_path / "events.jsonl"
+    append(log, {"n": 0, "text": "x" * 80})
+    t = EventTail(str(log))
+    t.begin_at_end()
+    append(log, *({"n": i} for i in range(1, 5)))
+    synced = log.stat().st_size
+    append(log, {"n": 5}, {"n": 6})
+    assert names(t.read()) == list(range(1, 7))
+    os.truncate(log, synced)
+    append(log, {"n": 50, "pad": "q" * 40})     # written, then the file renamed, all before the next read
+    rotate(log)
+    append(log, {"n": 60})
+    assert names(t.read()) == [50, 60] and t.lost == 1
+
+
+def test_a_file_read_to_its_end_is_never_read_again_when_a_power_cut_undoes_the_next_steps(tmp_path):
+    # (a) the rename to .1 reached the drive, the new file did not; (b) the rename itself was undone.
+    for variant in ("new_file_lost", "rename_undone"):
+        d = tmp_path / variant
+        d.mkdir()
+        log = d / "events.jsonl"
+        append(log, {"n": 0, "text": "x" * 80})
+        t = EventTail(str(log))
+        t.begin_at_end()
+        append(log, {"n": 1}, {"n": 2})
+        assert names(t.read()) == [1, 2]
+        saved_a = log.read_bytes()
+        rotate(log)
+        append(log, {"n": 3, "text": "y" * 80})
+        assert names(t.read()) == [3]           # A read to its end, now in B
+        os.unlink(log)
+        if variant == "new_file_lost":
+            assert t.read() == []
+            append(log, {"n": 4, "text": "z" * 80})     # the next boot's first file
+        else:
+            os.replace(str(log) + ".1", log)    # A back at <file>, as if never renamed
+            assert log.read_bytes() == saved_a
+            assert t.read() == []
+            append(log, {"n": 4})               # the next boot writes on in A
+        assert names(t.read()) == [4], variant

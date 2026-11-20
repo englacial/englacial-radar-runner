@@ -261,9 +261,15 @@ the end: history is not sent. Otherwise a log is never read from its start again
 * renamed to `.1`: the rest of `.1`, then the new file;
 * renamed twice while the service was not running: the end of the older file is
   gone (`events.<name>.lost`), then all of `.1`, then the new file;
-* shorter than what was read (its end lost in a power cut before it reached the
-  drive): on after the last line already taken that is still in it, so the
-  lines the next boot added are read and nothing is read twice (`lost`).
+* cut short (its end lost in a power cut before it reached the drive), whether
+  or not the next boot has written past the old offset since: the line ending
+  at the offset is checked against the last one taken every round; if it is not
+  that line, on after the last line already taken that is still in the file, so
+  the lines the next boot added are read and nothing is read twice (`lost`).
+  The same for `.1`, when the cut file was renamed before it was read again;
+* a file read to its end is never read from its start again (the last three are
+  remembered): a power cut that undoes the rename, or the new file after it,
+  does not replay it; at `<file>` again it is read on from where it ended.
 
 Only whole lines are read; a line cut off by a power cut, NUL bytes, a line
 that is not JSON or longer than 64 kB are skipped and counted. At most
