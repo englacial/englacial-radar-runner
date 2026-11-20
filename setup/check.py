@@ -3,8 +3,8 @@
 
     setup/check.py               everything that can be checked by looking
     setup/check.py --receiver    also ask the GPS receiver for two settings in all three layers and its
-                                 buffer error flags (four read-only polls through gpsd, one more after
-                                 a lost reply; nothing is ever set)
+                                 buffer error flags (four read-only polls through gpsd, each asked once
+                                 more after a lost reply; nothing is ever set)
 
 Prints one line per item:
 
@@ -842,8 +842,11 @@ def _(name):
           "setup/SYSTEM_CHANGES.md, section 11)")
     check("GPS receiver: position message (NAV-PVT) on USB", values[keys[0]] == [1, 1, 1], shown(keys[0]),
           "1 in all three (setup/gps_receiver.py --apply)")
-    rc, text, err = run(*ubxtool, "-p", "MON-COMMS", timeout=30)
-    m = re.search(r"txErrors x([0-9a-fA-F]+)", text)
+    for _ in range(2):              # asked once more if the reply was lost
+        rc, text, err = run(*ubxtool, "-p", "MON-COMMS", timeout=30)
+        m = re.search(r"txErrors x([0-9a-fA-F]+)", text)
+        if m:
+            break
     peak = re.search(r"\(USB\)\s+txPending \d+ txBytes \d+ txUsage \d+ txPeakUsage (\d+)", text)
     check("GPS receiver: no transmit buffer errors", bool(m) and not int(m.group(1), 16) & 0xC0,
           (f"txErrors 0x{int(m.group(1), 16):02x}" + (f", USB buffer peak {peak.group(1)} %" if peak else ""))
