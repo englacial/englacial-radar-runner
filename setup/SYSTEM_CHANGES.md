@@ -277,8 +277,8 @@ where they differ):
   the OLA's 10 Hz rate the transmit buffer overflows and gpsd gets no fix) was written to RAM,
   battery-backed memory and flash on 2026-11-19 with `ubxtool -z CFG-UART1OUTPROT-NMEA,0`. It
   had been believed to be in flash already and was found back at 1 after a power-off of a few
-  minutes. `radar-gps-receiver.service` now runs `setup/gps_receiver.py --apply` once per boot,
-  after gpsd, and sets it again if it is not 0. Revert: `systemctl disable
+  minutes. `radar-gps-receiver.service` was added to set it again if it is not 0 (it runs after
+  every start of gpsd, in RAM only: next point). Revert: `systemctl disable
   radar-gps-receiver.service` and delete the unit file.
 - Correction to the two points above, same day: the value in the receiver's RAM goes back to 1
   at every start of gpsd (four of four observed; not after an OLA reset alone), while the
@@ -332,19 +332,19 @@ where they differ):
   - the receiver on the command line, by its stable name: gpsd has it again
     after gpsd restarts. The name has no serial number, so a replacement
     receiver of the same type gets the same name.
-- **Hotplug stays Ubuntu's:** a receiver that appears later, or is unplugged
-  and replugged, is added by udev (`60-gpsd.rules`, USB ID `1546:01a9`) through
-  `gpsdctl@ttyACM<n>.service`, which runs `gpsdctl add /dev/ttyACM<n>`
-  (`USBAUTO="true"` in `/etc/default/gpsd`, the package default; `check.py`
-  verifies it). This path is needed: gpsd 3.25 drops a device that it cannot
-  open (tested with a private gpsd instance: "device activation failed, freeing
-  device") and never looks for it again. After a replug gpsd therefore knows
-  the receiver as `/dev/ttyACM<n>`, not by the long name; clients must not
-  filter on the device path (the telemetry service does not).
-  At boot both paths name the same receiver; gpsd opens a serial device
-  exclusively, so the second one is refused and dropped (from the gpsd source;
-  **to confirm on the bench:** `gpspipe -w -n 5 | grep DEVICES` after a reboot
-  shows one device).
+- **Hotplug is systemd's, not Ubuntu's** (changed 2026-11-19, top of this
+  section). Ubuntu's path (udev `60-gpsd.rules`, USB ID `1546:01a9`, through
+  `gpsdctl@ttyACM<n>.service` running `gpsdctl add /dev/ttyACM<n>`) is switched
+  off by the gpsdctl drop-in. Do not switch it back on: with both, the receiver
+  was opened twice at boot ("Device or resource busy") and gpsd delivered
+  nothing. Instead gpsd is bound to the receiver's device unit: systemd stops
+  gpsd when the receiver goes and starts it, with the stable name, when the
+  receiver comes back. A restart is needed because gpsd 3.25 drops a device
+  that it cannot open (tested with a private gpsd instance: "device activation
+  failed, freeing device") and never looks for it again. `USBAUTO` in
+  `/etc/default/gpsd` no longer matters, since `gpsdctl add` is a no-op.
+  Clients should still not filter on the device path (the telemetry service
+  does not).
 - **Load:** gpsd reading this receiver (10 Hz, all satellite messages) uses
   0.7 % of one core, all the time.
 - **File:** `/etc/systemd/system/gpsd.service.d/radar-runner.conf`
@@ -393,22 +393,25 @@ relying on it.
 - An OLA reset (opening its serial port) changed none of the 30 keys read, in
   any layer. The receiver skipped one 100 ms epoch twice (while the OLA
   configured it); no NMEA and no error text appeared on USB; the fix was kept.
-- So nothing is applied at boot, and nothing in this repository ever writes
-  to the receiver. The telemetry service only asks gpsd for positions; it
-  reports a receiver that is present but delivers no fix data
-  (`sources.gps.health: error`), which is how the overflow showed.
-  `setup/check.py --receiver` reads the setting and the receiver's
-  transmit-buffer error flags by hand, read-only.
-- Two reasons not to set it from software: the value is in flash already; and
-  if the OLA does save the receiver's configuration when it starts, a value
-  written "to RAM only" is in flash after the next OLA reset.
-- **A replaced or factory-reset receiver** has `CFG-UART1OUTPROT-NMEA` = 1.
-  `check.py --receiver` then fails. By hand, once, with the layer given
-  (1 = RAM; without a third field `ubxtool -z` writes RAM, BBR **and flash**):
-  `ubxtool -P 27.50 -z CFG-UART1OUTPROT-NMEA,0,1`.
+- No longer so (decided on this basis on 2026-11-19, reversed the same day):
+  "nothing is applied at boot, and nothing in this repository writes to the
+  receiver". `radar-gps-receiver.service` and the telemetry service set NAV-PVT
+  and UART1 NMEA in RAM (`setup/gps_receiver.py --apply --ram`), and
+  `setup/gps_receiver.py --apply` provisions the receiver once at setup (top of
+  this section). The telemetry service also reports a receiver that is present
+  but delivers no fix data (`sources.gps.health: error`), which is how the
+  overflow showed. `setup/check.py --receiver` reads NAV-PVT and UART1 NMEA in
+  all three layers and the transmit-buffer error flags, read-only.
+- The OLA does save the receiver's configuration when it starts (measured
+  2026-11-20, top of this section), so a value written to RAM only is in
+  battery-backed memory and flash after the next OLA start.
+- **A replaced or factory-reset receiver** is provisioned with
+  `setup/gps_receiver.py --apply` (top of this section). Writing only
+  `CFG-UART1OUTPROT-NMEA` by hand, as this section said before, leaves the
+  message set gpsd needs unset.
 - **Every OLA start touches the receiver.** Opening the OLA's serial port
-  resets the OLA, and the OLA then configures the receiver (and, it seems,
-  saves to its flash). The telemetry service therefore opens the port once and
+  resets the OLA, and the OLA then configures the receiver and saves its RAM
+  settings to battery-backed memory and flash. The telemetry service therefore opens the port once and
   spaces out reopenings after failures up to an hour
   (`radar_runner/telemetry/README.md`).
 - Not changed, to decide: the receiver runs at 10 Hz because the OLA sets it
@@ -678,7 +681,7 @@ In this order, before `setup/setup.sh`:
    expects that path) at the release tag; uv into `~/.local/bin` (verify the
    checksum above); copy `wheelhouse/` from another unit or run
    `setup/fetch_wheels.py`; then `setup/build_venv.sh`.
-7. `sudo setup/setup.sh` (in tmux), reboot, `setup/check.py`, then the three
+7. `sudo setup/setup.sh` (in tmux), reboot, `setup/check.py --receiver`, then the three
    watchdog bench tests of section 8.
 8. Per-unit files in `/etc/radar-runner/`: `power.toml` (arm it after the
    stage 1 tests), `local.yaml` (calibration and thresholds), `secrets.yaml`
@@ -687,7 +690,8 @@ In this order, before `setup/setup.sh`:
    The OLA's ADC settings are applied by the telemetry service at every start.
    The GPS receiver's settings are in its flash: provision a new or replaced
    receiver once with `setup/gps_receiver.py --apply`, then restart the
-   telemetry service once (section 11). The receiver check after every start
+   telemetry service once, and run `setup/check.py --receiver` again (section
+   11; on a receiver not yet provisioned it fails in step 7). The receiver check after every start
    of gpsd and the telemetry service set NAV-PVT and UART1 NMEA in RAM if needed.
 
 Not yet stored for a rebuild without internet: the Ubuntu image, the `.deb`
