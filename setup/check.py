@@ -1125,6 +1125,25 @@ def _(name):
           f"{'is' if os.path.ismount(mount) else 'is NOT'} mounted", f"owner {OWNER.pw_name}, on the mounted drive")
 
 
+@item("turn-on check")
+def _(name):
+    t = manager_settings()["manager"]["turn_on_check"]
+    e = t["expected"]
+    report(INFO, name, ("enabled" if t["enabled"] else "off") + f"; blocking {str(t['blocking']).lower()}; "
+           + (f"expected peak verified (leakage {e['leakage_sample']:g}, delay {e['delay_samples']:g} samples, "
+              f"at least {e['min_level_db']:g} dB at tx_gain {e['level_tx_gain']:g})" if e["verified"] else
+              "expected peak not set: the check only records (radar_runner/manager/README.md, \"Setting the "
+              "expected values\")") + f"; low-power tx_gain {t['max_tx_gain']:g}, {t['pulses']} pulses")
+    if not t["enabled"]:
+        return
+    command = [str(a) for a in t["analysis_command"]]
+    script = next((a for a in command[1:] if a.endswith(".py")), "")
+    rc, _text, err = run(command[0], "-I", "-c", "import numpy") if command else (1, "", "no command")
+    check("turn-on check analysis can run", rc == 0 and os.path.isfile(script),
+          f"{command[0] if command else '(none)'}: numpy {'imports' if rc == 0 else 'MISSING: ' + err[-100:]}; "
+          f"{script or '(no script)'} {'found' if os.path.isfile(script) else 'MISSING'}")
+
+
 def power_hook_findings(power, state_file):
     """What is right and wrong with the radar's hooks in the power service's config.
 
