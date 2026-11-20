@@ -794,6 +794,17 @@ def test_an_exit_that_asks_for_a_restart_is_not_a_clean_stop(tmp_path, server, e
     assert "ended without a clean stop" in summaries(server)[-1]["message"]
 
 
+@pytest.mark.parametrize("synced", [[], {}])
+def test_an_odd_clock_field_keeps_no_alert_out_of_the_queue(tmp_path, server, synced):
+    rig = Rig(tmp_path, server.url)
+    rig.telemetry["clock"]["synced"] = synced
+    rig.start()
+    rig.watcher_event(event="stuck", severity="urgent", text="AMPLIFIER STUCK ENABLED: 2.5 A")
+    status = rig.tick(3)
+    assert sorted(titles(server)) == ["test-unit: AMPLIFIER STUCK ENABLED", "test-unit: boot 42 summary"]
+    assert "queue" not in status["errors"] and "clock state unknown" in summaries(server)[0]["message"]
+
+
 def test_odd_fields_in_the_other_services_status_do_not_keep_the_summary_from_going_out(tmp_path, server):
     rig = Rig(tmp_path, server.url)
     rig.telemetry.update(state={"x": 1}, problems=7, config_warnings=3)

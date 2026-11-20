@@ -641,7 +641,7 @@ class Alerts(Service):
         if self.disk.crossed:
             active.append(f"data drive below {min(self.disk.crossed):g} GB")
         return {"boot": self.boot, "uptime_s": now,
-                "clock_synced": L._get(tel.data, "clock", "synced") if tel.ok else None,
+                "clock_synced": self._clock_set(),
                 "previous": previous,
                 "disk": {"nvme_free_gb": values.get("nvme_free_gb"), "sd_free_gb": values.get("sd_free_gb")},
                 "collections": collections, "services": services, "active": active,
@@ -651,8 +651,10 @@ class Alerts(Service):
     # ---- queueing
 
     def _clock_set(self):
+        """Telemetry's clock.synced, or None: an odd value (a list) must not keep an alert out of the queue."""
         tel = self._reads.get("telemetry")
-        return L._get(tel.data, "clock", "synced") if tel is not None and tel.ok else None
+        synced = L._get(tel.data, "clock", "synced") if tel is not None and tel.ok else None
+        return synced if type(synced) in (int, float, bool) else None
 
     def _enqueue(self, now, alert, when):
         when = when or {}
