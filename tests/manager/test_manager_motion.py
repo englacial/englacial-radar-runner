@@ -161,6 +161,39 @@ def test_settings_below_their_limits_are_refused():
     assert cfg.stop_s == 1.0                                # tests may lower the limits
 
 
+@pytest.mark.parametrize("gap, why", [
+    (600.0, "must be below the smaller of start_s and stop_s"), (20.0, "must be below the smaller of start_s and stop_s"),
+    (6.0, "must be at most stale_s")])
+def test_a_gap_limit_that_would_bridge_a_count_is_refused(gap, why):
+    cfg, warnings = M.MotionConfig.from_config(dict(vars(M.MotionConfig()), max_gap_s=gap))
+    assert cfg.max_gap_s == 3.0 and len(warnings) == 1 and why in warnings[0]
+
+
+def test_the_counts_start_again_when_the_answer_becomes_unknown():
+    d = Drive()
+    d.fixes(19, 4.0)                                        # 18 s of receiver time counted
+    stale = status(d.t - 1, 4.0)                            # the same fix again and again: nothing new
+    for _ in range(12):
+        d.states.append(d.motion.update(d.now, stale))
+        d.now += 0.5
+    assert d.motion.state == M.UNKNOWN
+    d.t += 1.0                                              # the next fix, 2 s after the last one
+    assert d.fixes(1, 4.0) == M.UNKNOWN                     # not "moving" on the strength of the old count
+    assert d.fixes(20, 4.0) == M.MOVING
+
+
+@pytest.mark.parametrize("data", [{"sources": []}, {"sources": {"gps": "x"}}, {"sources": {"gps": {"values": 5}}},
+                                  {"sources": {"gps": {"health": "ok", "values": []}}}, []])
+def test_a_status_of_the_wrong_shape_is_no_fix(data):
+    d = Drive()
+    d.fixes(25, 4.0)
+    odd = S.StatusRead(S.OK, data, 0.2)
+    for _ in range(12):
+        d.motion.update(d.now, odd)
+        d.now += 0.5
+    assert d.motion.state == M.UNKNOWN
+
+
 @pytest.mark.parametrize("text, expected", [
     ("2026-11-20T01:00:00.000Z", T0), ("2026-11-20T01:00:00Z", T0), ("2026-11-20T01:00:00.25Z", T0 + 0.25),
     ("", None), (None, None), ("2026-11-20 01:00:00", None), ("garbage Z", None)])

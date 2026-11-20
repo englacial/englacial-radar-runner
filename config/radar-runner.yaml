@@ -179,6 +179,7 @@ manager:
     min_mode: 3               # a fix counts with this mode or better (2 = 2D, 3 = 3D) ...
     max_eph_m: 5.0            # ... and a horizontal error estimate (gpsd eph) at most this
     max_gap_s: 3.0            # counting fixes further apart than this start the counts again
+                              # (below the smaller of start_s and stop_s, at most stale_s)
     stale_s: 5.0              # nothing that counts for this long (Pi time): "unknown"
 
   # Raw GPS log for PPK in every collection (radar_runner/gpsraw/README.md).

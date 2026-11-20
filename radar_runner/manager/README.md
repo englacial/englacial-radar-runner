@@ -56,8 +56,10 @@ most `max_eph_m` (5 m). Settings in `manager.motion`, times in receiver time:
 * "stationary": every counting fix at most `stop_speed_mps` (0.5 m/s) for
   `stop_s` (120 s);
 * "unknown": nothing that counts for `stale_s`, and at start-up. A fix that
-  does not count, a speed between the two, or a gap of more than `max_gap_s`
-  (3 s) between counting fixes starts both counts again. Each answer holds
+  does not count, a speed between the two, a gap of more than `max_gap_s`
+  (3 s; below the smaller of `start_s` and `stop_s`, at most `stale_s`)
+  between counting fixes, or `stale_s` without a counting fix starts both
+  counts again. Each answer holds
   until another is reached: a truck creeping between the two speeds keeps
   the last one.
 

@@ -15,10 +15,12 @@ receiver's hAcc) at most `max_eph_m`, and a speed.
 Durations are measured in receiver time between fixes, so a stall of this
 loop or of the telemetry service cannot stretch or shorten them. A fix that
 does not count, a speed between the two thresholds, or two counting fixes more
-than `max_gap_s` apart start both counts again. "moving" and "stationary"
-hold until the other one is reached or the fixes stop counting for `stale_s`;
-so a truck creeping between the two speeds keeps whatever was said last, and
-after "unknown" the full time is needed again. What logic.py does with the
+than `max_gap_s` apart start both counts again, and so does `stale_s`
+without a counting fix. "moving" and "stationary" hold until the other one is
+reached or the fixes stop counting for `stale_s`; so a truck creeping between
+the two speeds keeps whatever was said last, and after "unknown" the full
+time is needed again. `max_gap_s` must be below the smaller of `start_s` and
+`stop_s` and at most `stale_s`, or two fixes far apart could make a count. What logic.py does with the
 three answers (an automatic run is stopped only on "stationary", "unknown"
 never changes the radar's state, the manual rules) is in logic.py.
 """
@@ -66,6 +68,11 @@ class MotionConfig:
             refuse("max_eph_m", "must be above 0")
         if not 0 <= values["stop_speed_mps"] < values["start_speed_mps"]:
             refuse("stop_speed_mps", "must be at least 0 and below start_speed_mps")
+        # A gap as long as a count would let two fixes make it; one longer than stale_s would bridge "unknown".
+        if values["max_gap_s"] >= min(values["start_s"], values["stop_s"]):
+            refuse("max_gap_s", "must be below the smaller of start_s and stop_s")
+        elif values["max_gap_s"] > values["stale_s"]:
+            refuse("max_gap_s", "must be at most stale_s")
         return cls(**values), warnings
 
 
@@ -101,13 +108,21 @@ class Motion:
     def _restart(self):
         self.fast_since = self.still_since = None
 
+    def _forget(self):
+        """Nothing has counted for stale_s: the next fix starts from nothing."""
+        self._restart()
+        self.last_fix = None
+
     def update(self, now, read):
         """`read`: a common.status read of telemetry.json (or None). Returns the state to report."""
         self.problem = self._look(now, read)
+        if self.last_counted_at is None or now - self.last_counted_at > self.cfg.stale_s:
+            self._forget()
+            if self.state != UNKNOWN:
+                self._set(UNKNOWN, f"nothing that counts for {self.cfg.stale_s:g} s: {self.problem or 'no new fix'}")
+                return self.state
         if self.state == UNKNOWN:
             self.reason = self.problem or "counting: " + self._counting()
-        elif self.last_counted_at is None or now - self.last_counted_at > self.cfg.stale_s:
-            self._set(UNKNOWN, f"nothing that counts for {self.cfg.stale_s:g} s: {self.problem or 'no new fix'}")
         return self.state
 
     def _look(self, now, read):
@@ -116,8 +131,10 @@ class Motion:
         if read is None or not getattr(read, "ok", False):
             self._restart()
             return "telemetry status: " + (getattr(read, "error", "") or "not read")
-        gps = ((read.data.get("sources") or {}).get("gps")) or {}
-        values = gps.get("values") or {}
+        data = read.data if isinstance(read.data, dict) else {}
+        sources = data.get("sources") if isinstance(data.get("sources"), dict) else {}
+        gps = sources.get("gps") if isinstance(sources.get("gps"), dict) else {}
+        values = gps.get("values") if isinstance(gps.get("values"), dict) else {}
         t = fix_time(values.get("gps_time"))
         if gps.get("health") != "ok" or t is None:
             self._restart()
@@ -140,6 +157,8 @@ class Motion:
         if problem:
             self._restart()
             return problem
+        if self.last_counted_at is not None and now - self.last_counted_at > cfg.stale_s:
+            self._forget()
         if self.last_fix is not None and not 0 < t - self.last_fix <= cfg.max_gap_s:
             self._restart()                             # a gap in the fixes (or time went back)
         self.last_fix, self.last_counted_at, self.speed = t, now, float(speed)
