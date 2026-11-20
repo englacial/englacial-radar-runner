@@ -351,6 +351,13 @@ def nvme_fstab_findings(spec, device, uuid, label, cached_label, others):
                               f"it would be missing after the next boot ({fix})")]
     else:
         found = [(INFO, name, f"{spec}: neither LABEL= nor UUID=, not compared")]
+    if by == "LABEL" and label is not None:
+        # The mounted drive by its real label, the others by udev's cache.
+        carry = ([device] if label == value else []) + meant
+        found.append((PASS, "NVMe fstab label unique", f"{spec} is on {carry[0]}") if len(carry) == 1 else
+                     (FAIL, "NVMe fstab label unique", f"{spec} is on {', '.join(carry)}: which one is mounted "
+                                                        "at the next boot is not determined") if carry else
+                     (PASS, "NVMe fstab label unique", f"{spec} is on no present drive"))
     if label is not None and label != cached_label:
         # INFO, not FAIL: udev reads the label again at the next boot; until then lsblk, findmnt and
         # /dev/disk/by-label show the old one. The fstab finding above covers what matters for the boot.

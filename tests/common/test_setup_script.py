@@ -595,6 +595,27 @@ def test_nvme_by_label_refuses_a_mount_that_is_not_a_data_drive(with_fstab, chan
     assert r.returncode == 1 and message in r.stderr and "WOULD    /etc/fstab" not in r.stdout
 
 
+def test_nvme_by_label_finds_a_duplicate_label_also_when_the_line_is_already_right(with_fstab):
+    system = with_fstab
+    line = FSTAB.replace(f"UUID={UUID}", "LABEL=radar-data")
+    system.path("/etc/fstab").write_text(line)
+    system.set(other_labels=["writable", "radar-data"])
+    r = system.run("--nvme-by-label", "--dry-run")
+    assert r.returncode == 1 and "2 filesystems have the label 'radar-data' (/dev/nvme0n1p1 /dev/other1)" in r.stderr
+    assert "already mounted by label" not in r.stdout
+    relabelled_while_mounted(system)                # the mounted drive counts by its real label
+    system.set(other_labels=["writable", "orca-hil"])
+    r = system.run("--nvme-by-label", "--dry-run")
+    assert r.returncode == 0 and "/mnt/nvme is already mounted by label (LABEL=radar-data)" in r.stdout
+
+
+def test_nvme_by_label_an_empty_label_line_with_an_unlabelled_drive_is_not_done(with_fstab):
+    with_fstab.path("/etc/fstab").write_text(FSTAB.replace(f"UUID={UUID}", "LABEL="))
+    with_fstab.set(nvme_label="")
+    r = with_fstab.run("--nvme-by-label", "--dry-run")
+    assert r.returncode == 1 and "has no filesystem label" in r.stderr and "already mounted by label" not in r.stdout
+
+
 def test_nvme_by_label_uniqueness_is_not_fooled_by_a_stale_cache(with_fstab):
     system = with_fstab
     relabelled_while_mounted(system)

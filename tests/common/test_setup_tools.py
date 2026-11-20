@@ -386,6 +386,17 @@ def test_check_fails_an_fstab_line_that_would_not_mount_the_drive():
     assert nvme_findings("LABEL=radar-data", label=None)["NVMe fstab line names the mounted drive"][0] == "SKIP"
 
 
+def test_check_fails_a_label_that_two_present_drives_have():
+    found = nvme_findings("LABEL=radar-data", others={"/dev/sda1": "radar-data", "/dev/sdb1": "x"})
+    assert found["NVMe fstab label unique"] == ("FAIL", "LABEL=radar-data is on /dev/nvme0n1p1, /dev/sda1: which one "
+                                                        "is mounted at the next boot is not determined")
+    assert nvme_findings("LABEL=radar-data", others={"/dev/sdb1": "x"})["NVMe fstab label unique"][0] == "PASS"
+    # The mounted drive counts by its real label, not by udev's stale one.
+    found = nvme_findings("LABEL=radar-data", cached="orca-hil", others={"/dev/sda1": "orca-hil"})
+    assert found["NVMe fstab label unique"][0] == "PASS"
+    assert "NVMe fstab label unique" not in nvme_findings(f"UUID={UUID_NVME}", others={"/dev/sda1": "radar-data"})
+
+
 def test_check_does_not_promise_a_correction_that_setup_refuses():
     # The data drive is present, not mounted; another drive is mounted at /mnt/nvme.
     status, text = nvme_findings("LABEL=radar-data", label="spare", cached="spare",

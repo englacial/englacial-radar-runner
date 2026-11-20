@@ -901,6 +901,18 @@ optional_nvme_by_label() {
         UUID=*) [ "UUID=$uuid" = "$spec" ] || die "the drive mounted at $mnt ($dev, UUID $uuid) is not the one in /etc/fstab ($spec)" ;;
     esac
     label=$(python3 -B "$REPO/setup/fs_label.py" "$mnt") || die "cannot read the label of the filesystem at $mnt"
+    [ -n "$label" ] || die "$dev has no filesystem label. Set one first, for example: e2label $dev radar-data"
+    [[ "$label" =~ ^[A-Za-z0-9_.-]+$ ]] || die "the label '$label' has characters that are unsafe in /etc/fstab"
+    # This drive by its real label, the others by udev's cache (an unmounted one cannot be asked without root).
+    others=$(lsblk -rpno NAME,LABEL | awk -v d="$dev" -v l="$label" '$1 != d && $2 == l {print $1}')
+    [ -z "$others" ] || die "$(($(wc -l <<<"$others") + 1)) filesystems have the label '$label' ($dev ${others//$'\n'/ }); it must be unique"
+    if [ "$spec" != "LABEL=$label" ]; then
+        # Like a UUID= line for another drive: a LABEL= line that another present drive has is not this one's.
+        others=$(lsblk -rpno NAME,LABEL | awk -v d="$dev" -v l="${spec#LABEL=}" '$1 != d && $2 == l {print $1}')
+        case "$spec" in
+            LABEL=*) [ -z "$others" ] || die "the $mnt line's $spec means another drive that is present (${others//$'\n'/ }), not $dev, which is mounted there; not changing it" ;;
+        esac
+    fi
     cached=$(lsblk -no LABEL "$dev")
     if [ "$cached" != "$label" ]; then
         # Never refreshed here: a change event for the mounted data drive can make systemd unmount it.
@@ -911,20 +923,9 @@ optional_nvme_by_label() {
         ok "$mnt is already mounted by label ($spec)"
         return 0
     fi
-    # Like a UUID= line for another drive: a LABEL= line that another present drive has is not this one's.
-    others=$(lsblk -rpno NAME,LABEL | awk -v d="$dev" -v l="${spec#LABEL=}" '$1 != d && $2 == l {print $1}')
     case "$spec" in
-        LABEL=*) [ -z "$others" ] || die "the $mnt line's $spec means another drive that is present (${others//$'\n'/ }), not $dev, which is mounted there; not changing it" ;;
+        LABEL=*) note "the $mnt line says $spec, but the drive mounted there ($dev) has the label $label: at the next boot it would not be mounted" ;;
     esac
-    case "$spec" in
-        LABEL=*) note "the $mnt line says $spec, but the drive mounted there ($dev) has the label ${label:-(none)}: at the next boot it would not be mounted" ;;
-    esac
-    [ -n "$label" ] || die "$dev has no filesystem label. Set one first, for example: e2label $dev radar-data"
-    [[ "$label" =~ ^[A-Za-z0-9_.-]+$ ]] || die "the label '$label' has characters that are unsafe in /etc/fstab"
-    # This drive by its real label, the others by udev's cache (an unmounted one cannot be asked without root).
-    count=$(lsblk -rpno NAME,LABEL | awk -v d="$dev" -v l="$label" '$1 != d && $2 == l' | wc -l)
-    count=$((count + 1))
-    [ "$count" -eq 1 ] || die "$count filesystems have the label '$label'; it must be unique"
     change "/etc/fstab: $spec -> LABEL=$label on the $mnt line (backup: /etc/fstab.before-radar-runner)"
     [ "$DRY_RUN" -eq 0 ] || return 0
     TMP_FILE=$(mktemp "$(dirname "$fstab")/.radar-setup.XXXXXX")
