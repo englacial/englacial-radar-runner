@@ -23,8 +23,9 @@ reboots. It installs the radar manager's unit but never enables or starts it (se
 enables the safety watcher's unit but does not start it (section 15). Its one
 Tailscale change is section 5. Its one package change is section 13 (chrony
 and fake-hwclock in place of systemd-timesyncd), which is the last step and the
-only one that needs the internet. It restarts gpsd (section 11) and chrony
-(section 13) when their settings change.
+only one that needs the internet. It restarts gpsd when gpsd is not running
+the command line of its drop-in (section 11), and chrony when its settings
+change (section 13).
 
 After section 8 (watchdog) is applied, the three bench tests listed there must
 be done before the system ships.
@@ -200,8 +201,59 @@ simply running the script again.
 
 ### 11. gpsd owns the GPS receiver
 
-**Changed 2026-11-19 after the first boot with stage 2** (this paragraph overrides anything
-below that contradicts it):
+**Changed 2026-11-20: gpsd runs passive (`-p`)** (this paragraph overrides anything below that
+contradicts it). The drop-in's command line is `gpsd -n -p <receiver>`. With `-p` gpsd does not
+configure the receiver; it still asks for its version, identifies it, and passes ubxtool
+commands on. Everything below was measured on `englacial-radar-1` on 2026-11-19/20 unless it
+says otherwise.
+
+- **Why:** without `-p`, gpsd 3.25 configures the receiver at every start (from its source,
+  `driver_ubx.c`). Our device path has no "/ttyACM" in it, so gpsd addresses UART1 and switches
+  NMEA output on there (`CFG-UART1OUTPROT-NMEA` = 1 in RAM), which at 10 Hz overflows the
+  receiver's transmit buffer; and if it reads a position message before the receiver's version
+  reply it assumes an old protocol version and switches NAV-PVT and the other position messages
+  off, leaving only NAV-TIMEGPS and NAV-DOP. The 77-minute outage of 2026-11-19 (below) was in
+  exactly that state; that gpsd got there this way is inferred, and it was never reproduced.
+- **The OLA saves the receiver's settings.** It copies the receiver's current RAM settings to
+  battery-backed memory and flash each time it starts: `CFG-UART1OUTPROT-NMEA` set to 1 in RAM
+  only read 1/0/0 (RAM/battery-backed/flash); after a restart of the telemetry service, which
+  restarts the OLA, it read 1/1/1. At boot the OLA starts within a second or two of gpsd, so
+  whatever passing state gpsd had put the receiver in became what the receiver powered up with
+  the next time. This settles the "likely cause ... not proven" further down.
+- **Without `-p`, ten gpsd restarts:** gpsd identified the receiver every time, but UART1 NMEA
+  was on after every start (corrected each time by `setup/gps_receiver.py`), and two of the
+  script's reads went unanswered (the overflow).
+- **With `-p`, nine gpsd restarts:** receiver identified 9/9, NAV-PVT on and UART1 NMEA off 9/9,
+  nothing to correct, no unanswered read, chrony's GPS source fed throughout (newest sample never
+  older than 12 s). **Six cold boots** after power-offs of several to 22 minutes (boot counters 6
+  to 11, 2026-11-19 23:02 to 2026-11-20 03:22 UTC): gpsd had position messages from the
+  telemetry service's first sample at every one; a 3D fix within 0.5 to 1 s of that sample on
+  four; on two the receiver itself needed about 44 s and about 60 s to reacquire after the long
+  power-off (gpsd reported "no fix" meanwhile: the receiver's state, not gpsd's); the receiver
+  was identified and the receiver check had nothing to correct. The three layers read identical:
+  NAV-PVT, SAT, SIG, EOE, POSECEF, VELECEF, DOP and TIMEGPS on USB 1; NMEA GGA and RMC on USB 0;
+  `CFG-USBOUTPROT-UBX` 1; `CFG-UART1OUTPROT-NMEA` 0; `CFG-RATE-MEAS` 100.
+- **What still guards the receiver:** `radar-gps-receiver.service` (20 s after every start of
+  gpsd) and the telemetry service (after every OLA start, and without a position) still run
+  `setup/gps_receiver.py --apply --ram`. They now cover gpsd not identifying the receiver (they
+  ask for its version), NAV-PVT off or UART1 NMEA on in RAM for any other reason (the OLA
+  configures the receiver at its start), and report what they find.
+- **A new unit or a replaced receiver:** nothing sets the message set now, and a receiver at
+  factory settings has these messages off and UART1 NMEA on. Once, after the OLA is connected
+  and the telemetry service runs: `setup/gps_receiver.py --apply`. It reads the eight messages,
+  `CFG-USBOUTPROT-UBX` and `CFG-UART1OUTPROT-NMEA` in all three layers, writes those that are
+  wrong in any layer to all three, and reports each key's three layers. Then one OLA start
+  (`sudo systemctl restart radar-telemetry`), so that the OLA stores its own settings (10 Hz)
+  with them, and `setup/gps_receiver.py` (only reads) or `setup/check.py --receiver` to see the
+  stored layers. Not in the list: the rate (the OLA sets 10 Hz and saves it at every start; a
+  different value written here would be overwritten), and NMEA on USB (gpsd reads UBX; GGA and
+  RMC on USB were already 0 here, a factory receiver has more NMEA messages than those two, and
+  switching NMEA off on USB has not been tried).
+- **Revert:** the drop-in without `-p`, `sudo systemctl daemon-reload`, `sudo systemctl restart
+  gpsd`.
+
+**Changed 2026-11-19 after the first boot with stage 2** (overridden by the paragraph above
+where they differ):
 
 - Ubuntu's hotplug path is switched off by a second drop-in,
   `/etc/systemd/system/gpsdctl@.service.d/radar-runner.conf` (`gpsdctl add` becomes a no-op).
@@ -250,19 +302,23 @@ below that contradicts it):
   reports a receiver without a position and why (`sources.gps.no_position`,
   `radar_runner/telemetry/README.md`), and runs the command again at 2, 6, 14 and 30 minutes
   without a position, then every 30 minutes. `setup/check.py` fails when gpsd has a receiver
-  that it has not identified, or a fix time with mode 0. **To do on the bench:** a cold boot
-  after several minutes without power, to see whether gpsd ends up in this state by itself and,
-  if so, that the service's run recovers it.
+  that it has not identified, or a fix time with mode 0. The cold-boot test on the bench
+  (2026-11-19/20, top of this section) was done with gpsd passive: six clean cold boots. Without
+  `-p` no cold boot was repeated, so whether gpsd ends up in this state by itself, and whether
+  the service's run recovers it, was not shown; `-p` removes the mechanism believed responsible.
 
 - **What:** a drop-in for `gpsd.service` that replaces its command line with
-  `gpsd -n /dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver-if00`
+  `gpsd -n -p /dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver-if00`
   and adds `Restart=on-failure`; `systemctl enable gpsd.service`; one restart of
-  gpsd when it is not yet running that way. `/etc/default/gpsd` is not touched.
+  gpsd when it is not yet running with exactly that command line (a file that
+  differs only in its comments needs none). `/etc/default/gpsd` is not touched.
 - **Why:** as shipped, gpsd is started on demand (by its socket), opens the
   receiver only while a client is connected, and has no receiver after a
   restart of gpsd itself.
   - `-n`: gpsd reads the receiver all the time, so chrony always has GPS time
     (gpsd(8) asks for `-n` with a time daemon).
+  - `-p` (from 2026-11-20): gpsd leaves the receiver's settings alone (top of
+    this section).
   - enabled: gpsd runs from boot, whether or not anything connects.
   - the receiver on the command line, by its stable name: gpsd has it again
     after gpsd restarts. The name has no serial number, so a replacement
@@ -620,8 +676,10 @@ In this order, before `setup/setup.sh`:
    (`root:englacial`, mode `0640`).
 9. Settings stored in hardware: bootloader EEPROM (compare with `check.py`).
    The OLA's ADC settings are applied by the telemetry service at every start.
-   The GPS receiver's settings are in its flash (section 11); the telemetry
-   service checks the one that matters and sets it in RAM if needed.
+   The GPS receiver's settings are in its flash: provision a new or replaced
+   receiver once with `setup/gps_receiver.py --apply`, then restart the
+   telemetry service once (section 11). The receiver check after every start
+   of gpsd and the telemetry service set NAV-PVT and UART1 NMEA in RAM if needed.
 
 Not yet stored for a rebuild without internet: the Ubuntu image, the `.deb`
 files of the packages above, the UHD source and FPGA images.

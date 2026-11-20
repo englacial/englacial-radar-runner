@@ -124,14 +124,14 @@ def test_drop_in_file_contents():
         "[Manager]", "RuntimeWatchdogSec=30s", "RebootWatchdogSec=10min"]
     assert 'APT::Periodic::Enable "0";' in settings("etc/apt/apt.conf.d/99zz-radar-runner-no-auto-updates")
     assert settings("etc/needrestart/conf.d/radar-runner.conf") == ["$nrconf{restart} = 'l';"]
-    # Stage 2. gpsd: reads without clients, the receiver by its stable name, restarted if it dies.
+    # Stage 2. gpsd: reads without clients, passive, the receiver by its stable name, restarted if it dies.
     device = r"dev-serial-by\x2did-usb\x2du\x2dblox_AG_\x2d_www.u\x2dblox.com_u\x2dblox_GNSS_receiver\x2dif00.device"
     # Ubuntu's hotplug path is off: with both, the receiver was opened twice at boot and gpsd delivered nothing.
     assert settings("etc/systemd/system/gpsdctl@.service.d/radar-runner.conf") == [
         "[Service]", "ExecStart=", "ExecStart=/bin/true", "ExecStop=", "ExecStop=/bin/true"]
     assert settings("etc/systemd/system/gpsd.service.d/radar-runner.conf") == [
         "[Unit]", "BindsTo=" + device, "After=" + device, "[Service]", "ExecStart=",
-        "ExecStart=/usr/sbin/gpsd -n /dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver-if00",
+        "ExecStart=/usr/sbin/gpsd -n -p /dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver-if00",
         "Restart=on-failure", "RestartSec=5"]
     # chrony: GPS from gpsd's shared memory; nothing else (the NTP pools stay Ubuntu's). No "makestep" here:
     # Ubuntu's chrony.conf would override it, so it is set by the service drop-in, and a failure there is ignored.
@@ -225,7 +225,7 @@ def test_check_script_runs_and_reports_every_item():
                  "shutdown inhibitor delay", "power key ignored", "/run/radar-runner/user",
                  "/var/lib/radar-runner/user", "held packages",
                  # stage 2
-                 "gpsd.service enabled and running", "gpsd keeps reading without clients", "gpsd hotplug",
+                 "gpsd.service enabled and running", "gpsd keeps reading without clients, passive", "gpsd hotplug",
                  "GPS receiver on USB", "GPS receiver known to gpsd, once", "GPS receiver identified by gpsd",
 "radar-telemetry.service unit file",
                  "sensor log directory on the data drive", "telemetry status file", "chrony package",
@@ -245,29 +245,44 @@ import json, sys
 with open({log!r}, "a") as f:
     f.write(json.dumps(sys.argv[1:]) + "\\n")
 if "-g" in sys.argv:
-    print("UBX-CFG-VALGET:\\n version 1 layer 0 position 0\\n  layers (ram)\\n    item CFG-UART1OUTPROT-NMEA/0x10740002 val {value}")
+    layer = int(sys.argv[-1].split(",")[1])
+    if layer == 1 and {flash_nmea!r} == "not stored":
+        print("UBX-ACK-NAK:\\n  NAK to Class x06 (CFG) ID x8b (VALGET)")
+    else:
+        print("UBX-CFG-VALGET:\\n version 1 layer %d position 0\\n  layers (...)" % layer)
+        print("    item CFG-MSGOUT-UBX_NAV_PVT_USB/0x20910009 val 1")
+        print("    item CFG-UART1OUTPROT-NMEA/0x10740002 val %s" % ({value!r} if layer < 2 else {flash_nmea!r}))
 else:
     print("UBX-MON-COMMS:\\nversion 0 nPorts 3 txErrors x{errors} reserved1 0\\n  Port: 0x300 (USB)\\n"
           "   txPending 0 txBytes 26542809 txUsage 5 txPeakUsage 88")
 """
 
 
-@pytest.mark.parametrize("value, errors, expected", [("0", "10", "PASS"), ("1", "90", "FAIL")])
-def test_check_script_asks_the_receiver_only_when_told_and_only_reads(tmp_path, value, errors, expected):
-    """With --receiver: two polls through (a stand-in for) ubxtool, and never an option that sets anything."""
+@pytest.mark.parametrize("value, flash_nmea, errors, expected, nmea, pvt", [
+    ("0", "0", "10", "PASS", "RAM 0, battery-backed 0, flash 0", "RAM 1, battery-backed 1, flash 1"),
+    ("1", "0", "90", "FAIL", "RAM 1, battery-backed 1, flash 0", "RAM 1, battery-backed 1, flash 1"),
+    ("0", "1", "10", "FAIL", "RAM 0, battery-backed 0, flash 1", "RAM 1, battery-backed 1, flash 1"),
+    ("0", "not stored", "10", "FAIL", "RAM 0, battery-backed not stored, flash not stored",
+     "RAM 1, battery-backed not stored, flash 1")])
+def test_check_script_asks_the_receiver_only_when_told_and_only_reads(tmp_path, value, flash_nmea, errors, expected,
+                                                                      nmea, pvt):
+    """With --receiver: four polls through (a stand-in for) ubxtool, and never an option that sets anything."""
     log = tmp_path / "ubxtool.log"
     tool = tmp_path / "ubxtool"
-    tool.write_text(UBXTOOL_STAND_IN.format(log=str(log), value=value, errors=errors))
+    tool.write_text(UBXTOOL_STAND_IN.format(log=str(log), value=value, flash_nmea=flash_nmea, errors=errors))
     tool.chmod(0o755)
     env = dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}")
     r = subprocess.run(["/usr/bin/python3", "-B", os.path.join(REPO, "setup", "check.py"), "--receiver"],
                        capture_output=True, text=True, timeout=300, cwd="/", env=env)
     assert r.returncode in (0, 1) and r.stderr == ""
-    assert f"{expected}  GPS receiver: NMEA output on UART1 off: CFG-UART1OUTPROT-NMEA = {value} in RAM" in r.stdout
-    assert f"{expected}  GPS receiver: no transmit buffer errors: txErrors 0x{errors}, USB buffer peak 88 %" in r.stdout
+    assert f"{expected}  GPS receiver: NMEA output on UART1 off: CFG-UART1OUTPROT-NMEA: {nmea}" in r.stdout
+    pvt_status = "FAIL" if "not stored" in pvt else "PASS"
+    assert f"{pvt_status}  GPS receiver: position message (NAV-PVT) on USB: CFG-MSGOUT-UBX_NAV_PVT_USB: {pvt}" in r.stdout
+    errors_status = "FAIL" if errors == "90" else "PASS"
+    assert f"{errors_status}  GPS receiver: no transmit buffer errors: txErrors 0x{errors}, USB buffer peak 88 %" in r.stdout
     calls = [json.loads(line) for line in log.read_text().splitlines()]
-    assert calls == [["-P", "27.50", "-w", "1.5", "-g", "CFG-UART1OUTPROT-NMEA,0"],
-                     ["-P", "27.50", "-w", "1.5", "-p", "MON-COMMS"]]
+    assert calls == [["-P", "27.50", "-w", "1.5", "-g", f"CFG-MSGOUT-UBX_NAV_PVT_USB,{n}", "-g", f"CFG-UART1OUTPROT-NMEA,{n}"]
+                     for n in range(3)] + [["-P", "27.50", "-w", "1.5", "-p", "MON-COMMS"]]
     for call in calls:
         assert not {"-z", "-x", "-e", "-d", "-c", "-S", "-s"} & set(call)
 

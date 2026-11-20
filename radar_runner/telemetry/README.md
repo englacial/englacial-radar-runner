@@ -151,10 +151,14 @@ output overflow of 2026-11-16 looked like.
 minutes, gpsd delivered fix times with mode 0 for 77 minutes while the receiver
 had a 3D fix: gpsd had not identified the receiver (empty `subtype`) and the
 receiver sent it only NAV-TIMEGPS and NAV-DOP, no position message. Asking for
-the receiver's version by hand fixed it at once. What gpsd does at its start,
+the receiver's version by hand fixed it at once. What gpsd did at its start,
 and why that can end in this state, is in `setup/gps_receiver.py`; the way in is
-inferred from that one occurrence, and a cold-boot test on the bench (several
-minutes without power) is still to be done. gpsd clears the fix at every cycle,
+inferred from that one occurrence and was never reproduced. Since 2026-11-20
+gpsd runs passive (`-p`) and no longer configures the receiver at its start,
+which removes that way in; six cold boots since then were clean
+(`setup/SYSTEM_CHANGES.md`, section 11). The checks below stay as the safety
+net: gpsd not identifying the receiver, and the position message off or UART1
+NMEA on in the receiver's RAM for any other reason. gpsd clears the fix at every cycle,
 so a fix time with mode 0 means that no position message came, and mode 1 a
 position message without a fix. The service reports:
 
@@ -185,8 +189,8 @@ indoors.
 To look at the receiver's side by hand:
 
 ```
-setup/check.py --receiver     # reads CFG-UART1OUTPROT-NMEA and the transmit-buffer error flags; sets nothing
-setup/gps_receiver.py         # identification, NAV-PVT and UART1 NMEA in RAM; sets nothing
+setup/check.py --receiver     # NAV-PVT and UART1 NMEA in all three layers, transmit-buffer error flags; sets nothing
+setup/gps_receiver.py         # identification and the receiver's settings in all three layers; sets nothing
 ```
 
 Background: `setup/SYSTEM_CHANGES.md`, section 11.

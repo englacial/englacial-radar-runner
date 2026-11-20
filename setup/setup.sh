@@ -22,7 +22,8 @@
 # when there is no internet): chrony and fake-hwclock, which replace
 # systemd-timesyncd. It refuses if apt would remove or upgrade anything else,
 # and puts systemd-timesyncd back if chrony cannot be made to run. That step
-# restarts chrony, and the gpsd step restarts gpsd, when their settings change.
+# restarts chrony when its settings change, and the gpsd step restarts gpsd
+# when it is not running the command line of its drop-in.
 #
 # Optional steps, off unless asked for (read the risks in SYSTEM_CHANGES.md):
 #   --nvme-by-label     mount /mnt/nvme by filesystem label instead of UUID (edits /etc/fstab)
@@ -382,18 +383,19 @@ step_power_service() {
     esac
 }
 
-# (h) gpsd: owns the receiver by name and keeps reading it without clients
-# (chrony needs that). Ubuntu's hotplug path (udev, gpsdctl) is left as it is.
+# (h) gpsd: owns the receiver by name, keeps reading it without clients
+# (chrony needs that) and leaves its settings alone (passive).
 step_gpsd() {
-    step "gpsd: owns the GPS receiver and runs without clients"
-    local enabled active args auto
+    step "gpsd: owns the GPS receiver, runs without clients, passive"
+    local enabled active args auto want
     if ! installed gpsd; then
         note "gpsd is not installed: nothing done. Install gpsd and gpsd-clients, then run setup again."
         return 0
     fi
     local changed=0 device_unit wants
+    # A changed file needs a restart only if gpsd is not running its command line (checked below).
     install_file etc/systemd/system/gpsd.service.d/radar-runner.conf
-    [ "$CHANGED" -eq 0 ] || { RELOAD_NEEDED=1; changed=1; }
+    [ "$CHANGED" -eq 0 ] || RELOAD_NEEDED=1
     # Ubuntu's hotplug path off: with both, the receiver was opened twice at boot (see the file).
     install_file "etc/systemd/system/gpsdctl@.service.d/radar-runner.conf"
     [ "$CHANGED" -eq 0 ] || { RELOAD_NEEDED=1; changed=1; }
@@ -425,8 +427,9 @@ step_gpsd() {
     fi
     active=$(systemctl is-active gpsd.service 2>/dev/null || true)
     args=$(ps -C gpsd -o args= 2>/dev/null || true)
+    want=$(sed -n 's|^ExecStart=\(/.*\)|\1|p' "$FILES/etc/systemd/system/gpsd.service.d/radar-runner.conf" | tail -1)
     case "$changed:$active:$args" in
-        0:active:*" -n "*) ok "gpsd is running with -n ($args)" ;;
+        "0:active:$want") ok "gpsd is running with -n -p and the receiver ($args)" ;;
         *)
             log "           gpsd is ${active:-not running}${args:+: $args}"
             reload_systemd

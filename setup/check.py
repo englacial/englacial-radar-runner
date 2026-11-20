@@ -2,8 +2,8 @@
 """Check this system against the setup that the radar manager expects.
 
     setup/check.py               everything that can be checked by looking
-    setup/check.py --receiver    also ask the GPS receiver for one setting and its buffer error flags
-                                 (two read-only polls through gpsd; nothing is ever set)
+    setup/check.py --receiver    also ask the GPS receiver for two settings in all three layers and its
+                                 buffer error flags (four read-only polls through gpsd; nothing is ever set)
 
 Prints one line per item:
 
@@ -32,6 +32,7 @@ sys.dont_write_bytecode = True
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [os.path.join(REPO, "setup"), REPO]
 import uvlock  # noqa: E402
+from gps_receiver import parse_valget  # noqa: E402  (standard library only)
 from radar_runner.common import status as status_files  # noqa: E402  (standard library only)
 
 FILES = os.path.join(REPO, "setup", "files")
@@ -717,11 +718,12 @@ def _(name):
     check(name, (enabled, active) == ("enabled", "active"), f"{enabled}, {active}", "enabled, active")
 
 
-@item("gpsd keeps reading without clients, with the receiver named")
+@item("gpsd keeps reading without clients, passive, with the receiver named")
 def _(name):
+    # -p: gpsd leaves the receiver's settings alone (setup/SYSTEM_CHANGES.md, section 11).
     args = out("ps", "-C", "gpsd", "-o", "args=")
-    check(name, " -n " in args + " " and GPS_DEVICE in args, args or "gpsd is not running",
-          f"gpsd -n {GPS_DEVICE}")
+    check(name, " -n " in args + " " and " -p " in args + " " and GPS_DEVICE in args, args or "gpsd is not running",
+          f"gpsd -n -p {GPS_DEVICE}")
 
 
 @item("gpsd started with the receiver, hotplug path off")
@@ -812,18 +814,29 @@ def _(name):
 @item("GPS receiver settings (asked of the receiver)")
 def _(name):
     if not ASK_RECEIVER:
-        raise Skip("not asked: setup/check.py --receiver reads them (two read-only polls through gpsd, nothing is set)")
-    # Read only: -g reads one configuration item from the RAM layer (0), -p MON-COMMS polls the port
-    # statistics. No -z, -x, -e, -d here, ever: this script changes nothing, least of all the receiver.
+        raise Skip("not asked: setup/check.py --receiver reads them (four read-only polls through gpsd, nothing is set)")
+    # Read only: -g reads configuration items from one layer (0 RAM, 1 battery-backed, 2 flash), -p MON-COMMS
+    # polls the port statistics. No -z, -x, -e, -d here, ever: this script changes nothing, least of all the receiver.
+    # The stored layers are what the receiver starts from at the next power-up.
     ubxtool = ("ubxtool", "-P", "27.50", "-w", "1.5")
-    rc, text, err = run(*ubxtool, "-g", "CFG-UART1OUTPROT-NMEA,0", timeout=30)
-    if rc is None:
-        report(FAIL, name, err)
-        return
-    values = re.findall(r"item CFG-UART1OUTPROT-NMEA/0x[0-9a-fA-F]+ val (-?\d+)", text)
-    check("GPS receiver: NMEA output on UART1 off", values[-1:] == ["0"],
-          f"CFG-UART1OUTPROT-NMEA = {values[-1]} in RAM" if values else "no answer from the receiver",
-          "0 (with 1 and the OLA's 10 Hz rate the receiver's transmit buffer overflows; setup/SYSTEM_CHANGES.md, section 11)")
+    keys = ("CFG-MSGOUT-UBX_NAV_PVT_USB", "CFG-UART1OUTPROT-NMEA")
+    values = {key: [] for key in keys}
+    for layer in range(3):
+        rc, text, err = run(*ubxtool, *[a for key in keys for a in ("-g", f"{key},{layer}")], timeout=30)
+        if rc is None:
+            report(FAIL, name, err)
+            return
+        got = parse_valget(text, layer)
+        for key in keys:
+            values[key].append("no answer" if got is None else got.get(key, "not stored"))
+
+    def shown(key):
+        return f"{key}: " + ", ".join(f"{where} {v}" for v, where in zip(values[key], ("RAM", "battery-backed", "flash")))
+    check("GPS receiver: NMEA output on UART1 off", values[keys[1]] == [0, 0, 0], shown(keys[1]),
+          "0 in all three (with 1 and the OLA's 10 Hz rate the receiver's transmit buffer overflows; "
+          "setup/SYSTEM_CHANGES.md, section 11)")
+    check("GPS receiver: position message (NAV-PVT) on USB", values[keys[0]] == [1, 1, 1], shown(keys[0]),
+          "1 in all three (setup/gps_receiver.py --apply)")
     rc, text, err = run(*ubxtool, "-p", "MON-COMMS", timeout=30)
     m = re.search(r"txErrors x([0-9a-fA-F]+)", text)
     peak = re.search(r"\(USB\)\s+txPending \d+ txBytes \d+ txUsage \d+ txPeakUsage (\d+)", text)

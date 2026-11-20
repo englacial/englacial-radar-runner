@@ -13,8 +13,8 @@ Type=oneshot
 User=englacial
 Group=englacial
 WorkingDirectory=/home/englacial/englacial-radar-runner
-# gpsd sets the receiver up during its first seconds, and that is when the UART1 setting gets
-# turned back on: wait until it has finished.
+# gpsd identifies the receiver during its first seconds (without -p it also configured it then,
+# and turned the UART1 setting back on): wait until it has finished.
 ExecStartPre=/bin/sleep 20
 ExecStart=/usr/bin/python3 -B -E -s setup/gps_receiver.py --apply --ram
 # A failure (gpsd has not identified the receiver: exit status 2) is tried again.
