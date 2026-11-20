@@ -826,3 +826,47 @@ def test_a_tree_on_another_file_system_passes_the_mount_check(unit, shm, monkeyp
                                                     ("/dev/shm", "tmpfs", "tmpfs"),
                                                     ("/media/my card", "ext4", "/dev/sdc2")))
     nui.refuse_host_tree(root, "--root", host=(set(), set()))
+
+
+@pytest.mark.parametrize("name", ["no", "yes", "true", "off", "null", "y", "12345", "1e5", "0x1f", "2-radar"])
+def test_refuses_hostnames_yaml_would_not_read_as_text(unit, name):
+    root, boot = unit
+    with pytest.raises(SystemExit) as e:
+        run(root, boot, hostname=name)
+    assert e.value.code == 2
+
+
+def test_force_is_refused_after_an_incomplete_run(unit, capsys):
+    root, boot = unit
+    marker = {"tool": nui.TOOL, "time": "2026-11-21T10:00:00Z", "hostname": NEW, "old_hostname": OLD,
+              "state": "started"}
+    write(os.path.join(root, nui.MARKER.lstrip("/")), json.dumps(marker))
+    before = snapshot(root, boot)
+    assert run(root, boot, "--force") == 2
+    err = capsys.readouterr().err
+    assert "incomplete" in err and "fresh copy" in err
+    assert snapshot(root, boot) == before
+
+
+def test_private_keys_are_made_in_memory_and_overwritten(unit, monkeypatch):
+    root, boot = unit
+    made, seen = [], {}
+    real_mkdtemp, real_rmtree = tempfile.mkdtemp, shutil.rmtree
+
+    def mkdtemp(*a, **k):
+        path = real_mkdtemp(*a, **k)
+        made.append((k.get("dir"), path))
+        return path
+
+    def rmtree(path, *a, **k):
+        if any(path == p for _, p in made):
+            for n in os.listdir(path):
+                with open(os.path.join(path, n), "rb") as f:
+                    seen[n] = f.read()
+        return real_rmtree(path, *a, **k)
+    monkeypatch.setattr(nui.tempfile, "mkdtemp", mkdtemp)
+    monkeypatch.setattr(nui.shutil, "rmtree", rmtree)
+    assert run(root, boot) == 0
+    assert made and made[0][0] in ("/dev/shm", "/run")
+    assert not os.path.exists(made[0][1])
+    assert seen and all(set(content) <= {0} for content in seen.values())   # overwritten before removal

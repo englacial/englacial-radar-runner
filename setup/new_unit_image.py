@@ -42,7 +42,8 @@ DEFAULT_MAX_TX_GAIN = 43.0      # manager.limits.max_tx_gain in radar_runner/com
 HIGHEST_TX_GAIN = 76.0          # "never above 76" (config/radar-runner.yaml)
 SSH_TYPES = {"rsa": ["-b", "3072"], "ecdsa": ["-b", "256"], "ed25519": []}
 STATE = "/var/lib/radar-runner"
-HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+HOSTNAME_RE = re.compile(r"^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$")   # a letter first: YAML reads it as text
+YAML_WORDS = {"y", "n", "yes", "no", "true", "false", "on", "off", "null"}   # ... unless it is one of these
 LABEL_RE = re.compile(r"^[A-Za-z0-9_.-]{1,16}$")
 TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MACHINE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -400,6 +401,9 @@ class Unit:
         except (ValueError, AttributeError):
             when, host, state = "?", "?", "unreadable marker"
         text = (f"this image was changed by {TOOL} already: {when}, hostname {host} ({state})")
+        if state != "done":
+            raise Stop(text + ". That run is incomplete, so the image is partly changed: start again "
+                       "from a fresh copy (--force does not apply)")
         if not self.args.force:
             raise Stop(text + "; run again with --force if that is intended")
         self.plan.note(text + "; running again (--force)")
@@ -623,8 +627,9 @@ class Unit:
             self.plan.touched.add(("root", f"/etc/ssh/ssh_host_{t}_key.pub"))
 
     def _new_key(self, kind):
-        if self.keygen_dir is None:
-            self.keygen_dir = tempfile.mkdtemp(prefix="new-unit-keys.")
+        if self.keygen_dir is None:     # 0700, in memory where there is a tmpfs for it
+            memory = next((d for d in ("/dev/shm", "/run") if os.path.isdir(d) and os.access(d, os.W_OK)), None)
+            self.keygen_dir = tempfile.mkdtemp(prefix="new-unit-keys.", dir=memory)
         key = os.path.join(self.keygen_dir, f"ssh_host_{kind}_key")
         subprocess.run(["ssh-keygen", "-q", "-t", kind, *SSH_TYPES[kind], "-N", "", "-C",
                         f"root@{self.args.hostname}", "-f", key], check=True, stdin=subprocess.DEVNULL)
@@ -942,7 +947,7 @@ class Unit:
                 print(f"done: {text}", flush=True)
         finally:
             if self.keygen_dir:
-                shutil.rmtree(self.keygen_dir, ignore_errors=True)
+                wipe(self.keygen_dir)
         marker["state"] = "done"
         r.write(MARKER, (json.dumps(marker, indent=1) + "\n").encode(), 0o644, 0, 0)
 
@@ -1020,6 +1025,22 @@ Turn-on check: once a start at low power is verified on this unit, put the expec
 Power service bench tests on the new hardware (power/README.md, and the three watchdog tests of SYSTEM_CHANGES.md section 8).
 Write a HARDWARE_CONFIG.md for this unit (its amplifier, VVA divider, drive, receiver, serial numbers).
 """
+
+
+def wipe(directory):
+    """Overwrite each file of a flat directory with zeros, then remove the directory."""
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+            try:
+                os.write(fd, b"\0" * os.fstat(fd).st_size)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+    shutil.rmtree(directory, ignore_errors=True)
 
 
 def fingerprint(public):
@@ -1214,8 +1235,9 @@ def parse(argv):
         s.add_argument("--dry-run", action="store_true", help="print every change, make none")
         s.add_argument("--force", action="store_true", help="run on an image that this tool has changed before")
     args = p.parse_args(argv)
-    if not HOSTNAME_RE.match(args.hostname):
-        p.error("--hostname: lower-case letters, digits and '-', at most 63, not starting or ending with '-'")
+    if not HOSTNAME_RE.match(args.hostname) or args.hostname in YAML_WORDS:
+        p.error("--hostname: lower-case letters, digits and '-', at most 63, starting with a letter, not "
+                "ending with '-', and not a word that YAML reads as true, false or null")
     if not LABEL_RE.match(args.label):
         p.error("--label: at most 16 of A-Z a-z 0-9 _ . -")
     if not 0 <= args.max_tx_gain <= HIGHEST_TX_GAIN:
