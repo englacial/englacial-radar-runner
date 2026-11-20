@@ -1,9 +1,12 @@
 """setup/new_unit_image.py: the core, on a fake image tree built in a temporary directory.
 
-Not checked here, because it needs root: the image wrapper (losetup, mount, umount), and that
-the files the tool writes get root's ownership (the tests run with --skip-ownership; modes are
-checked). The trees are built in /dev/shm because the tool refuses any directory on the file
-system or disk that this computer runs from, which is where pytest's tmp_path is on the Pi.
+Not checked here, because it needs root: the image wrapper with the real losetup, mount and
+umount (it is tested with fake commands), and that the files the tool writes get root's
+ownership (the tests run with --skip-ownership; modes are checked). The one test that runs as
+root does so only with RADAR_RUNNER_TEST_AS_ROOT=1. The trees are built in /dev/shm because the
+tool refuses any directory on the file system or disk that this computer runs from, which is
+where pytest's tmp_path is on the Pi. No link in the fake tree points at a path that exists on
+a real unit, so that a fault in the tool's path resolution could not reach the unit's own files.
 """
 import ast
 import hashlib
@@ -29,7 +32,7 @@ from radar_runner.manager import limits  # noqa: E402
 TOOL = os.path.join(REPO, "setup", "new_unit_image.py")
 OLD, NEW = "englacial-radar-1", "englacial-radar-2"
 OLD_ID = "2055a6d999f94c11bac49c72c2dd5240"
-IID = "rpi-imager-1790188189686"
+IID = "test-instance-not-on-any-unit"     # made up: /var/lib/cloud/instances/<IID> exists nowhere real
 TOKEN = "tk_NOTAREALTOKEN0123456789"
 SECRETS = f"""alerts:
   ntfy:
@@ -113,7 +116,7 @@ def make_unit(top, key_types=("ed25519",)):
     os.makedirs(e("/home/englacial/englacial-radar-runner"))
     write(e("/home/englacial/.bash_history"), "ls\n", 0o600)
     os.makedirs(e("/var/lib/dbus"))
-    os.symlink("/etc/machine-id", e("/var/lib/dbus/machine-id"))
+    os.symlink("../../../etc/machine-id", e("/var/lib/dbus/machine-id"))    # relative: never the real file
     inst = e(f"/var/lib/cloud/instances/{IID}")
     write(f"{inst}/obj.pkl", b"\x80\x04pickled old user-data", 0o400)
     write(f"{inst}/user-data.txt", USER_DATA, 0o600)
@@ -222,7 +225,7 @@ def test_full_run(unit, capsys):
     new_id = read(root, "/etc/machine-id").strip()
     assert re.fullmatch(r"[0-9a-f]{32}", new_id) and new_id != OLD_ID
     assert stat.S_IMODE(os.stat(os.path.join(root, "etc/machine-id")).st_mode) == 0o444
-    assert os.readlink(os.path.join(root, "var/lib/dbus/machine-id")) == "/etc/machine-id"
+    assert os.readlink(os.path.join(root, "var/lib/dbus/machine-id")) == "../../../etc/machine-id"
     assert not os.path.exists(os.path.join(root, f"var/log/journal/{OLD_ID}"))
     assert not os.path.exists(os.path.join(root, "var/lib/systemd/random-seed"))
     # SSH host keys: new, with modes, fingerprints printed
@@ -578,7 +581,8 @@ def test_documentation_never_suggests_logging_out():
     assert "tailscale logout" not in doc.lower() and "tailscale logout" not in source.lower()
 
 
-@pytest.mark.skipif(os.geteuid() != 0, reason="needs root: file owners")
+@pytest.mark.skipif(os.geteuid() != 0 or os.environ.get("RADAR_RUNNER_TEST_AS_ROOT") != "1",
+                    reason="needs root (file owners), and RADAR_RUNNER_TEST_AS_ROOT=1")
 def test_owners_as_root(unit):
     root, boot = unit
     assert nui.main(["tree", "--root", root, "--boot", boot, "--hostname", NEW]) == 0
