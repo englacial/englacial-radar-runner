@@ -24,9 +24,14 @@ made yet.**
   `manager.gps_log.stop_wait_s` (1 s) for it; by then it has normally exited,
   and if not it is killed. It also exits when the manager dies.
 * gpsd restarting or the receiver unplugged (systemd then stops gpsd) ends the
-  connection; the logger connects again every second and carries on in the
-  same file. The summary counts the connections and the longest time without a
-  message.
+  connection; the logger waits a second, connects again and carries on in the
+  same file (a message cut off by the lost connection is dropped, not
+  written). The summary counts the connections and the longest time without a
+  message, from the start of the run to its end.
+* An error inside the logger's loop (a write error, a full or failing drive,
+  anything not foreseen) is counted (`loop_errors`), reported, and the loop
+  carries on after a pause. Its own log (`gps_raw.log`) has each text at most
+  once a minute.
 * The file is a plain u-blox binary log: whole UBX messages, exactly as the
   receiver sent them, in order, nothing added. gpsd's own JSON and anything
   that is not UBX are left out; so are the UBX messages not in
@@ -91,7 +96,9 @@ radar's own sample clock is not GPS-locked until stage 8 (PPS).
 
 counts the messages (with checksums), the RXM-RAWX epochs and measurements
 with a valid carrier phase, per system, and gives the receiver time of the
-first and last epoch. Exit status 0 if there is carrier phase, 1 if not.
+first and last epoch. Exit status 0 if there is carrier phase, 1 if not. It
+reads the whole file in Python: a long log takes about a minute of one
+processor core. **Do not run it during a collection.**
 
 RINEX: RTKLIB's `convbin` (not installed on the unit: `sudo apt install
 rtklib`, Ubuntu's RTKLIB 2.4.3; or on a laptop, where RTKLIB "demo5" from

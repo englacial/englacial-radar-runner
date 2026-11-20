@@ -1,6 +1,7 @@
 """Raw GPS log for PPK: the logger, and a check of a log. See README.md in this directory.
 
     python -m radar_runner.gpsraw log --out FILE [--keep NAMES] [--host H] [--port P] [--fsync-s S]
+                                      [--parent-pid PID]
     python -m radar_runner.gpsraw check FILE [--json]
 
 `check` reads a log and counts its messages (with checksums), the RXM-RAWX
@@ -56,6 +57,7 @@ def main(argv=None):
     log.add_argument("--fsync-s", type=float, default=10.0)
     log.add_argument("--reconnect-s", type=float, default=1.0)
     log.add_argument("--max-s", type=float, default=0.0, help="stop after this long (0: until signalled)")
+    log.add_argument("--parent-pid", type=int, default=0, help="the process that started it: exit when it is gone")
     chk = sub.add_parser("check", help="count what a log holds; exit status 0 if it has carrier phase")
     chk.add_argument("file")
     chk.add_argument("--json", action="store_true")

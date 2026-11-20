@@ -107,42 +107,55 @@ class Framer:
 
 
 def scan(path, block=1 << 20):
-    """Read a raw log and count what is in it, with checksums. Returns a dict (see `check` in __main__.py)."""
+    """Read a raw log and count what is in it, with checksums. Returns a dict (see `check` in __main__.py).
+
+    A message whose length runs past the end of the file is the cut-off last one, unless good
+    messages follow it: then its header was damaged, and the search goes on after its sync bytes.
+    """
     counts, bad, junk = {}, 0, 0
     epochs = meas = cp = 0
     first = last = None
     systems = {}
     buf = b""
+    tail = None                     # at the end of the file: (start of a message that does not fit, junk then)
     with open(path, "rb") as f:
         while True:
             data = f.read(block)
+            at_end = not data
             buf = buf + data if buf else data
             pos, end = 0, len(buf)
             while True:
                 start = buf.find(SYNC, pos)
                 if start < 0:
-                    keep = end - 1 if end > pos and buf[end - 1] == 0xB5 else end
+                    keep = end - 1 if end > pos and buf[end - 1] == 0xB5 and not at_end else end
                     junk += keep - pos
                     pos = keep
                     break
                 junk += start - pos
-                if end - start < 6:
+                if end - start < 6 and not at_end:
                     pos = start
                     break
-                length = buf[start + 4] | buf[start + 5] << 8
+                length = buf[start + 4] | buf[start + 5] << 8 if end - start >= 6 else MAX_PAYLOAD + 1
                 stop = start + 8 + length
-                if length > MAX_PAYLOAD:
+                if end - start >= 6 and length > MAX_PAYLOAD:
                     junk += 1
                     pos = start + 1
                     continue
                 if stop > end:
-                    pos = start
-                    break
+                    if not at_end:
+                        pos = start
+                        break
+                    if tail is None:
+                        tail = (start, junk)
+                    junk += 1
+                    pos = start + 1
+                    continue
                 if checksum(buf[start + 2:stop - 2]) != buf[stop - 2:stop]:
                     bad += 1
                     junk += 1
                     pos = start + 1
                     continue
+                tail = None
                 key = name(buf[start + 2], buf[start + 3])
                 counts[key] = counts.get(key, 0) + 1
                 if (buf[start + 2], buf[start + 3]) == RAWX:
@@ -162,22 +175,35 @@ def scan(path, block=1 << 20):
                             entry[0] += 1
                             entry[1] += 1 if payload[o + 30] & CP_VALID else 0
                 pos = stop
-            buf = buf[pos:]
-            if not data:
+            if at_end:
                 break
-    return {"messages": counts, "bad_checksums": bad, "skipped_bytes": junk, "partial_last_bytes": len(buf),
+            buf = buf[pos:]
+    partial = 0
+    if tail is not None:
+        partial, junk = len(buf) - tail[0], tail[1]
+    return {"messages": counts, "bad_checksums": bad, "skipped_bytes": junk, "partial_last_bytes": partial,
             "rawx_epochs": epochs, "measurements": meas, "carrier_phase_valid": cp,
             "by_system": {k: {"measurements": v[0], "carrier_phase_valid": v[1]} for k, v in sorted(systems.items())},
-            "first_epoch": _epoch(first), "last_epoch": _epoch(last)}
+            "first_epoch": None if first is None else epoch_time(first[1], first[0], first[2]),
+            "last_epoch": None if last is None else epoch_time(last[1], last[0], last[2])}
 
 
-def _epoch(info):
-    if info is None:
+def utc_text(t):
+    """Unix time as ISO text to the millisecond, or None if it is not a usable number."""
+    import math
+    import time
+    if not isinstance(t, (int, float)) or not math.isfinite(t):
         return None
-    tow, week, leap = info[0], info[1], info[2]
-    out = {"week": week, "tow_s": round(tow, 3), "leap_s": leap}
-    if leap is not None:
-        import time
-        t = gps_to_unix(week, tow, leap)
-        out["utc"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + f".{int(round(t % 1 * 1000)) % 1000:03d}Z"
-    return out
+    try:
+        seconds, ms = divmod(int(round(t * 1000)), 1000)
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds)) + f".{ms:03d}Z"
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def epoch_time(week, tow, leap):
+    """{week, tow_s, leap_s, utc} of a receiver epoch; tow_s and utc are None if tow is not finite."""
+    import math
+    finite = isinstance(tow, (int, float)) and math.isfinite(tow)
+    return {"week": week, "tow_s": round(tow, 3) if finite else None, "leap_s": leap,
+            "utc": utc_text(gps_to_unix(week, tow, leap)) if finite and leap is not None else None}

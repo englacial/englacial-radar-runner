@@ -142,3 +142,67 @@ class RawGpsd:
                 conn.close()
             except OSError:
                 pass
+
+
+# ------------------------------------------------------------------ a private gpsd, by gpsfake
+
+def alive(pid):
+    """True if the process exists and is not a zombie."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def children(pid):
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            return [int(p) for p in f.read().split()]
+    except OSError:
+        return []
+
+
+def gpsfake_start(log_path, cycle_s):
+    """gpsfake feeding `log_path` to a private gpsd on a free port, with gpsfake's own control socket
+    (/tmp/gpsfake-<pid>.sock). Returns (process, port). The receiver is a TCP stand-in: the system's
+    AppArmor profile for gpsd allows no pseudo-terminal."""
+    import socket
+    import subprocess
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    proc = subprocess.Popen(["gpsfake", "-t", "-1", "-q", "-P", str(port), "-c", str(cycle_s), str(log_path)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+            return proc, port
+        except OSError:
+            time.sleep(0.1)
+    gpsfake_stop(proc)
+    raise AssertionError("gpsfake's gpsd did not come up")
+
+
+def gpsfake_stop(proc):
+    """SIGTERM to the private gpsd, which then removes its control socket and shared memory, and to
+    gpsfake; SIGKILL only as the last resort. Each by its own PID."""
+    import os
+    import signal
+    daemons = children(proc.pid)
+    for pid in daemons + [proc.pid]:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and (proc.poll() is None or any(alive(p) for p in daemons)):
+        time.sleep(0.05)
+    for pid in daemons + [proc.pid]:
+        if alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    proc.wait(10)
