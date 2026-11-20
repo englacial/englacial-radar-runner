@@ -140,6 +140,27 @@ def test_a_send_is_cancelled_at_once(server):
     assert s.done.wait(2.0) and time.monotonic() - t < 1.0 and s.result.kind == ntfy.RETRY
 
 
+def test_a_send_reading_an_answer_ended_by_the_close_is_cancelled_at_once():
+    # http.client gives up its hold of the socket for such an answer: the cancel must still reach it.
+    def drip(conn):
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+        for _ in range(100):
+            time.sleep(0.2)
+            try:
+                conn.sendall(b"x")
+            except OSError:
+                return
+    url, sock = raw_server(drip)
+    s = ntfy.Send(url, "t", TOKEN, ALERT).start()
+    time.sleep(1.0)
+    t = time.monotonic()
+    s.cancel()
+    ended = s.done.wait(3.0)
+    sock.close()
+    assert ended and time.monotonic() - t < 1.5 and s.result.kind == ntfy.RETRY
+
+
 def test_redirects_are_not_followed(server):
     # A redirect would carry the token to another address.
     server.mode = "redirect"

@@ -113,6 +113,7 @@ class Send:
         self.cancelled = False
         self._complete = False      # the whole answer was read before any cancel
         self._conn = None
+        self._sock = None           # the connection's socket, for cancel()
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True, name="alerts-send")
 
@@ -127,8 +128,7 @@ class Send:
             if self._complete:
                 return
             self.cancelled = True
-            conn = self._conn
-        sock = getattr(conn, "sock", None)
+            sock = self._sock
         if sock is not None:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -180,8 +180,12 @@ class Send:
             self._conn = conn
         try:
             conn.connect()          # DNS lookup, TCP, TLS
-            if self.cancelled:
-                return Result(RETRY, text="cancelled")
+            with self._lock:
+                # Kept here: for an answer that ends with the connection, http.client hands the socket
+                # over to the response and clears conn.sock.
+                self._sock = conn.sock
+                if self.cancelled:
+                    return Result(RETRY, text="cancelled")
             conn.request("POST", (parts.path or "").rstrip("/") + "/", body=body, headers=headers)
             response = conn.getresponse()
             status = response.status
