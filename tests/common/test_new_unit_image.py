@@ -589,57 +589,176 @@ def test_owners_as_root(unit):
 
 # ------------------------------------------------------------------ the image wrapper, with fake commands
 
-@pytest.mark.parametrize("core", ["ok", "stop", "interrupt", "mount_fails"])
-def test_wrapper_always_unmounts_and_detaches(shm, monkeypatch, core):
-    """losetup, mount and umount are replaced by a record of the calls: their real use needs root."""
-    image = os.path.join(shm, "unit.img")
-    write(image, b"\0" * 1024)
-    calls = []
+class FakeSystem:
+    """losetup, mount, umount and sync as a record of calls and a model of what is attached and
+    mounted: their real use needs root. `trouble` picks where things go wrong."""
 
-    def fake_cmd(argv, **kw):
-        calls.append(argv)
+    def __init__(self, image, trouble=""):
+        self.image, self.trouble = image, trouble
+        self.calls, self.attached, self.mounted = [], [], set()
+
+    def handle(self, argv):
+        self.calls.append(list(argv))
         if argv[:2] == ["losetup", "-j"]:
-            return ""
-        if argv[0] == "losetup":
-            return "/dev/loop9"
-        if argv[0] == "mount" and core == "mount_fails" and argv[-2] == "/dev/loop9p1":
-            raise nui.Stop("mount: failed")
-        return ""
+            return 0, "\n".join(f"{d}: []: ({self.image})" for d in self.attached)
+        if argv[0] == "losetup" and "--find" in argv:
+            self.attached.append("/dev/loop9")
+            if self.trouble == "interrupt_in_losetup":      # attached, but --show never returned
+                raise KeyboardInterrupt
+            return 0, "/dev/loop9"
+        if argv[:2] == ["losetup", "-d"]:
+            if self.trouble != "busy_loop":                 # a busy device only gets autoclear, status 0
+                self.attached.remove(argv[2])
+            return 0, ""
+        if argv[0] == "mount":
+            if self.trouble == "mount_fails" and argv[-2].endswith("p1"):
+                return 32, ""
+            self.mounted.add(argv[-1])
+            if self.trouble == "interrupt_in_mount" and argv[-2].endswith("p1"):
+                raise KeyboardInterrupt                     # mounted, but mount never returned
+            return 0, ""
+        if argv[0] == "umount":
+            if self.trouble == "umount_fails":
+                return 32, ""
+            self.mounted.discard(argv[-1])
+            return 0, ""
+        return 0, ""
 
-    def fake_run(argv, **kw):
-        calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0)
+    def run_cmd(self, argv, **kw):
+        rc, out = self.handle(argv)
+        if rc:
+            raise nui.Stop(f"{' '.join(argv)}: failed")
+        return out
 
-    def fake_core(root, boot, args, ownership):
-        assert ownership and os.path.isdir(root) and os.path.isdir(boot)
-        if core == "stop":
-            raise nui.Stop("unexpected state")
-        if core == "interrupt":
-            raise KeyboardInterrupt
+    def run(self, argv, **kw):
+        rc, out = self.handle(argv)
+        return subprocess.CompletedProcess(argv, rc, out, "")
 
-    real_listdir, real_exists = os.listdir, os.path.exists
-    monkeypatch.setattr(nui.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(nui.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(nui, "run_cmd", fake_cmd)
-    monkeypatch.setattr(nui.subprocess, "run", fake_run)
-    monkeypatch.setattr(nui, "probe", lambda dev: {"TYPE": "vfat", "LABEL": "system-boot"} if dev.endswith("p1")
-                        else {"TYPE": "ext4", "LABEL": "writable"})
-    monkeypatch.setattr(nui, "run_tree", fake_core)
-    monkeypatch.setattr(nui.os, "listdir", lambda p: ["loop9p1", "loop9p2", "queue"] if p == "/sys/block/loop9"
-                        else real_listdir(p))
-    monkeypatch.setattr(nui.os.path, "exists", lambda p: True if p.startswith("/dev/loop9") else real_exists(p))
-    args = nui.parse(["image", image, "--hostname", NEW])
-    try:
-        if core == "ok":
-            nui.with_image(args)
-        else:
-            with pytest.raises(KeyboardInterrupt if core == "interrupt" else nui.Stop):
-                nui.with_image(args)
-    finally:
-        signal.signal(signal.SIGINT, signal.default_int_handler)
-    mounts = [c[-1] for c in calls if c[0] == "mount"]
-    umounts = [c[-1] for c in calls if c[0] == "umount"]
-    assert umounts == list(reversed(mounts[:1] if core == "mount_fails" else mounts))
-    assert calls[-1] == ["losetup", "-d", "/dev/loop9"]
-    assert ["sync"] in calls
-    assert all(not real_exists(m) for m in mounts)       # the empty mount points are gone
+
+@pytest.fixture
+def fake_system(shm, monkeypatch):
+    image = os.path.join(shm, "unit.img")
+    write(image, b"\0" * 1024, 0o600)
+    holder = {}
+
+    def make(trouble="", core=""):
+        fake = FakeSystem(image, trouble)
+        holder["fake"] = fake
+
+        def fake_core(root, boot, args, ownership):
+            assert ownership and os.path.isdir(root) and os.path.isdir(boot)
+            if core == "stop":
+                raise nui.Stop("unexpected state")
+            if core == "interrupt":
+                raise KeyboardInterrupt
+        real_listdir, real_exists, real_ismount = os.listdir, os.path.exists, os.path.ismount
+        monkeypatch.setattr(nui.os, "geteuid", lambda: 0)
+        monkeypatch.setattr(nui.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(nui, "run_cmd", fake.run_cmd)
+        monkeypatch.setattr(nui.subprocess, "run", fake.run)
+        monkeypatch.setattr(nui.time, "sleep", lambda s: None)
+        monkeypatch.setattr(nui, "probe", lambda dev: {"TYPE": "vfat", "LABEL": "system-boot"}
+                            if dev.endswith("p1") else {"TYPE": "ext4", "LABEL": "writable"})
+        monkeypatch.setattr(nui, "run_tree", fake_core)
+        monkeypatch.setattr(nui.os, "listdir", lambda p: ["loop9p1", "loop9p2", "queue"]
+                            if p == "/sys/block/loop9" else real_listdir(p))
+        monkeypatch.setattr(nui.os.path, "exists", lambda p: True if p.startswith("/dev/loop9")
+                            else real_exists(p))
+        monkeypatch.setattr(nui.os.path, "ismount", lambda p: p in fake.mounted or real_ismount(p))
+        return fake
+    yield image, make
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+
+@pytest.mark.parametrize("trouble, core, status", [
+    ("", "", 0), ("", "stop", 2), ("", "interrupt", 130), ("mount_fails", "", 2),
+    ("interrupt_in_losetup", "", 130), ("interrupt_in_mount", "", 130)])
+def test_wrapper_always_unmounts_and_detaches(fake_system, capsys, trouble, core, status):
+    image, make = fake_system
+    fake = make(trouble, core)
+    assert nui.main(["image", image, "--hostname", NEW]) == status
+    err = capsys.readouterr().err
+    assert fake.mounted == set() and fake.attached == []
+    assert ["sync"] in fake.calls
+    mounts = [c[-1] for c in fake.calls if c[0] == "mount"]
+    assert all(not os.path.exists(m) for m in mounts)       # the empty mount points are gone
+    assert "image unmounted and detached" in err and "INCOMPLETE" not in err
+
+
+@pytest.mark.parametrize("trouble, left", [("umount_fails", "still mounted"), ("busy_loop", "/dev/loop9")])
+def test_wrapper_reports_an_incomplete_clean_up_with_a_failing_status(fake_system, capsys, trouble, left):
+    image, make = fake_system
+    fake = make(trouble)
+    status = nui.main(["image", image, "--hostname", NEW])
+    err = capsys.readouterr().err
+    assert status not in (0, 2, 130)                         # never mistaken for success, nor a plain stop
+    assert "CLEAN-UP INCOMPLETE" in err and left in err
+    assert "image unmounted and detached" not in err
+    if trouble == "umount_fails":
+        assert not [c for c in fake.calls if c[:2] == ["losetup", "-d"]]     # never detached under a mount
+
+
+def test_wrapper_dry_run_is_read_only(fake_system):
+    image, make = fake_system
+    fake = make()
+    assert nui.main(["image", image, "--hostname", NEW, "--dry-run"]) == 0
+    attach = next(c for c in fake.calls if c[0] == "losetup" and "--find" in c)
+    assert "--read-only" in attach
+    mounts = [c for c in fake.calls if c[0] == "mount"]
+    assert len(mounts) == 2
+    for c in mounts:
+        options = c[c.index("-o") + 1].split(",")
+        assert "ro" in options and "nodev" in options and "nosuid" in options
+    assert "noload" in mounts[0][mounts[0].index("-o") + 1].split(",")
+
+
+def test_wrapper_refuses_an_image_attached_already(fake_system, capsys):
+    image, make = fake_system
+    fake = make()
+    fake.attached.append("/dev/loop3")
+    assert nui.main(["image", image, "--hostname", NEW]) == 2
+    assert "attached to a loop device already" in capsys.readouterr().err
+    assert not [c for c in fake.calls if c[0] == "mount"]
+
+
+def test_wrapper_missing_image_is_a_clean_stop(shm, capsys):
+    assert nui.main(["image", os.path.join(shm, "nothing.img"), "--hostname", NEW]) == 2
+    assert "STOPPED" in capsys.readouterr().err
+
+
+class BrokenAfter:
+    """A stdout whose reader (| tee) goes away after `n` writes."""
+
+    def __init__(self, n):
+        self.n = n
+
+    def write(self, text):
+        self.n -= 1
+        if self.n < 0:
+            raise BrokenPipeError(32, "Broken pipe")
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def fileno(self):
+        raise OSError("no file descriptor")
+
+
+def test_broken_pipe_in_the_core_says_partly_changed(unit, monkeypatch, capsys):
+    root, boot = unit
+    monkeypatch.setattr(sys, "stdout", BrokenAfter(5))
+    assert run(root, boot) == 4
+    assert "partly changed" in capsys.readouterr().err
+
+
+def test_broken_pipe_in_the_wrapper_still_cleans_up(fake_system, monkeypatch, capsys):
+    image, make = fake_system
+    fake = make()
+    monkeypatch.setattr(nui, "run_tree", lambda *a, **k: (_ for _ in ()).throw(BrokenPipeError(32, "Broken pipe")))
+    assert nui.main(["image", image, "--hostname", NEW]) == 4
+    assert fake.mounted == set() and fake.attached == []
+    err = capsys.readouterr().err
+    assert "partly changed" in err and "image unmounted and detached" in err

@@ -967,11 +967,74 @@ def probe(dev):
     return dict(line.split("=", 1) for line in out.split("\n") if "=" in line)
 
 
+class CleanupIncomplete(Exception):
+    """The image is still mounted or attached: it must not be flashed or copied."""
+
+
+def say(text):
+    """A line on stderr that a broken pipe on stdout (| tee) cannot stop."""
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except OSError:
+        pass
+
+
+def attached_loops(image):
+    """Every loop device attached to the image file, asked of the kernel (losetup -j)."""
+    out = run_cmd(["losetup", "-j", image])
+    return [line.split(":", 1)[0] for line in out.split("\n") if line.strip()]
+
+
+def clean_up(image, mount_points):
+    """Unmount whatever is mounted at our mount points, detach every loop device of the image,
+    then check both. Returns what is left (empty: clean)."""
+    left = []
+    subprocess.run(["sync"], check=False)
+    for d in reversed(mount_points):
+        for _ in range(5):
+            if not os.path.ismount(d):
+                break
+            subprocess.run(["umount", d], check=False)
+            if not os.path.ismount(d):
+                break
+            time.sleep(1)
+        if os.path.ismount(d):
+            left.append(f"{d} still mounted")
+    try:
+        if not left:            # never detach a device with a file system mounted from it
+            for loop in attached_loops(image):
+                subprocess.run(["losetup", "-d", loop], check=False)
+            for _ in range(10):         # a busy device is only marked for detaching: wait, then check
+                if not attached_loops(image):
+                    break
+                time.sleep(0.5)
+        loops = attached_loops(image)
+        if loops:
+            left.append(f"{', '.join(loops)} still attached to {image}")
+    except Stop as e:
+        left.append(f"cannot ask which loop devices the image has ({e})")
+    for d in reversed(mount_points):
+        if not os.path.ismount(d):
+            try:
+                os.rmdir(d)             # rmdir only: never deletes anything inside a mount
+            except OSError:
+                pass
+    if mount_points and not left:
+        try:
+            os.rmdir(os.path.dirname(mount_points[0]))
+        except OSError:
+            pass
+    return left
+
+
 def with_image(args):
     """Attach the image with partition scanning, mount both partitions, run the core, then sync,
-    unmount and detach, whatever happens (errors, Ctrl-C, SIGTERM)."""
+    unmount and detach, whatever happens (errors, Ctrl-C, SIGTERM, a broken pipe)."""
     image = os.path.realpath(args.image)
-    st = os.stat(image)
+    try:
+        st = os.stat(image)
+    except OSError as e:
+        raise Stop(f"{args.image}: {e.strerror}")
     if not stat.S_ISREG(st.st_mode):
         raise Stop(f"{args.image} is not an image file (for a card or its mounted partitions use 'tree')")
     if os.geteuid() != 0:
@@ -979,18 +1042,19 @@ def with_image(args):
     for tool in ("losetup", "mount", "umount", "blkid", "ssh-keygen"):
         if shutil.which(tool) is None:
             raise Stop(f"{tool} is not installed on this computer")
-    if run_cmd(["losetup", "-j", image]):
+    if attached_loops(image):
         raise Stop(f"{image} is attached to a loop device already (losetup -j): detach it first")
 
     def interrupted(signum, frame):
         raise KeyboardInterrupt
     for s in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(s, interrupted)
-    loop, mounted, workdir = None, [], None
+    mount_points, attaching = [], False
     try:
+        attaching = True        # from here the clean-up asks the kernel what is attached
         loop = run_cmd(["losetup", "--find", "--show", "--partscan"] + (["--read-only"] if args.dry_run else [])
                        + [image])
-        print(f"image attached as {loop}")
+        say(f"image attached as {loop}")
         if shutil.which("udevadm"):
             subprocess.run(["udevadm", "settle", "--timeout=10"], check=False)
         parts = {}
@@ -1010,44 +1074,29 @@ def with_image(args):
                            f"labelled {label}")
         workdir = tempfile.mkdtemp(prefix="new-unit-image.")
         root_dir, boot_dir = os.path.join(workdir, "root"), os.path.join(workdir, "boot")
-        os.mkdir(root_dir)
-        os.mkdir(boot_dir)
         ro = ["-o", "ro,noload,nodev,nosuid"] if args.dry_run else ["-o", "nodev,nosuid"]
-        run_cmd(["mount", "-t", "ext4", *ro, root_dev, root_dir])
-        mounted.append(root_dir)
-        run_cmd(["mount", "-t", "vfat", "-o", ("ro," if args.dry_run else "") + "nodev,nosuid,noexec",
-                 boot_dev, boot_dir])
-        mounted.append(boot_dir)
+        for d, mount in ((root_dir, ["mount", "-t", "ext4", *ro, root_dev, root_dir]),
+                         (boot_dir, ["mount", "-t", "vfat", "-o", ("ro," if args.dry_run else "")
+                                     + "nodev,nosuid,noexec", boot_dev, boot_dir])):
+            os.mkdir(d)
+            mount_points.append(d)      # before mount: an interrupt during it is cleaned up too
+            run_cmd(mount)
         run_tree(root_dir, boot_dir, args, ownership=True)
     finally:
         for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             signal.signal(s, signal.SIG_IGN)        # a second Ctrl-C must not stop the clean-up
-        problems = []
-        subprocess.run(["sync"], check=False)
-        for d in reversed(mounted):
-            for attempt in range(5):
-                if subprocess.run(["umount", d], check=False).returncode == 0:
-                    break
-                time.sleep(1)
-            else:
-                problems.append(f"could not unmount {d}")
-        if loop and not problems:
-            if subprocess.run(["losetup", "-d", loop], check=False).returncode != 0:
-                problems.append(f"could not detach {loop}")
-        if workdir and not problems:
-            for d in ("root", "boot", ""):      # rmdir only: never deletes anything inside a mount
-                try:
-                    os.rmdir(os.path.join(workdir, d))
-                except OSError:
-                    pass
-        if problems:
-            print("CLEAN-UP INCOMPLETE: " + "; ".join(problems) + f". Fix by hand: umount, then losetup -d {loop}",
-                  file=sys.stderr)
-        else:
-            print(f"image unmounted and detached: {image}")
-        signal.signal(signal.SIGINT, signal.default_int_handler)
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        try:
+            left = clean_up(image, mount_points) if attaching else []
+        finally:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        if left:
+            say(f"CLEAN-UP INCOMPLETE: {'; '.join(left)}. Do not copy or flash the image until "
+                f"'findmnt' shows nothing of it and 'losetup -j {image}' prints nothing: umount, then losetup -d.")
+            raise CleanupIncomplete("; ".join(left))
+        if attaching:
+            say(f"image unmounted and detached: {image}")
 
 
 def run_tree(root_dir, boot_dir, args, ownership, host=None):
@@ -1098,8 +1147,15 @@ def parse(argv):
     return args
 
 
+PARTLY = "the image may be partly changed; start again from a fresh copy"
+
+
 def main(argv=None):
     args = parse(sys.argv[1:] if argv is None else argv)
+    try:
+        sys.stdout.reconfigure(line_buffering=True)     # each line reaches | tee as it is printed
+    except (AttributeError, ValueError):
+        pass
     try:
         if args.mode == "image":
             with_image(args)
@@ -1107,12 +1163,27 @@ def main(argv=None):
             if os.geteuid() != 0 and not args.dry_run and not args.skip_ownership:
                 raise Stop("run as root (or, for a test, with --skip-ownership)")
             run_tree(args.root, args.boot, args, ownership=not args.skip_ownership)
+    except CleanupIncomplete as e:
+        cause = e.__context__
+        if isinstance(cause, Stop):
+            say(f"STOPPED: {cause}")
+        elif cause is not None:
+            say(f"INTERRUPTED ({type(cause).__name__}): {PARTLY}")
+        say(f"FAILED: the clean-up is incomplete ({e})")
+        return 3
     except Stop as e:
-        print(f"\nSTOPPED: {e}", file=sys.stderr)
+        say(f"\nSTOPPED: {e}")
         return 2
     except KeyboardInterrupt:
-        print("\nINTERRUPTED: the image may be partly changed; start again from a fresh copy", file=sys.stderr)
+        say(f"\nINTERRUPTED: {PARTLY}")
         return 130
+    except BrokenPipeError:
+        try:        # nothing more can go to stdout; keep Python's own exit flush from failing too
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        say(f"\nOUTPUT LOST (broken pipe): {PARTLY}")
+        return 4
     return 0
 
 
