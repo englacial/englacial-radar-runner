@@ -9,13 +9,18 @@ from it, and the receiver settings this system depends on.
                                      start of gpsd, and by the telemetry service a little after
                                      every OLA start and when gpsd delivers no position)
 
-The settings: the messages gpsd needs on USB (NAV-PVT, SAT, SIG, EOE, POSECEF, VELECEF, DOP and
-TIMEGPS at every epoch), UBX output on USB, and no NMEA output on the unused UART1. gpsd runs
-passive (-p) and sets none of them. The OLA copies the receiver's settings from RAM to
-battery-backed memory and flash at every OLA start (measured 2026-11-20), so what is in RAM then
-is what the receiver powers up with next time. Left alone: the measurement rate (the OLA sets
-10 Hz and saves it), and NMEA on USB (gpsd reads UBX; a new receiver's few NMEA messages on USB
-cost little at its full speed, and turning them off has not been tested here).
+The settings are the USB output tested on this unit, which gpsd without -p used to set: the
+messages gpsd needs (NAV-PVT, SAT, SIG, EOE, POSECEF, VELECEF, DOP and TIMEGPS at every epoch,
+NAV-TIMELS every 255 epochs), the six NMEA sentences that a receiver at factory settings sends on
+USB (GGA, GLL, GSA, GSV, RMC, VTG) off, UBX output on USB, and no NMEA output on the unused UART1.
+gpsd runs passive (-p) and sets none of them. Left on, the NMEA sentences would come at every
+epoch at the OLA's 10 Hz on top of the UBX messages, which already fill most of the USB transmit
+buffer. The OLA copies the receiver's settings from RAM to battery-backed memory and flash at
+every OLA start (measured 2026-11-20), so what is in RAM then is what the receiver powers up with
+next time. Left alone: the measurement rate (the OLA sets 10 Hz and saves it), NMEA as a protocol
+on USB (CFG-USBOUTPROT-NMEA: switching it off is untested), and the MON-RF and MON-SPAN messages
+(the gps_jam logger's). Provisioning a receiver at factory settings has not been tested: after
+it, `setup/check.py --receiver` (transmit errors, buffer peak) must pass.
 
 In this order:
  1. If gpsd has not identified the receiver (no MON-VER reply seen: empty `subtype` in its
@@ -27,7 +32,10 @@ In this order:
     gets lost is the one that needs the write.
     Without --ram: read every setting in the three layers (one read per layer, asked once more if
     the reply is lost) and report them. With --apply, write those that are wrong in any layer to
-    all three, in one write, and report them again. Nothing is written while a read has no answer.
+    all three, in one write, and report them again. Nothing is written while a read has no
+    answer, or when the receiver refuses the read of RAM (RAM holds every setting it knows, so
+    that means a setting unknown to its firmware). A warning is printed when gpsd is not running
+    passive: at its next start it would set part of this again.
 
 What gpsd 3.25 does without -p (driver_ubx.c): at its start it sends MON-VER and, without waiting
 for acknowledgements, a burst of configuration. That burst addresses UART1 (gpsd takes a device
@@ -74,13 +82,22 @@ import time
 
 KEY = "CFG-UART1OUTPROT-NMEA"
 PVT = "CFG-MSGOUT-UBX_NAV_PVT_USB"
-# Provisioned in all three layers: the messages gpsd needs on USB at every epoch, UBX on USB, no
-# NMEA on UART1.
+# Provisioned in all three layers, the USB output tested on this unit (gpsd without -p used to set
+# it): the messages gpsd needs at every epoch, NAV-TIMELS every 255 epochs (gpsd's rate; its only
+# source of a leap-second warning), the six default NMEA sentences off, UBX on USB, no NMEA on UART1.
 SETTINGS = {f"CFG-MSGOUT-UBX_NAV_{m}_USB": 1
             for m in ("PVT", "SAT", "SIG", "EOE", "POSECEF", "VELECEF", "DOP", "TIMEGPS")}
+SETTINGS["CFG-MSGOUT-UBX_NAV_TIMELS_USB"] = 255
+SETTINGS.update({f"CFG-MSGOUT-NMEA_ID_{m}_USB": 0 for m in ("GGA", "GLL", "GSA", "GSV", "RMC", "VTG")})
 SETTINGS.update({"CFG-USBOUTPROT-UBX": 1, KEY: 0})
+# One read (4 bytes a key) and one write (5 bytes a key: all of these are one-byte values) must
+# each fit in the 255 bytes that gpsd passes on per message, with 12 bytes of frame and header.
+assert 12 + 5 * len(SETTINGS) <= 255
 LAYERS = ("RAM", "battery-backed", "flash")
 NOT_STORED = "not stored"   # left out of the reply: that layer holds no value and the default applies
+# RAM holds every setting the firmware knows: one left out of a RAM reply, or a refused RAM read,
+# means a setting unknown to this receiver.
+UNKNOWN = "refused (unknown to the receiver?)"
 ENV = dict(os.environ, UBXOPTS="-P 27.50")
 UBXTOOL = "/usr/bin/ubxtool"
 GPSD = ("127.0.0.1", 2947)
@@ -207,8 +224,22 @@ def layers(keys):
             if got is not None:
                 break
         for key in keys:
-            table[key].append(None if got is None else got.get(key, NOT_STORED))
+            table[key].append(None if got is None else got.get(key, NOT_STORED if layer else UNKNOWN))
     return table
+
+
+def gpsd_args():
+    """The running gpsd's command line as a list ([] if none is found): /proc, which is never cut short."""
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() != "gpsd":
+                    continue
+            with open(f"/proc/{pid}/cmdline") as f:
+                return f.read().rstrip("\0").split("\0")
+        except OSError:
+            continue
+    return []
 
 
 def show(key, values, now=""):
@@ -218,6 +249,10 @@ def show(key, values, now=""):
 
 def provision(apply):
     """Check SETTINGS in the three layers and, with `apply`, write the wrong ones to all three; True if all are right."""
+    args = gpsd_args()
+    if apply and args and "-p" not in args[1:]:
+        print(f"warning: gpsd is not running passive (-p): at its next start it sets part of this again "
+              f"({' '.join(args)}; setup/setup.sh installs it with -p)", flush=True)
     table = layers(SETTINGS)
     for key, values in table.items():
         show(key, values)
@@ -225,6 +260,10 @@ def provision(apply):
     if not wrong:
         print(f"all {len(SETTINGS)} settings are right in RAM, battery-backed memory and flash", flush=True)
         return True
+    if any(values[0] == UNKNOWN for values in table.values()):
+        print("the receiver refused the read of RAM, which holds every setting it knows: a setting unknown to "
+              "its firmware" + (": nothing written" if apply else ""), flush=True)
+        return False
     if any(None in values for values in table.values()):
         print("the receiver did not answer every read" + (": nothing written, run again" if apply else ""), flush=True)
         return False

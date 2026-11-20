@@ -18,7 +18,10 @@ NMEA, PVT = "CFG-UART1OUTPROT-NMEA", "CFG-MSGOUT-UBX_NAV_PVT_USB"
 SIG = "CFG-MSGOUT-UBX_NAV_SIG_USB"
 READ_NMEA, READ_PVT = ["-g", f"{NMEA},0"], ["-g", f"{PVT},0"]
 WANT = {f"CFG-MSGOUT-UBX_NAV_{m}_USB": 1 for m in ("PVT", "SAT", "SIG", "EOE", "POSECEF", "VELECEF", "DOP", "TIMEGPS")}
+WANT["CFG-MSGOUT-UBX_NAV_TIMELS_USB"] = 255
+WANT.update({f"CFG-MSGOUT-NMEA_ID_{m}_USB": 0 for m in ("GGA", "GLL", "GSA", "GSV", "RMC", "VTG")})
 WANT.update({"CFG-USBOUTPROT-UBX": 1, NMEA: 0})
+GGA = "CFG-MSGOUT-NMEA_ID_GGA_USB"
 
 
 def read_layer(layer, keys=WANT):
@@ -29,7 +32,8 @@ READ_ALL = [read_layer(0), read_layer(1), read_layer(2)]
 
 # The receiver's values are files in `state` named after the key (RAM) and the key with "@1"
 # (battery-backed) or "@2" (flash). No file in those two: not stored there, left out of the reply,
-# and the read refused (ACK-NAK) if none is stored. A value "-" means that the reply to a read of
+# and the read refused (ACK-NAK) if none is stored. No file in RAM: a key unknown to the receiver,
+# and the whole RAM read is refused. A value "-" means that the reply to a read of
 # that layer is lost (no answer), as in the overflow state. "-z KEY,VALUE" writes all three layers,
 # "-z KEY,VALUE,1" RAM only, as ubxtool does.
 UBXTOOL_STAND_IN = """#!/usr/bin/python3
@@ -51,7 +55,7 @@ elif "-g" in args:
     values = {key: open(path(key, layer)).read() for key, *_ in items if os.path.exists(path(key, layer))}
     if "-" in values.values():
         pass
-    elif values:
+    elif values and (layer or len(values) == len(items)):     # a RAM read with an unknown key is refused
         print("UBX-CFG-VALGET:\\n version 1 layer %d position 0\\n  layers (%s)" % (layer, ["ram", "bbr", "flash"][layer]))
         for key, value in values.items():
             print("    item %s/0x10740002 val %s" % (key, value))
@@ -122,6 +126,7 @@ def tool(tmp_path):
     stand_in.chmod(0o755)
     module.UBXTOOL = str(stand_in)
     module.IDENTIFY_WAIT_S, module.CONFIGURE_WAIT_S, module.POLL_S = 1.5, 0.2, 0.1
+    module.gpsd_args = lambda: ["/usr/sbin/gpsd", "-n", "-p", "/dev/ttyACM0"]     # not this machine's gpsd
     module.calls_file = state / "calls"
 
     def stored(key, layer, value=None):
@@ -162,7 +167,7 @@ def test_already_identified_no_version_request(tool, capsys):
     out = capsys.readouterr().out
     assert "gpsd has identified the receiver: /dev/ttyACM0: ROM BASE" in out and "MON-VER" not in out
     assert f"{PVT}: RAM 1, battery-backed 1, flash 1\n" in out and f"{NMEA}: RAM 0, battery-backed 0, flash 0\n" in out
-    assert "all 10 settings are right in RAM, battery-backed memory and flash" in out
+    assert "all 17 settings are right in RAM, battery-backed memory and flash" in out
     assert f"{PVT} in RAM: 1" in out and f"{NMEA} in RAM: 0" in out
     assert set(gpsd.questions) == {b"?DEVICES;\n"}
 
@@ -209,16 +214,28 @@ def test_provisioning_turns_uart1_nmea_off_when_on_in_flash_or_not_stored(tool, 
 def test_provisioning_a_receiver_at_factory_settings(tool, capsys):
     """Nothing stored in battery-backed memory or flash: the read of those layers is refused (ACK-NAK)."""
     tool.gpsd([IDENTIFIED])
-    for key in WANT:
+    for key, value in WANT.items():
         tool.stored(key, 1, "")
         tool.stored(key, 2, "")
-    tool.ram(NMEA, 1)
-    tool.ram("CFG-MSGOUT-UBX_NAV_EOE_USB", 0)
+        if key != "CFG-USBOUTPROT-UBX":       # the factory defaults in RAM (layer 7 on this unit)
+            tool.ram(key, {0: 1, 1: 0, 255: 0}[value])
     assert tool.main(["--apply"]) == 0
     assert all(tool.all_layers(key) == [str(value)] * 3 for key, value in WANT.items())
+    writes = [c for c in calls(tool) if "-z" in c]
+    assert len(writes) == 1 and len(writes[0]) == 2 * len(WANT)      # everything in one write
     out = capsys.readouterr().out
     assert f"{NMEA}: RAM 1, battery-backed not stored, flash not stored\n" in out
+    assert f"{GGA}: RAM 1, battery-backed not stored, flash not stored\n" in out
     assert out.count(" now: RAM 1, battery-backed 1, flash 1\n") == 9
+    assert out.count(" now: RAM 0, battery-backed 0, flash 0\n") == 7
+    assert "CFG-MSGOUT-UBX_NAV_TIMELS_USB now: RAM 255, battery-backed 255, flash 255\n" in out
+
+
+def test_one_read_and_one_write_fit_in_a_gpsd_message(tool):
+    """gpsd passes on at most 255 bytes per message (gps.py, write_gpsd): 8 bytes of UBX frame,
+    4 of VALGET or VALSET header, 4 bytes a key to read, 5 to write (every key here is one byte)."""
+    assert set(tool.SETTINGS) == set(WANT) and tool.SETTINGS == WANT
+    assert 8 + 4 + 5 * len(WANT) <= 255 and 8 + 4 + 4 * len(WANT) <= 255
 
 
 def test_provisioning_writes_nothing_without_an_answer(tool, capsys):
@@ -264,11 +281,12 @@ def test_never_identified_ends_in_bounded_time_with_status_2(tool, capsys):
 def test_identified_without_position_message_gets_nav_pvt_in_ram_only(tool, capsys):
     """gpsd identified, but NAV-PVT is off in RAM: no version request helps, the RAM write does."""
     tool.gpsd([IDENTIFIED])
-    tool.ram(PVT, 0)
+    for layer in range(3):
+        tool.stored(PVT, layer, 0)
     assert tool.main(["--ram"]) == 1                        # read only: reported, not changed
     assert tool.ram(PVT) == "0"
     assert tool.main(["--apply", "--ram"]) == 0
-    assert tool.all_layers(PVT) == ["1", "1", "1"]
+    assert tool.all_layers(PVT) == ["1", "0", "0"]         # never battery-backed memory or flash
     assert calls(tool) == [READ_PVT, READ_NMEA, READ_PVT, ["-z", f"{PVT},1,1"], READ_PVT, READ_NMEA]
     out = capsys.readouterr().out
     assert f"setting {PVT} to 1 in RAM\n" in out and f"{PVT} in RAM now: 1" in out
@@ -328,3 +346,46 @@ def test_wrong_options_have_their_own_status():
     r = subprocess.run(["/usr/bin/python3", "-B", "-E", "-s", os.path.join(REPO, "setup", "gps_receiver.py"), "--fix"],
                        capture_output=True, text=True, timeout=30)
     assert r.returncode == 4 and "Exit status" in r.stderr and r.stdout == ""
+
+
+def test_a_refused_ram_read_is_a_setting_unknown_to_the_receiver_and_nothing_is_written(tool, capsys):
+    tool.gpsd([IDENTIFIED])
+    tool.stored(GGA, 0, "")                                 # firmware without that key: RAM read refused
+    tool.stored(SIG, 2, 0)
+    assert tool.main(["--apply"]) == 1
+    assert [c for c in calls(tool) if "-z" in c] == []
+    out = capsys.readouterr().out
+    assert f"{PVT}: RAM refused (unknown to the receiver?), battery-backed 1, flash 1\n" in out
+    assert "the receiver refused the read of RAM, which holds every setting it knows: a setting unknown to " \
+           "its firmware: nothing written\n" in out
+
+
+def test_provisioning_warns_when_gpsd_is_not_passive(tool, capsys):
+    tool.gpsd([IDENTIFIED])
+    tool.gpsd_args = lambda: ["/usr/sbin/gpsd", "-n", "/dev/ttyACM0"]
+    assert tool.main(["--apply"]) == 0                      # a warning, not a failure
+    out = capsys.readouterr().out
+    assert "warning: gpsd is not running passive (-p): at its next start it sets part of this again " \
+           "(/usr/sbin/gpsd -n /dev/ttyACM0; setup/setup.sh installs it with -p)\n" in out
+    assert tool.main([]) == 0 and "warning" not in capsys.readouterr().out     # only when writing
+
+
+FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "ubxtool-valget-layer1.txt")
+
+
+def test_parse_valget_reads_a_real_ubxtool_transcript(tool):
+    """The start of `ubxtool -P 27.50 -g <17 keys>,1` on englacial-radar-1, 2026-11-20 (the position
+    messages after the reply left out), followed by the receiver's ordinary output."""
+    text = open(FIXTURE).read()
+    assert tool.parse_valget(text, 1) == WANT
+    assert tool.parse_valget(text, 0) is None and tool.parse_valget(text, 2) is None     # not ours
+
+
+def test_parse_valget_ignores_a_reply_for_another_layer_and_sees_a_refusal(tool):
+    foreign = ("layer 1 position 0 end None \nUBX-CFG-VALGET:\n version 1 layer 2 position 0\n  layers (flash)\n"
+               f"    item {PVT}/0x20910009 val 0\nUBX-ACK-ACK:\n  ACK to Class x06 (CFG) ID x8b (VALGET)\n")
+    assert tool.parse_valget(foreign, 1) is None            # another client's read of flash: no answer to ours
+    refused = "layer 0 position 0 end None \nUBX-ACK-NAK:\n  NAK to Class x06 (CFG) ID x8b (VALGET)\n"
+    assert tool.parse_valget(refused, 0) == {}
+    other_nak = "UBX-ACK-NAK:\n  NAK to Class x06 (CFG) ID x8a (VALSET)\n"
+    assert tool.parse_valget(other_nak, 0) is None

@@ -232,23 +232,32 @@ says otherwise.
   power-off (gpsd reported "no fix" meanwhile: the receiver's state, not gpsd's); the receiver
   was identified and the receiver check had nothing to correct. The three layers read identical:
   NAV-PVT, SAT, SIG, EOE, POSECEF, VELECEF, DOP and TIMEGPS on USB 1; NMEA GGA and RMC on USB 0;
-  `CFG-USBOUTPROT-UBX` 1; `CFG-UART1OUTPROT-NMEA` 0; `CFG-RATE-MEAS` 100.
+  `CFG-USBOUTPROT-UBX` 1; `CFG-UART1OUTPROT-NMEA` 0; `CFG-RATE-MEAS` 100. Read later on
+  2026-11-20: all six NMEA sentences that the receiver sends on USB by default (GGA, GLL, GSA,
+  GSV, RMC, VTG) are 0 in RAM and battery-backed memory and 1 in the receiver's defaults (layer
+  7), `CFG-USBOUTPROT-NMEA` is 1, and NAV-TIMELS on USB is 255 (gpsd's rate, every 255 epochs).
+  gpsd without `-p` is what had switched those six off and NAV-TIMELS on.
 - **What still guards the receiver:** `radar-gps-receiver.service` (20 s after every start of
   gpsd) and the telemetry service (after every OLA start, and without a position) still run
   `setup/gps_receiver.py --apply --ram`. They now cover gpsd not identifying the receiver (they
   ask for its version), NAV-PVT off or UART1 NMEA on in RAM for any other reason (the OLA
   configures the receiver at its start), and report what they find.
-- **A new unit or a replaced receiver:** nothing sets the message set now, and a receiver at
-  factory settings has these messages off and UART1 NMEA on. Once, after the OLA is connected
-  and the telemetry service runs: `setup/gps_receiver.py --apply`. It reads the eight messages,
-  `CFG-USBOUTPROT-UBX` and `CFG-UART1OUTPROT-NMEA` in all three layers, writes those that are
-  wrong in any layer to all three, and reports each key's three layers. Then one OLA start
-  (`sudo systemctl restart radar-telemetry`), so that the OLA stores its own settings (10 Hz)
-  with them, and `setup/gps_receiver.py` (only reads) or `setup/check.py --receiver` to see the
-  stored layers. Not in the list: the rate (the OLA sets 10 Hz and saves it at every start; a
-  different value written here would be overwritten), and NMEA on USB (gpsd reads UBX; GGA and
-  RMC on USB were already 0 here, a factory receiver has more NMEA messages than those two, and
-  switching NMEA off on USB has not been tried).
+- **A new unit or a replaced receiver:** nothing sets the USB output now. A receiver at factory
+  settings has the UBX messages off, the six NMEA sentences on and UART1 NMEA on; at the OLA's
+  10 Hz the NMEA sentences would come at every epoch on top of the UBX set, which alone is
+  21 kB/s with the USB transmit buffer peaking at 88 % (below): likely the overflow again (a
+  prediction, not measured). Once, after the OLA is connected and the telemetry service runs:
+  `setup/gps_receiver.py --apply`. It reads 17 settings in all three layers (the eight UBX
+  messages at 1, NAV-TIMELS at 255, the six NMEA sentences on USB at 0, `CFG-USBOUTPROT-UBX` 1,
+  `CFG-UART1OUTPROT-NMEA` 0: this unit's tested state), writes those that are wrong in any layer
+  to all three, and reports each key's three layers. Then one OLA start (`sudo systemctl restart
+  radar-telemetry`), so that the OLA stores its own settings (10 Hz) with them, then
+  `setup/gps_receiver.py` (only reads) to see all three layers right, and `setup/check.py
+  --receiver`, which must pass (no transmit errors; look at the buffer peak). This path has not
+  been tested with a receiver at factory settings. Not in the list: the rate (the OLA sets 10 Hz
+  and saves it at every start; a different value written here would be overwritten),
+  `CFG-USBOUTPROT-NMEA` (switching NMEA off as a protocol is untested), and the MON-RF and
+  MON-SPAN messages (from the `gps_jam` logger; table below).
 - **Revert:** the drop-in without `-p`, `sudo systemctl daemon-reload`, `sudo systemctl restart
   gpsd`.
 
