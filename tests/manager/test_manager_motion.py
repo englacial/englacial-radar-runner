@@ -169,6 +169,12 @@ def test_a_gap_limit_that_would_bridge_a_count_is_refused(gap, why):
     assert cfg.max_gap_s == 3.0 and len(warnings) == 1 and why in warnings[0]
 
 
+def test_when_the_default_gap_breaks_the_rule_the_limit_itself_is_used():
+    cfg, warnings = M.MotionConfig.from_config(dict(vars(M.MotionConfig()), stale_s=2.5))
+    assert cfg.max_gap_s == 2.5 and cfg.max_gap_s <= cfg.stale_s
+    assert warnings == ["manager.motion.max_gap_s must be at most stale_s: 2.5 is used"]
+
+
 def test_the_counts_start_again_when_the_answer_becomes_unknown():
     d = Drive()
     d.fixes(19, 4.0)                                        # 18 s of receiver time counted

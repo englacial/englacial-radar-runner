@@ -55,9 +55,10 @@ class MotionConfig:
         values = {f.name: motion_cfg.get(f.name, getattr(default, f.name)) for f in fields(cls)}
         warnings = []
 
-        def refuse(name, why):
-            warnings.append(f"manager.motion.{name} {why}: the default is used")
-            values[name] = getattr(default, name)
+        def refuse(name, why, use=None):
+            values[name] = getattr(default, name) if use is None else use
+            warnings.append(f"manager.motion.{name} {why}: " +
+                            ("the default is used" if use is None else f"{use:g} is used"))
 
         for name, floor in low.items():
             if name in values and values[name] < floor:
@@ -69,10 +70,16 @@ class MotionConfig:
         if not 0 <= values["stop_speed_mps"] < values["start_speed_mps"]:
             refuse("stop_speed_mps", "must be at least 0 and below start_speed_mps")
         # A gap as long as a count would let two fixes make it; one longer than stale_s would bridge "unknown".
-        if values["max_gap_s"] >= min(values["start_s"], values["stop_s"]):
-            refuse("max_gap_s", "must be below the smaller of start_s and stop_s")
+        # The default is used, unless it breaks the rule too: then the limit itself (start_s and
+        # stop_s are at least 5, max_gap_s at least 1, so half the smaller count is a usable gap).
+        count = min(values["start_s"], values["stop_s"])
+        if values["max_gap_s"] >= count:
+            ok = default.max_gap_s < count and default.max_gap_s <= values["stale_s"]
+            refuse("max_gap_s", "must be below the smaller of start_s and stop_s",
+                   None if ok else min(count / 2, values["stale_s"]))
         elif values["max_gap_s"] > values["stale_s"]:
-            refuse("max_gap_s", "must be at most stale_s")
+            ok = default.max_gap_s <= values["stale_s"]
+            refuse("max_gap_s", "must be at most stale_s", None if ok else values["stale_s"])
         return cls(**values), warnings
 
 
