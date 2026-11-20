@@ -64,6 +64,7 @@ from radar_runner.common.status import boottime_s
 from . import ampsafe
 from . import collection as coll
 from . import gates
+from . import gpslog
 from . import limits
 
 log = logging.getLogger("manager.runner")
@@ -220,6 +221,7 @@ class _Run:
         self.tail = collections.deque(maxlen=12)
         self.stdout_log = None
         self.stderr_log = None
+        self.gps_log = None         # the raw GPS logger alongside the radar (gpslog.py)
 
     def fail(self, kind, text, fatal=False):
         if not self.failure:
@@ -243,6 +245,7 @@ class Runner:
                  amp_telemetry=None, uptime=boottime_s, sdr_state=None):
         self.cfg = config["manager"]
         self.state_dir = config["paths"]["state_dir"]
+        self.gpsd = config["telemetry"]["gps"]
         self.post = post
         self._wall = wall
         self._uptime = uptime
@@ -571,7 +574,10 @@ class Runner:
             if not passed:
                 return run.fail("turn_on_check", f"turn-on check failed: {text}", fatal=True)
 
-        # 7. The radar.
+        # 7. The radar, with the raw GPS log alongside it.
+        if cfg["gps_log"]["enabled"] and not run.stop.is_set():
+            run.gps_log = gpslog.GpsLog(cfg["gps_log"], self.gpsd, run.directory)
+            run.gps_log.start()
         self._radar(run, list(orca_cfg["launch_prefix"]) + command, radar_cwd)
 
     def _on_line(self, run, radar_cwd, line, now):
@@ -718,6 +724,8 @@ class Runner:
         with self._lock:
             run.radar_over = True
         self.last_activity_uptime = self._uptime()
+        if run.gps_log is not None:
+            run.gps_log.stop()
 
         for thread in readers:
             thread.join(5.0)        # the pipes close when the radar is gone
@@ -891,6 +899,10 @@ class Runner:
         """Write the end of the collection's metadata."""
         if run.meta is None:
             return
+        if run.gps_log is not None:
+            run.meta.data["gps_raw"] = run.gps_log.finish()
+            if run.meta.data["gps_raw"]["no_raw_data"]:
+                run.meta.add_flag("no_raw_gps")
         if run.failure:
             how = "failed"
         elif not run.launched:

@@ -167,6 +167,19 @@ DEFAULTS = {
             "command": True,            # radarctl start/toggle; stop and clear-fault always work
             "gps": False,               # the motion trigger (stage 6)
         },
+        # Raw GPS log for PPK in every collection (radar_runner/gpsraw/README.md). gpsd's address
+        # is telemetry.gps.host and port.
+        "gps_log": {
+            "enabled": True,
+            "file": "gps_raw.ubx",
+            "messages": ["RXM-RAWX", "RXM-SFRBX", "NAV-PVT", "NAV-TIMELS"],    # written; [] = every UBX message
+            "fsync_interval_s": 10.0,   # the log is forced to the drive this often
+            "stop_wait_s": 1.0,         # at the end of a run, wait this long for the logger to exit
+            # Receiver setting, written by setup/gps_receiver.py --apply and checked by
+            # setup/check.py --receiver: RXM-RAWX at every Nth navigation epoch (at 10 Hz:
+            # 1 = 10 Hz, 2 = 5 Hz, 10 = 1 Hz), and RXM-SFRBX on. 0: both off.
+            "rawx_every": 10,
+        },
 
         "run": {
             "manual_timeout_s": 50400.0,            # a manually started run is stopped after this (14 h); 0 = never
