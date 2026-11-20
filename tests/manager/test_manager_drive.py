@@ -14,9 +14,6 @@ socket; nothing here touches the live gpsd or the receiver.
 """
 import os
 import shutil
-import signal
-import socket
-import subprocess
 import threading
 import time
 
@@ -60,11 +57,7 @@ class Receiver:
         log = os.path.join(env.tmp, "drive.ubx")
         with open(log, "wb") as f:
             f.write(F.drive(parked(LEAD_S) + segments, start_unix=START - LEAD_S))
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-        self.proc = subprocess.Popen(["gpsfake", "-t", "-1", "-q", "-P", str(port), "-c", str(CYCLE_S), log],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.proc, port = F.gpsfake_start(log, CYCLE_S)
         cfg = dict(env.config["telemetry"]["gps"], port=port, interval_s=0.01, reconnect_s=0.2,
                    receiver_fix_command="")
         config = dict(env.config, telemetry=dict(env.config["telemetry"], gps=cfg))
@@ -109,11 +102,7 @@ class Receiver:
         self._stop.set()
         self._thread.join(2)
         self.telemetry.gps.close()
-        try:
-            os.killpg(self.proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        self.proc.wait(10)
+        F.gpsfake_stop(self.proc)       # SIGTERM first: the private gpsd leaves no socket or shared memory
 
 
 class Drive(Running):
