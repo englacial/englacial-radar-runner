@@ -426,15 +426,25 @@ step_gpsd() {
         run systemctl enable gpsd.service
     fi
     active=$(systemctl is-active gpsd.service 2>/dev/null || true)
-    args=$(ps -C gpsd -o args= 2>/dev/null || true)
+    # -ww: without it ps cuts the line to $COLUMNS when that is set.
+    args=$(ps -ww -C gpsd -o args= 2>/dev/null || true)
     want=$(sed -n 's|^ExecStart=\(/.*\)|\1|p' "$FILES/etc/systemd/system/gpsd.service.d/radar-runner.conf" | tail -1)
     case "$changed:$active:$args" in
         "0:active:$want") ok "gpsd is running with -n -p and the receiver ($args)" ;;
         *)
             log "           gpsd is ${active:-not running}${args:+: $args}"
-            reload_systemd
+            # Always reload first: an earlier run may have installed the file and stopped before
+            # reloading, and systemd would then start the old command line.
+            run systemctl daemon-reload
+            RELOAD_NEEDED=0
             # Its clients (the telemetry service, chrony) reconnect by themselves.
-            run systemctl restart gpsd.service ;;
+            run systemctl restart gpsd.service
+            if [ "$DRY_RUN" -eq 0 ]; then
+                args=$(ps -ww -C gpsd -o args= 2>/dev/null || true)
+                [ "$args" = "$want" ] || die "gpsd was restarted but runs \"${args:-nothing}\", not \"$want\":
+       see systemctl cat gpsd.service and journalctl -u gpsd"
+                ok "gpsd is running with -n -p and the receiver ($args)"
+            fi ;;
     esac
     # After every start of gpsd: the receiver check and its corrections (setup/gps_receiver.py).
     put_file "$REPO/systemd/radar-gps-receiver.service" /etc/systemd/system/radar-gps-receiver.service 0644
