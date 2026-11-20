@@ -232,6 +232,61 @@ def test_enabled_the_status_shows_what_it_says_and_why(env):
     assert "auto:       gps says unknown (gps: not in the status)" in radarctl.format_status(status)
 
 
+def test_the_block_after_a_manual_stop_survives_a_restart_of_the_manager_but_not_a_new_boot(env):
+    import json
+    import os
+    from test_manager_service import Running
+    env.config["manager"]["triggers"]["gps"] = True
+    path = os.path.join(env.state_dir, "auto-blocked")
+    mgr = Running(env).start()
+    try:
+        mgr.wait_state("ready")
+        mgr.manager.report_auto("moving")
+        mgr.wait_state("running")
+        assert mgr.ctl("stop", "--wait")[0] == 0               # a manual stop of a GPS-started run
+        assert mgr.wait_state("ready")["auto"]["blocked"]
+    finally:
+        mgr.stop()
+    assert os.path.exists(path)
+    mgr = Running(env).start()                                 # the manager restarted, same boot
+    try:
+        status = mgr.wait_state("ready")
+        assert status["auto"]["blocked"]
+        mgr.manager.report_auto("moving")
+        time.sleep(0.5)
+        assert mgr.state() == "ready" and env.collections() and len(env.collections()) == 1
+        mgr.manager.report_auto("stationary")                  # the truck stopped: the block is over
+        deadline = time.monotonic() + 5
+        while os.path.exists(path) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not os.path.exists(path) and not mgr.status()["auto"]["blocked"]
+    finally:
+        mgr.stop()
+    with open(path, "w") as f:                                 # left from before a power cycle
+        json.dump({"boot_id": "another-boot", "since": "2026-11-20T01:00:00Z"}, f)
+    mgr = Running(env).start()
+    try:
+        assert not mgr.wait_state("ready")["auto"]["blocked"]
+    finally:
+        mgr.stop()
+    assert not os.path.exists(path)
+
+
+def test_disabled_no_block_is_kept(env):
+    import os
+    from test_manager_service import Running
+    mgr = Running(env).start()
+    try:
+        mgr.wait_state("ready")
+        assert mgr.ctl("start")[0] == 0
+        mgr.wait_state("running")
+        assert mgr.ctl("stop", "--wait")[0] == 0
+        mgr.wait_state("ready")
+    finally:
+        mgr.stop()
+    assert not os.path.exists(os.path.join(env.state_dir, "auto-blocked"))
+
+
 def test_status_text_shows_the_newest_fix():
     text = radarctl.format_status({"auto": {"enabled": True, "source": "gps", "state": "stationary", "blocked": True},
                                    "motion": {"enabled": True, "state": "stationary", "reason": "at most 0.5 m/s for 120 s",
