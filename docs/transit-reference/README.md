@@ -19,8 +19,11 @@ What the numbers mean:
   internal leakage, and the two form one peak. Its level therefore depends on the leakage path
   inside the case as well as on the cable and attenuators; the shape around the peak says which
   moved. Level -5.98 dB, steady to 0.06 dB over two minutes.
-- Scope side at the same setting (power detector 56.6 dB nominal below the amplifier): see the
-  plan, "Radar config limits".
+- Scope side in the same run (eleven captures, all with full pulse trains): power detector 1.471 V
+  (+/-0.002) during the pulse, against 2.06-2.10 V with no signal; scope RF channel -21.40 dBm
+  (+/-0.07) at the scope. With the nominal 56.6 dB between amplifier and detector that is +39.3 dBm
+  (about 8.4 W, +/-1.5 to 2 dB: the new attenuators are not measured). The raw readings repeat to
+  about 0.1 dB and are what to compare. 12 V input: +0.42 A while transmitting.
 - Pulses lost 2.4 % on a quiet Pi. A first attempt with the Pi's processor busy (load 2-4) lost
   32 % of the time to dropped pulses and schedule slips with the same recorded level: compare
   runs only when nothing else is running.
