@@ -693,7 +693,9 @@ class Unit:
                 self.plan.add(f"{power}: armed = true -> false (monitor-only until the power tests on the new unit)",
                               lambda: r.write(power, body2.encode()), r, power)
             else:
-                self.plan.note(f"{power}: kept as it is (armed = {'true' if armed else 'false'})")
+                self.plan.note(f"{power}: kept as it is (armed = {'true' if armed else 'false'})"
+                               + ("; --disarm-power is recommended until the power-service bench tests pass "
+                                  "on the new unit" if armed else ""))
         if r.exists("/etc/radar-runner/power-disarm"):
             self.plan.note("/etc/radar-runner/power-disarm exists: the power service runs monitor-only; kept")
         unknown = [n for n in r.listdir("/etc/radar-runner") if n not in ETC_FILES]
@@ -990,8 +992,9 @@ class Unit:
             for line in left:
                 print(f"- {line}")
         print("\n== On the new unit, after its first boot, in this order (setup/NEW_UNIT.md) ==")
-        for i, line in enumerate(AFTER_FIRST_BOOT.format(label=self.args.label,
-                                                         cap=f"{self.args.max_tx_gain:g}").strip().split("\n"), 1):
+        steps = AFTER_FIRST_BOOT.format(label=self.args.label, cap=f"{self.args.max_tx_gain:g}",
+                                        old=self.old_hostname or "the first unit")
+        for i, line in enumerate(steps.strip().split("\n"), 1):
             print(f"{i}. {line}")
         if dry:
             print("\nDry run: nothing was written.")
@@ -1015,14 +1018,16 @@ manager:
 """
 
 AFTER_FIRST_BOOT = """
-Log in to Tailscale as a new node: sudo tailscale up (open the link it prints); in the admin console disable key expiry for the new node; then sudo tailscale set --auto-update=false (the setting was in the removed state). Do not log either unit out of Tailscale: they shared one node key, and logging out expires it, which would cut off the field unit.
+Log in to Tailscale as a new node: sudo tailscale up --ssh --advertise-tags=tag:radar and open the link it prints (Tailscale SSH and the tag were in the removed state; the tag for the lab unit is your choice; a tagged node has key expiry off already, an untagged one needs it disabled in the admin console). Then sudo tailscale set --auto-update=false (also in the removed state). Do not log either unit out of Tailscale: they shared one node key, and logging out expires it, which would cut off the field unit. For the same reason do not remove or expire {old} in the admin console.
 setup/check.py: the identity lines (hostname, machine-id, SSH host keys, Tailscale node) must all differ from the field unit's.
-Label the new unit's data drive: sudo e2label /dev/nvme0n1p1 {label}, then sudo mount /mnt/nvme (or reboot) and sudo setup/setup.sh to create /mnt/nvme/radar-runner on it.
+The data drive: find it with lsblk (a unit may have two NVMe devices). A new drive needs a partition and sudo mkfs.ext4 -L {label} <partition>; one with a file system needs sudo e2label <partition> {label}. After relabelling a mounted drive the device cache is stale: check the label with setup/fs_label.py if that file exists, and see setup/SYSTEM_CHANGES.md, section --nvme-by-label (sudo setup/setup.sh --nvme-by-label). Then sudo mount /mnt/nvme (or reboot) and sudo setup/setup.sh, which creates /mnt/nvme/radar-runner on it.
 Provision the GPS receiver once: setup/gps_receiver.py --apply, sudo systemctl restart radar-telemetry, setup/gps_receiver.py, setup/check.py --receiver.
 Compare the bootloader settings with the field unit's (setup/check.py, the bootloader line; rpi-eeprom-config).
 Measure the amplifier's gain (output power against tx_gain, with this unit's VVA) before raising manager.limits.max_tx_gain above {cap} in /etc/radar-runner/local.yaml and RF0.tx_gain in /etc/radar-runner/radar.yaml.
+Amplifier current calibration: telemetry.ola.current_cal in the repository's config/radar-runner.yaml was measured on the first unit and reaches this one through the checkout: measure it again (clamp meter on the amplifier's supply) and set this unit's value in local.yaml.
 Turn-on check: once a start at low power is verified on this unit, put the expected values that tools/turn_on_check/measure.py prints in local.yaml.
-Power service bench tests on the new hardware (power/README.md, and the three watchdog tests of SYSTEM_CHANGES.md section 8).
+Power service bench tests on the new hardware (power/README.md, and the three watchdog tests of SYSTEM_CHANGES.md section 8). Until they pass, keep the power service disarmed (--disarm-power when making the image, as SYSTEM_CHANGES.md says for a rebuild), then set armed = true in /etc/radar-runner/power.toml.
+Alerts: send a test alert (alertctl test --wait 60) and decide this unit's ntfy topic.
 Write a HARDWARE_CONFIG.md for this unit (its amplifier, VVA divider, drive, receiver, serial numbers).
 """
 

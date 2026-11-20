@@ -874,3 +874,26 @@ def test_private_keys_are_made_in_memory_and_overwritten(unit, monkeypatch):
     assert made and made[0][0] in ("/dev/shm", "/run")
     assert not os.path.exists(made[0][1])
     assert seen and all(set(content) <= {0} for content in seen.values())   # overwritten before removal
+
+
+CHECKLIST = ["sudo tailscale up --ssh --advertise-tags=tag:radar", "key expiry", "tailscale set --auto-update=false",
+             f"do not remove or expire {OLD}", "lsblk", "mkfs.ext4 -L radar-data", "e2label", "fs_label.py",
+             "--nvme-by-label", "--disarm-power", "telemetry.ola.current_cal", "alertctl test"]
+
+
+def test_report_checklist(unit, capsys):
+    root, boot = unit
+    assert run(root, boot, "--dry-run") == 0
+    out = capsys.readouterr().out.lower()
+    for words in CHECKLIST:
+        assert words.lower() in out, words
+
+
+def test_procedure_document():
+    with open(os.path.join(REPO, "setup", "NEW_UNIT.md")) as f:
+        doc = f.read()
+    for words in CHECKLIST[:-5] + ["umask 077", "chmod 600", "e2fsck -fn", "python3 -u", "umount",
+                                   "as sensitive as the card", "journal", "sync"]:
+        if words == f"do not remove or expire {OLD}":
+            words = "do not remove or expire `englacial-radar-1`"
+        assert words.lower() in doc.lower(), words
