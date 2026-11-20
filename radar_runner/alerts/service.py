@@ -214,6 +214,8 @@ class Alerts(Service):
         self._state_error = ""
         self._scan = None
         self._scan_thread = None
+        self._scan_wanted = None    # uptime at which the summary first waited for a scan
+        self._scan_earlier = None   # a scan's answer, read again as the manager's state changed meanwhile
         self._reads = {}
         self._followed = set()      # event logs read once already by this process
         self._settled_since = None  # uptime since which the other services' status has been usable
@@ -527,26 +529,34 @@ class Alerts(Service):
             return []
         settled = self._settled_since is not None and now - self._settled_since >= self.cfg["summary_settle_s"]
         if not settled and now - self._started_at < self.cfg["summary_wait_max_s"]:
-            self._scan = None   # a scan from before the break may be out of date by the time it settles again
+            # A scan from before the break may be out of date by the time the status settles again.
+            self._scan = self._scan_wanted = self._scan_earlier = None
             return []           # a restart of the other services under way: wait until it is over
-        if self._scan is None:
+        if self._scan_wanted is None:
+            self._scan_wanted = now
+        # One scan thread at a time: a new scan starts only once the one before has ended (a drive
+        # that hangs). A scan that was dropped writes only into its own result.
+        if self._scan is None and (self._scan_thread is None or not self._scan_thread.is_alive()):
             result = {}
-            # One scan thread at a time: while one is still stuck on a drive that hangs, no other is
-            # started (the summary then goes without the collection, at SCAN_TIMEOUT_S). A scan that is
-            # dropped writes only into its own result.
-            if self._scan_thread is None or not self._scan_thread.is_alive():
-                def scan():
-                    try:
-                        result["value"] = scan_collections(self.collections_root)
-                    except OSError as e:
-                        result["value"] = {"error": f"cannot list {self.collections_root} ({e.strerror or e})"}
-                self._scan_thread = threading.Thread(target=scan, daemon=True, name="alerts-scan")
-                self._scan_thread.start()
-            self._scan = {"result": result, "started": now}
+
+            def scan():
+                try:
+                    result["value"] = scan_collections(self.collections_root)
+                except OSError as e:
+                    result["value"] = {"error": f"cannot list {self.collections_root} ({e.strerror or e})"}
+            self._scan_thread = threading.Thread(target=scan, daemon=True, name="alerts-scan")
+            self._scan_thread.start()
+            self._scan = {"result": result, "manager": self._manager_run()}
         scan = self._scan
-        if "value" not in scan["result"] and now - scan["started"] < SCAN_TIMEOUT_S:
-            return []           # wait for the drive, at most SCAN_TIMEOUT_S
-        collections = scan["result"].get("value") or {
+        done = scan is not None and "value" in scan["result"]
+        if done and self._scan_earlier is None and scan["manager"] != self._manager_run():
+            # A run began or ended while the drive was read: read it once more, so that the collection is
+            # judged by the manager's status of the same moment (the first answer if the second is late).
+            self._scan_earlier, self._scan = scan["result"]["value"], None
+            return []
+        if not done and now - self._scan_wanted < SCAN_TIMEOUT_S:
+            return []           # wait for the drive, at most SCAN_TIMEOUT_S from when the scan was wanted
+        collections = (scan["result"]["value"] if done else self._scan_earlier) or {
             "error": f"the data drive did not answer within {SCAN_TIMEOUT_S:g} s"}
         try:
             facts = self._summary_facts(now, collections)
@@ -568,6 +578,10 @@ class Alerts(Service):
         self.summary_sent = True
         self._dirty = True
         return [(alert, None)]
+
+    def _manager_run(self):
+        man = self._reads.get("manager")
+        return (man.data.get("state"), man.data.get("collection")) if man is not None and man.ok else None
 
     def _summary_facts(self, now, collections):
         r = self._reads

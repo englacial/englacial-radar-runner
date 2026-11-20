@@ -962,6 +962,62 @@ def test_a_scan_from_before_a_break_in_the_settle_is_not_used(tmp_path, server, 
     assert f"{name}, stopped" in s["message"] and "cut off" not in s["message"]
 
 
+def test_a_slow_scan_still_running_when_the_status_settles_again_is_followed_by_a_fresh_one(
+        tmp_path, server, monkeypatch):
+    import threading
+    import time
+    from radar_runner.alerts import service as alerts_service
+    rig = Rig(tmp_path, server.url)
+    (rig.collections / "b00042_s001_20261120T054629Z").mkdir()
+    gate, real_scan = threading.Event(), alerts_service.scan_collections
+
+    def slow_scan(root):
+        gate.wait(10)
+        return real_scan(root)
+    monkeypatch.setattr(alerts_service, "scan_collections", slow_scan)
+    rig.start()
+    rig.tick()                                  # the scan starts; the drive is slow
+    rig.watcher["running"] = False
+    rig.tick()                                  # dropped
+    rig.watcher["running"] = True
+    rig.tick(3)                                 # wanted again: the old scan still runs
+    gate.set()
+    time.sleep(0.5)
+    rig.tick(3)
+    [s] = summaries(server)
+    assert "b00042_s001_20261120T054629Z" in s["message"] and "did not answer" not in s["message"]
+
+
+def test_a_run_that_ends_while_the_drive_is_read_is_not_called_cut_off(tmp_path, server, monkeypatch):
+    import threading
+    import time
+    from radar_runner.alerts import service as alerts_service
+    rig = Rig(tmp_path, server.url)
+    name = "b00042_s001_20261120T054629Z"
+    col = rig.collections / name
+    col.mkdir()
+    (col / "collection.json").write_text(json.dumps({"recording_started": {"uptime_s": 900.0}, "end": None}))
+    rig.manager = {"state": "running", "not_ready": [], "collection": name}
+    gate, real_scan = threading.Event(), alerts_service.scan_collections
+
+    def slow_scan(root):
+        found = real_scan(root)
+        gate.wait(10)
+        return found
+    monkeypatch.setattr(alerts_service, "scan_collections", slow_scan)
+    rig.start()
+    rig.tick()                                  # the scan sees the run open
+    (col / "collection.json").write_text(json.dumps({"recording_started": {"uptime_s": 900.0},
+                                                     "end": {"uptime_s": 1003.0, "how": "stopped"}}))
+    rig.manager = {"state": "ready", "not_ready": [], "collection": None}
+    rig.tick()                                  # the run has ended meanwhile
+    gate.set()
+    time.sleep(0.5)
+    rig.tick(3)
+    [s] = summaries(server)
+    assert f"{name}, stopped" in s["message"] and "cut off" not in s["message"]
+
+
 def test_scans_of_a_drive_that_hangs_do_not_pile_up_while_the_status_flaps(tmp_path, server, monkeypatch):
     import threading
     from radar_runner.alerts import service as alerts_service
