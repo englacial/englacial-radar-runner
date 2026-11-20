@@ -418,6 +418,30 @@ Known and open:
 - The HIL fixtures in `~/radar-testbench/fixtures` describe the old amplifier gain and loopback. ORCA has four uncommitted HIL files (`~/orca/tests/hil`) from the move to the patched UHD.
 - An unexplained disagreement on 2026-11-20 01:17 UTC between the scope's first back-to-back captures (no RF) and the Pi (pulsing); a continuous scope record agreed with the Pi on every later start.
 
+# Status at 2026-11-20 21:40 UTC (overnight tests, stages 6 and 7, shipping settings)
+
+Installed and running from `main`: as in the section above, plus the alerts fixes of the third review, the turn-on check (stage 7), the raw GPS log and the motion trigger (stage 6; the trigger is off). `setup/check.py`: no failures, with the versions of this unit now pinned in `setup/pins.toml`.
+
+Settings the unit ships with (`/etc/radar-runner/`, copies in `docs/units/englacial-radar-1/`): `radar.yaml` at `tx_gain` 40 (about +9.6 dBm, 9 mW at the amplifier output; user's decision, the level of the turn-on check); the cap stays at 70; the turn-on check on and not blocking, with loose expected values for the field (a peak in samples 74.5 to 80.5 of at least -20 dB scaled to `tx_gain` 70: about 3 m of cable and antennas about 8 ft apart put the direct signal 2 to 3 samples after the leakage at sample 75). With both gains at 40 every collection carries the flag `turn_on_check_warning` (the check ran at the requested gain). The data drive is labelled `radar-data` and mounted by label.
+
+Hardware: the scope and both splitters are out of the loopback (`HARDWARE_CONFIG.md`); the reference for the comparison after transport is `docs/transit-reference/20261120-loopback-no-splitter-tx40.json` (peak sample 78, -32.7 dB at `tx_gain` 40, 3.6 dB above the level through the splitter).
+
+Tested since the section above, on the real radar:
+
+- Overnight (final configuration then: `tx_gain` 70, loopback with the splitter): a 2 h run stopped cleanly with all 24 data files closed, 1.15 % late commands of 35.2 million pulses (the schedule ran at 97.8 % of nominal), received level -5.85 dB with 0.2 dB of settling in the first 40 minutes and flat within 0.01 dB after, amplifier 27.6 to 28.8 C; scope: +39.4 dBm at 22 minutes and +39.3 dBm at 112 minutes, 12 V input 29.3 W with peaks of 34 W. 14 more start/stop cycles (50 by command in all). 10.9 h idle with no change in any service, GPS a 3D fix throughout. Results in `~/radar-config-staging/overnight/`.
+- Turn-on check (stage 7): record-only pass (peak 78.39, -36.3 dB at `tx_gain` 40, which scaled is within 0.3 dB of the full-power level of the same collection); blocking pass; loopback cable disconnected: the check failed (only the leakage left, -30.8 dB at sample 75.07 against -6.2 dB at 78.35 connected), the radar stayed off, the alert arrived, and the next button press checked again and ran; stops before, during and (with the power service's own stop command) inside the low-power run; a power cut during the low-power pulses (radar gone 0.3 s after the loss was detected, nothing launched afterwards, clean boot). The scope confirmed from the 12 V current that nothing followed the low-power train with the cable disconnected. A start takes 12.6 s longer with the check (20 s in all; about 35 s for the first start after power-up, when the SDR loads its firmware).
+- Raw GPS log (stage 6): the receiver sends RXM-RAWX at 1 Hz and RXM-SFRBX (all three layers; USB output 20.0 -> 20.7 kB/s, buffer peak unchanged at 60 %, antenna indoors); a collection holds `gps_raw.ubx` with one epoch a second and NAV-PVT at 10 Hz; the log converts to RINEX 3.04 with RTKLIB's `convbin`; the logger uses 0.23 % of a core and the late-command rate with it is 1.72 % on a quiet Pi. Indoors only about a quarter of the measurements have a valid carrier phase.
+- The data drive mounted by label after a power cycle.
+
+Known and open, in addition to the list above:
+
+- The loose expected values of the turn-on check are an estimate: it has never seen antennas. It does not block. After the first field start, `tools/turn_on_check/measure.py` gives values to replace them; the amplifier-current windows were set at room temperature.
+- Raw GPS data and the motion trigger have not been tried outdoors (the stage 6 criterion with a drive); the trigger stays off until then.
+- `setup/setup.sh --nvme-by-label` read a stale label after `e2label` on the mounted drive and wrote the old label into `/etc/fstab` (2026-11-20; corrected by hand before any reboot). A fix is on the branch `fix-nvme-label`. Do not relabel the mounted data drive of a unit that booted by label unless a reboot follows directly.
+- The UPS capacitor was at 1.27 V after 35 minutes without power and needed about 6 minutes to reach 5 V; a power loss in those minutes has not been tested (the power service then commits at once below 4.5 V).
+- The card image is from 2026-11-20 06:16 to 06:47 UTC (repository at 4a661fc). It was not taken again; `docs/units/englacial-radar-1/README.md` says how a card made from it is brought to the present state, and `LAB_UNIT_CARD.md` and `setup/NEW_UNIT.md` how the second unit's card is made from it with `setup/new_unit_image.py` (whose loop-device part has not yet run on a real image).
+- Under processor load the late-command rate rises (8.1 % in one run with test suites running beside the radar).
+
 # Implementation stages
 
 Stages are in priority order. The parts that are hardest to fix remotely come first, and nothing transmits through the amplifier under this repository's control until the safety watcher exists. Later stages can be pushed out over Starlink.

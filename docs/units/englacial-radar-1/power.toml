@@ -1,0 +1,67 @@
+# Power service configuration (example).
+#
+# Every value below is the built-in default; a setting that is left out keeps
+# its default. The service reads /etc/radar-runner/power.toml if it exists
+# (or the file given with --config). Copy this file there to change settings.
+# A setting that cannot be used is ignored with a warning in the log and in
+# the status file, and its default applies.
+
+# false = monitor-only: the service decides and logs, but runs no hooks and
+# never powers off. true = armed.
+armed = true
+
+# What to do when one signal says "loss" and the other is unreadable or faulty:
+# "shutdown" = shut down on the one signal; "quiesce" = keep the radar stopped
+# but never power off on one signal alone. (A capacitor discharging below
+# low_voltage_v still shuts down: that is the current and the voltage together.)
+single_signal_action = "shutdown"
+
+[paths]
+status_file = "/run/radar-runner/power.json"
+state_dir = "/var/lib/radar-runner"                  # boot-loop guard state
+disable_file = "/etc/radar-runner/power-disarm"      # if this exists: monitor-only
+
+[sampling]
+sample_interval_s = 0.2
+publish_interval_s = 0.5
+
+[signals]
+i2c_bus = 1
+ina219_address = 0x40
+shunt_ohms = 0.010
+loss_current_a = -0.3        # capacitor current below this = discharging = power lost
+gpio_line = 26               # high = external power present
+gpio_chip_label = "pinctrl-rp1"
+gpio_settle_s = 0.1
+loss_confirm_samples = 2     # consecutive samples to confirm a loss
+restore_confirm_s = 1.0      # continuous "present" to confirm a restore
+unreadable_after_s = 2.0     # no valid reading for this long: signal is "unreadable"
+faulty_after_s = 180.0       # "loss" for longer than the capacitor can last: signal is "faulty"
+faulty_clear_s = 60.0        # continuous "present" that clears "faulty"
+disagree_warn_s = 5.0        # the signals must contradict for this long to raise a warning
+
+[shutdown]
+ride_through_s = 8.0         # the signals must agree on a loss for this long, without a break
+low_voltage_v = 4.5          # capacitor below this while the signals agree: do not wait.
+                             # Discharging below this for 2 s: shut down whatever GPIO 26 says
+sync_timeout_s = 5.0
+last_resort_after_s = 10.0   # still running this long after the power-off command: immediate
+                             # power-off without sync, repeated every 10 s
+
+[guard]
+early_boot_s = 300.0         # a shutdown within this time of boot counts as "early"
+max_early_shutdowns = 3      # this many early shutdowns in a row: go passive
+passive_rearm_s = 1800.0     # healthy power for this long ends passive mode
+
+[hooks]
+# Commands as argument lists, run without a shell. Empty = no hook.
+# stop_radar: the radar manager stops the radar. amp_safe: the SDR GPIO reset tool, run only if the
+# amplifier pin is not recorded as safe and the SDR has its firmware (printed by setup/setup.sh).
+stop_radar = ["/usr/bin/setpriv", "--reuid=englacial", "--regid=englacial", "--init-groups", "--reset-env",
+              "/usr/bin/python3", "-B", "-E", "-s", "/home/englacial/englacial-radar-runner/radar_runner/manager/radarctl.py",
+              "stop", "--interrupt", "--wait", "--timeout", "4"]
+stop_radar_timeout_s = 5.0
+amp_safe = ["/usr/bin/setpriv", "--reuid=englacial", "--regid=englacial", "--init-groups", "--reset-env",
+            "/home/englacial/englacial-radar-runner/bin/radar-manager-stop-hook",
+            "--timeout", "10", "/var/lib/radar-runner/user/sdr-state"]
+amp_safe_timeout_s = 12.0

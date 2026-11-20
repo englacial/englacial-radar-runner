@@ -1,0 +1,28 @@
+# Per-unit settings for this unit (layer 3; see config/radar-runner.yaml).
+manager:
+  limits:
+    # Amplifier gain fixed by the VVA divider fitted 2026-11-20 (1k to 5 V, 2.2k + 470 to ground,
+    # 3.452 V): tx_gain 70 gives about +39.5 dBm (9 W peak) at the amplifier output, 72 about 14 W.
+    # The cap keeps the output at or under about 10 W (user, 2026-11-20).
+    max_tx_gain: 70.0
+  # Turn-on check: a low-power run (tx_gain 40, 3 s) before every start. Not blocking, with loose bounds
+  # set before the first field start (user, 2026-11-20): about 3 m of cable and antennas about 8 ft
+  # (2.4 m) apart put the direct signal about 2 to 3 samples after the SDR's own leakage (sample 75),
+  # so near sample 77 to 78. The check asks only for a peak somewhere in samples 74.5 to 80.5 that is
+  # clearly stronger than the leakage alone (-30.8 dB at tx_gain 70 with the cable disconnected). The bench
+  # loopback (sample 78.4, -6 dB) passes too. Tighten after the first field start
+  # (tools/turn_on_check/measure.py prints the values).
+  turn_on_check:
+    enabled: true
+    blocking: false             # the result is recorded and a failure raises a low alert; the radar starts anyway
+    clip_fs: 2.0                # never reached: clipping does not fail the check (the direct wave may clip)
+    idle_current_min_a: 0.03    # wide: the idle current in the cold is not known (0.144-0.156 A at room temperature)
+    idle_current_max_a: 0.45
+    current_rise_min_a: 0.0     # any reading passes: the rise in the cold is not known
+    expected:
+      verified: true
+      leakage_sample: 77.5      # centre of the window (samples 74.5 to 80.5), not a measured peak
+      delay_samples: 0.0
+      tolerance_samples: 3.0
+      level_tx_gain: 70
+      min_level_db: -20.0       # 11 dB above the leakage alone (-30.8 dB), 14 dB below the bench loopback (-6.2 dB)

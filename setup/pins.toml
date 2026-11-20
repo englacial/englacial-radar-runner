@@ -7,15 +7,15 @@
 os_version = "24.04"          # VERSION_ID in /etc/os-release
 uv_version = "0.13.7"         # ~/.local/bin/uv (see setup/SYSTEM_CHANGES.md for the checksum)
 
-kernel = ""                   # uname -r, e.g. "6.8.0-1068-raspi"
-bootloader = ""               # first line of "vcgencmd bootloader_version", e.g. "2026/01/21 13:38:47"
-bootloader_config = ""        # "rpi-eeprom-config" output on one line, e.g. "[all] BOOT_UART=1 BOOT_ORDER=0xf461 NET_INSTALL_AT_POWER_ON=1"
-orca_commit = ""              # git commit of ~/orca (full hash)
+kernel = "6.8.0-1068-raspi"                   # uname -r, e.g. "6.8.0-1068-raspi"
+bootloader = "2026/01/21 13:38:47"               # first line of "vcgencmd bootloader_version", e.g. "2026/01/21 13:38:47"
+bootloader_config = "[all] BOOT_UART=1 BOOT_ORDER=0xf461 NET_INSTALL_AT_POWER_ON=1"        # "rpi-eeprom-config" output on one line, e.g. "[all] BOOT_UART=1 BOOT_ORDER=0xf461 NET_INSTALL_AT_POWER_ON=1"
+orca_commit = "9daf78f03309891cc4d8887e2727add6f8245acf"              # git commit of ~/orca (full hash)
 uhd_prefix = "~/uhd-patched-gpio"    # install prefix of the one UHD build in use (check.py; the reset
                               # tool's CMakeLists.txt and manager.orca.build_commands name it too)
 uhd_commit = "c3e2439c5112c5fbfb56db1d2bb856429adf7cb5"    # "commit" in <uhd_prefix>/ORCA_UHD_BUILD.yaml:
                               # UHD 4.11.0 + the TR-switch fix + front-panel pins left as inputs at initialisation
-gpsd_version = ""             # package version, e.g. "3.25-3ubuntu3.2"
-chrony_version = ""           # package version, e.g. "4.5-1ubuntu4"
-fake_hwclock_version = ""     # package version, e.g. "0.13"
+gpsd_version = "3.25-3ubuntu3.2"             # package version, e.g. "3.25-3ubuntu3.2"
+chrony_version = "4.5-1ubuntu4"           # package version, e.g. "4.5-1ubuntu4"
+fake_hwclock_version = "0.13"     # package version, e.g. "0.13"
 repo_tag = ""                 # release tag of this repository that should be checked out

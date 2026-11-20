@@ -128,6 +128,17 @@ sync
 sudo umount /media/$USER/writable /media/$USER/system-boot
 ```
 
+## If the image is older than the repository
+
+The tool is run from a current checkout, whatever the age of the image: copy
+`setup/new_unit_image.py` from the newest release. The image of 2026-11-20 holds the repository at
+commit 4a661fc, before the turn-on check, the raw GPS log and this tool. A card made from it runs
+the older services at its first boot: they warn about the settings in the new `local.yaml` that
+they do not know yet (`turn_on_check`) and otherwise work. Right after step 1 of the list below
+(the unit then has a network of its own identity), bring it up to date as described in
+`docs/units/englacial-radar-1/README.md`: update the two checkouts, run
+`sudo setup/setup.sh` and reboot. The rest of the list assumes the current release.
+
 ## On the new unit, after its first boot
 
 In this order (the report prints the same list):

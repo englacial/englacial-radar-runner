@@ -1,0 +1,81 @@
+# Radar config for the manager's first runs on the bench (VVA at 5 V, amplifier into attenuators).
+# From ~/radar-testbench/pa_bringup/run300_d05_tx60.yaml: 300 MHz, 30 MHz chirp, 6.5 % enable duty.
+# Changed from that file: the 10 MHz offset is RF0.lo_offset (hardware) instead of
+# GENERATE.lo_offset_sw, so RF0.freq is now the chirp centre. The LO stays at 290 MHz.
+
+GENERATE:
+  sample_rate: 56e6          # [Hz]
+  chirp_type: linear
+  chirp_bandwidth: 30e6      # [Hz] chirp is 285-315 MHz
+  lo_offset_sw: 0            # [Hz] no software offset
+  window: hamming
+  chirp_length: 10e-6        # [s]
+  pulse_length: 13e-6        # [s] chirp plus 1.5 us of zero padding each side
+  out_file: chirp.bin
+  show_plot: false
+
+DEVICE:
+  device_args: num_recv_frames=700,num_send_frames=700,recv_frame_size=11000,send_frame_size=11000
+  subdev: A:A
+  clk_ref: internal
+  clk_rate: 56e6             # [Hz]
+  tx_channels: '0'
+  rx_channels: '0'
+  cpu_format: fc32
+  otw_format: sc12
+
+GPIO:
+  gpio_bank: FP0
+  pwr_amp_pin: "2"           # ORCA subtracts 2 (DB15 pin numbering): "2" is GPIO_0. Below 2 means no amplifier pin
+  pwr_amp_active_low: true   # low = amplifier enabled
+  ref_out: -1
+
+RF0:
+  rx_rate: 56e6              # [Hz]
+  tx_rate: 56e6              # [Hz]
+  freq: 300e6                # [Hz] chirp centre
+  lo_offset: -10e6           # [Hz] LO at 290 MHz
+  rx_gain: 40
+  tx_gain: 40                # about +9.6 dBm (9 mW peak) at the amplifier output with VVA 3.452 V: the level of the turn-on check; 70 gives about +39.5 dBm (9 W)
+  bw: 56e6                   # [Hz]
+  tx_ant: TX/RX
+  rx_ant: RX2
+  transmit: true
+  tuning_args: ''
+
+RF1:                         # not used on the B206mini, but ORCA sizes its bursts from these rates
+  rx_rate: 56e6
+  tx_rate: 56e6
+  freq: 450e6
+  lo_offset: 0
+  rx_gain: 10
+  tx_gain: 10
+  bw: 56e6
+  tx_ant: TX/RX
+  rx_ant: RX2
+  transmit: false
+  tuning_args: ''
+
+CHIRP:
+  time_offset: 1             # [s]
+  tx_duration: 13e-6         # [s]
+  rx_duration: 42e-6         # [s]
+  tr_on_lead: 0
+  tr_off_trail: 0
+  pulse_rep_int: 200e-6      # [s] 5 kHz; enable duty 13/200 = 6.5 %
+  tx_lead: 1.5e-6            # [s]
+  num_pulses: -1             # continuous
+  num_presums: 1000
+  phase_dithering: true
+
+FILES:                       # the manager replaces output_dir and max_chirps_per_file for each collection
+  chirp_loc: chirp.bin
+  output_dir: hil_scratch/manager
+  save_loc: rx_samps.bin
+  gps_loc: gps_log.txt
+  max_chirps_per_file: -1
+
+RUN_MANAGER:                 # only read by ORCA's run.py, which the manager does not use
+  final_save_loc: null
+  save_partial_files: false
+  save_gps: false
