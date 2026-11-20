@@ -402,6 +402,22 @@ TODO: How do we enable useful previews without putting excess load on the proces
 
 With presumming, the recorded data rate is low. A low-priority process can read the newest record every few seconds, pulse-compress it and save a small image. The same numbers can feed an in-run check that the direct antenna signal is still present. The load must be measured against the late-command baseline before it is enabled.
 
+# Status at the end of the bench day, 2026-11-20
+
+Installed and running from this checkout (`main`): power service (armed, with the two radar hooks), telemetry, safety watcher, radar manager (enabled at boot), alerts (enabled; ntfy reaches the user's phone), gpsd passive with the receiver check after every gpsd start. `setup/check.py`: no failures.
+
+Hardware as in `HARDWARE_CONFIG.md`: replacement control board, VVA 3.452 V from a fixed divider, `tx_gain` cap 70 (about +39.6 dBm), the portable loopback (20 dB + 30 dB, 30 ft cable), PPS from the GPS receiver on the SDR's REF port (seen by the SDR; ORCA does not use it yet, and its single `clk_ref` setting would also switch the clock source: stage 8 needs an ORCA change). Reference for the comparison after transport: `docs/transit-reference/`.
+
+Tested today on the real radar: the manager's first-start list; 44 start/stop cycles by command and 2 by button; a data file change at 1,500 records; telemetry lost while recording; the manager service stopped while recording; five power cuts with the radar transmitting (radar stopped 0.3 s after the loss is detected, power-off command at 8.4 s, journal closed at about 12 s, collections intact, the manager back to ready by itself, no amplifier enable at power-up); GPS a 3D fix for 99.7 % of 7 h with the antenna indoors, 100 % while transmitting.
+
+Known and open:
+
+- Pulse loss is 2.4 % on a quiet Pi and rises steeply when the processor is busy (13 % dropped plus a fifth of the schedule slipped at load 2-4). Measure or compare only with nothing else running. The 2 h run of stage 4 has not been done.
+- Alerts: the fixes for the second review were merged without an independent review (user's decision, 2026-11-20: findings become a later update). The boot summary had two defects seen on real boots (a collection in progress called "cut off"; a summary sent while other services were restarting), fixed the same evening.
+- Not done against the stage criteria: the remaining power-cut counts, the boot-loop guard and the signal-fault cases on hardware, the 24 h runs, OLA and GPS unplugging, missing SDR, missing NVMe, full disk, the clock from GPS with the network unplugged, alerts with the network unplugged.
+- The HIL fixtures in `~/radar-testbench/fixtures` describe the old amplifier gain and loopback. ORCA has four uncommitted HIL files (`~/orca/tests/hil`) from the move to the patched UHD.
+- An unexplained disagreement on 2026-11-20 01:17 UTC between the scope's first back-to-back captures (no RF) and the Pi (pulsing); a continuous scope record agreed with the Pi on every later start.
+
 # Implementation stages
 
 Stages are in priority order. The parts that are hardest to fix remotely come first, and nothing transmits through the amplifier under this repository's control until the safety watcher exists. Later stages can be pushed out over Starlink.
