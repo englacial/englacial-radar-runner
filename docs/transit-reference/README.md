@@ -27,3 +27,9 @@ What the numbers mean:
 - Pulses lost 2.4 % on a quiet Pi. A first attempt with the Pi's processor busy (load 2-4) lost
   32 % of the time to dropped pulses and schedule slips with the same recorded level: compare
   runs only when nothing else is running.
+
+`20261120-portable-loopback-all-runs.json` holds the same numbers for every run made with this
+arrangement on 2026-11-20 (the reference, the first attempt under load, and the short runs before
+power cuts 3 to 5, each after a cold boot): it shows how much the numbers move from run to run
+and across power cycles with nothing changed, which is the yardstick for a difference after
+transport.
