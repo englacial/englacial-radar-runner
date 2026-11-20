@@ -60,6 +60,18 @@ def test_no_signal_has_no_peak_where_one_is_expected():
     assert not d["found"] or d["level_db"] < -90
 
 
+def test_amplifier_off_only_the_leakage_fails_by_position_and_by_level():
+    # The 28 V gone after a power cut, the SDR still running: only the leakage, 3 samples early.
+    x = records("amplifier_off_tx70.bin")
+    d = measure.measure(x, chirp(), 2, expected=COMBINED)["direct"]
+    assert not d["found"]                                   # nothing at the bench's 78.4 +/- 1.5
+    wide = dict(COMBINED, tolerance_samples=4.0)            # a tolerance wide enough to reach the leakage
+    d = measure.measure(x, chirp(), 2, expected=wide)["direct"]
+    assert d["found"] and d["sample"] == pytest.approx(75.07, abs=0.1)
+    assert d["level_db"] == pytest.approx(-33.5, abs=0.3)   # 27.6 dB under the bench's -5.9
+    assert d["level_db"] < -5.9 - 15                        # below a minimum set with a 15 dB margin
+
+
 def test_wrong_delay_finds_no_direct_peak():
     # The portable loopback judged with the 50 m cable's delay: nothing at 90.
     m = measure.measure(records("loopback_30ft_tx70.bin"), chirp(), 2, expected=TWO_PEAK)

@@ -408,6 +408,39 @@ def test_a_power_loss_during_the_check_radar_has_it_gone_in_the_urgent_budget(en
     assert result(env)["radar"]["signalled_before_start"] and env.amp_safe_calls() == 0
 
 
+@pytest.mark.parametrize("damage,words", [
+    ("extra", "differs from the collection's in more than the gain, the pulse count and the output: CHIRP.tx_duration"),
+    ("limits", "low-power config refused: RF0.tx_gain"),
+    ("read_back", "does not read back as it was derived"),
+])
+def test_the_check_refuses_a_low_power_config_that_is_not_what_it_should_be(env, events, check_env, monkeypatch,
+                                                                            damage, words):
+    real_config, real_load = turnon.low_power_config, turnon.limits.load_file
+
+    def bad_config(derived, cap, pulses, output_dir):
+        lp, facts = real_config(derived, cap, pulses, output_dir)
+        if damage == "extra":
+            lp["CHIRP"]["tx_duration"] = 2e-5
+        elif damage == "limits":
+            lp["RF0"]["tx_gain"] = -1.0           # passes the cap check, fails the limits
+            facts["tx_gain"] = -1.0
+        return lp, facts
+
+    def bad_load(path, *a, **k):
+        out = real_load(path, *a, **k)
+        if damage == "read_back" and os.sep + turnon.SUBDIR + os.sep in path:
+            out["RF0"]["tx_gain"] = 39.0
+        return out
+    monkeypatch.setattr(turnon, "low_power_config", bad_config)
+    monkeypatch.setattr(turnon.limits, "load_file", bad_load)
+    r = check_env(events)
+    r.start(REQUEST)
+    info = events.wait("ended")
+    assert info["kind"] == "config" and info["fatal"] and words in info["failure"]
+    assert not info["launched"] and r._current is None and env.amp_safe_calls() == 0
+    assert not os.path.exists(os.path.join(check_dir(env), "low_power.bin.0"))     # no low-power radar ran
+
+
 def test_a_power_loss_between_the_two_runs_starts_nothing(env, events, check_env):
     r = check_env(events, behave={"analysis": "slow"}, analysis_timeout_s=20.0)
     r.start(REQUEST)
@@ -430,7 +463,8 @@ def test_a_power_loss_between_the_two_runs_starts_nothing(env, events, check_env
 
 @pytest.mark.skipif(not os.path.exists(ORCA_PYTHON), reason="no ORCA Python environment (numpy)")
 @pytest.mark.parametrize("records,gain,passed", [("loopback_30ft_tx70.bin", 70.0, True),
-                                                 ("no_signal_tx0.bin", 0.0, False)])
+                                                 ("no_signal_tx0.bin", 0.0, False),
+                                                 ("amplifier_off_tx70.bin", 70.0, False)])
 def test_the_real_analysis_on_recorded_loopback_records(env, events, check_env, records, gain, passed):
     behave = {"records_from": os.path.join(RECORDS, records), "records_gain": gain,
               "chirp_from": os.path.join(RECORDS, "chirp.bin")}
@@ -473,6 +507,33 @@ class CheckRunning(Running):
         out = super().stop()
         self.feed_thread.halt.set()
         return out
+
+
+def test_the_power_services_stop_hook_during_the_check(env):
+    # radarctl stop --interrupt --wait --timeout 4, while the low-power radar is in its SDR set-up.
+    tx_file = setup_check(env)
+    env.behave(tx_file=tx_file, init_s=3.0)
+    mgr = CheckRunning(env, tx_file).start()
+    try:
+        mgr.wait_state("ready")
+        assert mgr.ctl("start")[0] == 0
+        deadline = time.monotonic() + 10
+        while not (mgr.status().get("radar") or {}).get("turn_on_check"):
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        t0 = time.monotonic()
+        code, out = mgr.ctl("stop", "--interrupt", "--wait", "--timeout", "4")
+        assert code == 0 and "stopped" in out and time.monotonic() - t0 < 4.0
+        # The ended event follows the amplifier step; the run stays wanted and resumes later.
+        deadline = time.monotonic() + 10
+        while not mgr.events("ended"):
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        ended = mgr.events("ended")[0]
+        assert not ended["launched"] and ended["requested"]     # the radar at power was never started
+        assert not [f for f in os.listdir(env.collection_dir(0)) if f.startswith("rx_samps.bin")]
+    finally:
+        mgr.stop()
 
 
 def test_the_service_shows_a_blocking_failure_as_a_fault_and_tries_again_at_the_next_press(env):
