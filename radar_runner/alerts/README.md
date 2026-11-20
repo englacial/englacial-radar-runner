@@ -296,7 +296,7 @@ reported as restarted; its status file going stale still is.
 | Its own state file damaged | started afresh, at the end of the event logs; said in the status (`state_file.note`) |
 | Memory | `MemoryMax=200M`; everything it reads is bounded (status files 1 MB, 256 kB of event log per round, 64 kB per line) |
 | It is stopped | the send in progress is cut off (it stays queued), the state saved with `clean_stop`, the status says `running: false`; exit within a second |
-| A send never ends (no answer, a DNS lookup that hangs) | given up on after 15 s; the loop goes on meanwhile. The longest gap between two status writes is about a second plus the card's sync time, so `alertctl` and `setup/check.py` (10 s limit) do not take a busy service for a stopped one |
+| A send never ends (no answer, a DNS lookup that hangs) | given up on after 15 s; the loop goes on meanwhile. The longest gap between two status writes is about a second plus the card's sync time, so `alertctl` and `setup/check.py` (10 s limit) do not take a busy service for a stopped one. Two sends stuck in DNS lookups stop all sending (no third is started): if that lasts 10 minutes the service exits with status 1 and systemd restarts it; the queue is on disk |
 | A test alert's inbox file cannot be deleted (`sudo alertctl test`) | not sent; `inbox.problem` in the status. `alertctl` refuses to run as root and never creates the inbox |
 
 ## Status file

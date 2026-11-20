@@ -42,6 +42,7 @@ COLLECTION_RE = re.compile(r"^b(\d{5,})_s(\d{3,})_")
 RECENT = 20
 SEND_ROUND_S = 0.5          # the loop waits at most this long per round for sends to finish
 MAX_STALE = 2               # sends given up on but still in a DNS lookup; no new one beyond this
+STALE_EXIT_S = 600.0        # at that limit this long (nothing at all can be sent): exit, systemd restarts
 UNREMOVABLE_RETRY_S = 60.0
 UNREADABLE_RETRY_S = 600.0
 
@@ -187,6 +188,8 @@ class Alerts(Service):
         self.inbox_stuck = set()    # inbox files that could not be deleted
         self.inbox_problem = ""
         self._removal_retry_at = 0.0
+        self._stale_full_since = None
+        self.exit_status = 0
         self.counters = {"queued": 0, "sent": 0, "held_back": 0, "rejected": 0, "events": 0,
                          "voltage_trips_in_power_loss": 0, "inbox": 0}
         self.recent = []
@@ -310,6 +313,10 @@ class Alerts(Service):
         self.conditions = L.Conditions(self.cond_cfg["clear_s"], conditions)
         self.disk = L.DiskLevels(self.cfg["disk"]["free_gb_levels"], self.cfg["disk"]["rearm_fraction"],
                                  st.get("disk_levels") if st else None)
+
+    def run(self):
+        status = super().run()
+        return status or self.exit_status
 
     def cleanup(self):
         if self.limiter is None:
@@ -672,6 +679,19 @@ class Alerts(Service):
 
     def _reap(self):
         """Sends given up on that have ended since (a DNS lookup); and files that could not be deleted."""
+        now = self._uptime()
+        if len(self.stale) < MAX_STALE:
+            self._stale_full_since = None
+        elif self._stale_full_since is None:
+            self._stale_full_since = now
+        elif now - self._stale_full_since >= STALE_EXIT_S and not self._stop.is_set():
+            # Threads stuck in DNS lookups that never return: nothing, urgent alerts included, can be
+            # sent, while the watchdog is still fed. A new process starts afresh; the queue is on disk.
+            self.log.error("%d sends have been stuck in DNS lookups for %.0f s: exiting so that systemd "
+                           "restarts the service", len(self.stale), now - self._stale_full_since)
+            self.exit_status = 1
+            self.request_stop()
+            return
         for s in [s for s in self.stale if s["send"].done.is_set()]:
             self.stale.remove(s)
             if s["send"].result is not None and s["send"].result.kind == ntfy.SENT:

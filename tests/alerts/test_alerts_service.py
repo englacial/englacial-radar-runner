@@ -700,3 +700,25 @@ def test_refusals_while_the_server_refused_everything_do_not_count_towards_dropp
     assert any("summary" in b["title"] for b in server.bodies())
     assert status["counters"]["rejected"] == 0                  # one later 400 drops nothing
     assert any(n.startswith("p4-") for n in rig.queued())
+
+
+def test_sends_stuck_in_dns_lookups_for_ten_minutes_make_the_service_exit_for_a_restart(tmp_path, server):
+    import threading
+    from radar_runner.alerts import service as alerts_service
+    rig = Rig(tmp_path, server.url)
+    svc = rig.start()
+    rig.tick(3)
+
+    class Stuck:                                # a send whose DNS lookup never returns
+        done = threading.Event()
+        result = None
+
+        def cancel(self):
+            pass
+    svc.stale = [{"send": Stuck(), "name": f"p3-00000000000{i}.json", "item": {}, "since": 0.0} for i in range(2)]
+    rig.manager_event(event="fault", kind="a", reason="r")
+    rig.tick(int(alerts_service.STALE_EXIT_S) - 5)
+    assert not svc._stop.is_set() and not [b for b in server.bodies() if "FAULT" in b["title"]]
+    rig.tick(10)
+    assert svc._stop.is_set() and svc.exit_status == 1
+    assert any(n.startswith("p4-") for n in rig.queued())      # the alert waits on disk for the next process
