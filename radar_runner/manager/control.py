@@ -154,6 +154,9 @@ class EventLog:
         self.written = 0
         self.synced = 0         # rounds of the syncing thread
         self.sync_error = ""
+        self._asked = 0         # sync requests made, and the number that a finished round covered
+        self._covered = 0
+        self._sync_done = threading.Condition()
         self._sync_wanted = threading.Event()
         self._rotated = False
         self._syncer = None
@@ -162,6 +165,7 @@ class EventLog:
         while True:
             self._sync_wanted.wait()
             self._sync_wanted.clear()
+            asked = self._asked
             paths = [self.path]
             if self._rotated:
                 self._rotated = False
@@ -178,12 +182,29 @@ class EventLog:
                     error = f"{type(e).__name__}: {e.strerror or e}"
             self.sync_error = error
             self.synced += 1
+            with self._sync_done:
+                self._covered = asked
+                self._sync_done.notify_all()
 
     def _want_sync(self):
+        try:
+            self._asked += 1
+            if self._syncer is None:
+                self._syncer = threading.Thread(target=self._sync_loop, daemon=True, name="manager-events-sync")
+                self._syncer.start()
+            self._sync_wanted.set()
+        except Exception as e:      # no thread to be had: the lines are written, only not synced yet
+            self._syncer = None
+            self.sync_error = f"{type(e).__name__}: {e}"
+
+    def close(self, timeout=1.0):
+        """Wait, for at most `timeout`, until every line written so far is synced. For the end of
+        the manager, after the radar is stopped: the last events (`ended`, `manager_stopped`) are the
+        ones a power cut would otherwise take. Returns True if they are synced."""
         if self._syncer is None:
-            self._syncer = threading.Thread(target=self._sync_loop, daemon=True, name="manager-events-sync")
-            self._syncer.start()
-        self._sync_wanted.set()
+            return self._asked == 0
+        with self._sync_done:
+            return self._sync_done.wait_for(lambda: self._covered >= self._asked, timeout)
 
     def write(self, event):
         try:

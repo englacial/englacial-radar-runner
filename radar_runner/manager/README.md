@@ -303,7 +303,7 @@ the command's own 4 s and the hook's 5 s.
 |---|---|
 | `/run/radar-runner/user/manager.json` | status, at least once a second |
 | `/run/radar-runner/user/manager.sock` | command socket (mode 0660) |
-| `/var/lib/radar-runner/user/manager-events.jsonl` | event log: state changes, requests, starts, stops, faults, gate changes |
+| `/var/lib/radar-runner/user/manager-events.jsonl` | event log: state changes, requests, starts, stops, faults, gate changes. Each line is synced to the drive by a thread of its own (never holding up a stop); at its own stop, once the radar is stopped, the manager waits up to 1 s for the last lines to be synced |
 | `/var/lib/radar-runner/user/override-no-amp-telemetry` | the override |
 | `/var/lib/radar-runner/user/sdr-state` | is the SDR's amplifier pin known to be safe: first line `safe` or `unknown` |
 | `/var/lib/radar-runner/user/amp_safe.log` | output of the tool when it ran outside a collection |

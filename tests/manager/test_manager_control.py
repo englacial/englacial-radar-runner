@@ -212,6 +212,50 @@ def test_event_log_is_synced_to_the_drive_without_holding_up_the_writer(tmp_path
     assert path + ".1" in synced
 
 
+def test_closing_the_event_log_waits_briefly_for_the_last_lines_to_be_synced(tmp_path, monkeypatch):
+    import time
+    path = str(tmp_path / "events.jsonl")
+    synced = []
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        time.sleep(0.2)
+        synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+        real_fsync(fd)
+    monkeypatch.setattr(os, "fsync", fsync)
+    log = control.EventLog(path, 1e6)
+    log.write({"event": "ended"})
+    log.write({"event": "manager_stopped"})
+    assert log.close(1.0) is True and path in synced      # before the process would exit
+    assert control.EventLog(str(tmp_path / "none.jsonl"), 1e6).close(1.0) is True   # nothing written
+
+    def stuck(fd):
+        time.sleep(5)
+    monkeypatch.setattr(os, "fsync", stuck)
+    log = control.EventLog(str(tmp_path / "slow.jsonl"), 1e6)
+    log.write({"event": "manager_stopped"})
+    t = time.monotonic()
+    assert log.close(1.0) is False and time.monotonic() - t < 1.5       # bounded
+
+
+def test_event_log_without_a_thread_still_writes_and_never_raises(tmp_path, monkeypatch):
+    import threading
+
+    def no_threads(self):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(threading.Thread, "start", no_threads)
+    log = control.EventLog(str(tmp_path / "e.jsonl"), 1e6)
+    assert log.write({"event": "x"}) == "" and log.written == 1 and "can't start" in log.sync_error
+    assert log.close(0.1) is False
+
+
+def test_the_manager_closes_its_event_log_only_after_the_radar_is_stopped():
+    import inspect
+    from radar_runner.manager import service
+    source = inspect.getsource(service.Manager.cleanup)
+    assert source.index("self.runner.shutdown") < source.index("manager_stopped") < source.index("event_log.close")
+
+
 def test_event_log_never_raises(tmp_path):
     log = control.EventLog(str(tmp_path / "no-dir" / "events.jsonl"), 1e6)
     assert "No such file" in log.write({"event": "x"}) and log.error
