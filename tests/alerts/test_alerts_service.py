@@ -841,6 +841,58 @@ def test_a_summary_that_cannot_wait_any_longer_says_what_was_missing(tmp_path, s
     assert "telemetry status" in first and "not a fault of the radar" in first
 
 
+def test_a_scan_from_before_a_break_in_the_settle_is_not_used(tmp_path, server, monkeypatch):
+    import threading
+    import time
+    from radar_runner.alerts import service as alerts_service
+    rig = Rig(tmp_path, server.url)
+    name = "b00042_s001_20261120T054629Z"
+    col = rig.collections / name
+    col.mkdir()
+    (col / "collection.json").write_text(json.dumps({"recording_started": {"uptime_s": 900.0}, "end": None}))
+    rig.manager = {"state": "running", "not_ready": [], "collection": name}
+    gate, real_scan = threading.Event(), alerts_service.scan_collections
+
+    def slow_scan(root):
+        found = real_scan(root)
+        gate.wait(10)
+        return found
+    monkeypatch.setattr(alerts_service, "scan_collections", slow_scan)
+    rig.start()
+    rig.tick()                                  # settled: the scan starts, and sees the run open
+    rig.watcher["running"] = False              # the watcher restarts before the scan is used
+    rig.tick()
+    (col / "collection.json").write_text(json.dumps({"recording_started": {"uptime_s": 900.0},
+                                                     "end": {"uptime_s": 1003.0, "how": "stopped"}}))
+    rig.manager = {"state": "ready", "not_ready": [], "collection": None}
+    gate.set()
+    time.sleep(0.5)                             # the old scan has ended
+    rig.watcher["running"] = True
+    rig.tick(3)
+    [s] = summaries(server)
+    assert f"{name}, stopped" in s["message"] and "cut off" not in s["message"]
+
+
+def test_scans_of_a_drive_that_hangs_do_not_pile_up_while_the_status_flaps(tmp_path, server, monkeypatch):
+    import threading
+    from radar_runner.alerts import service as alerts_service
+    hang = threading.Event()
+    monkeypatch.setattr(alerts_service, "scan_collections", lambda root: hang.wait(30))
+    rig = Rig(tmp_path, server.url)
+    rig.start()
+    for _ in range(5):
+        rig.tick()
+        rig.watcher["running"] = False
+        rig.tick()
+        rig.watcher["running"] = True
+    scans = [t for t in threading.enumerate() if t.name == "alerts-scan" and t.is_alive()]
+    rig.tick(12)
+    hang.set()
+    assert len(scans) == 1
+    [s] = summaries(server)
+    assert "did not answer" in s["message"]
+
+
 def test_a_normal_boot_still_sends_the_summary_at_three_minutes(tmp_path, server):
     rig = Rig(tmp_path, server.url, summary_after_s=180.0, summary_settle_s=30.0)
     rig.clock.up = 20.0                         # started early in the boot, the others too

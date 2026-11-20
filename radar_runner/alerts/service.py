@@ -201,6 +201,7 @@ class Alerts(Service):
         self._saved_at = None
         self._state_error = ""
         self._scan = None
+        self._scan_thread = None
         self._reads = {}
         self._followed = set()      # event logs read once already by this process
         self._settled_since = None  # uptime since which the other services' status has been usable
@@ -509,18 +510,22 @@ class Alerts(Service):
             return []
         settled = self._settled_since is not None and now - self._settled_since >= self.cfg["summary_settle_s"]
         if not settled and now - self._started_at < self.cfg["summary_wait_max_s"]:
+            self._scan = None   # a scan from before the break may be out of date by the time it settles again
             return []           # a restart of the other services under way: wait until it is over
         if self._scan is None:
             result = {}
-
-            def scan():
-                try:
-                    result["value"] = scan_collections(self.collections_root)
-                except OSError as e:
-                    result["value"] = {"error": f"cannot list {self.collections_root} ({e.strerror or e})"}
-            thread = threading.Thread(target=scan, daemon=True, name="alerts-scan")
-            self._scan = {"thread": thread, "result": result, "started": now}
-            thread.start()
+            # One scan thread at a time: while one is still stuck on a drive that hangs, no other is
+            # started (the summary then goes without the collection, at SCAN_TIMEOUT_S). A scan that is
+            # dropped writes only into its own result.
+            if self._scan_thread is None or not self._scan_thread.is_alive():
+                def scan():
+                    try:
+                        result["value"] = scan_collections(self.collections_root)
+                    except OSError as e:
+                        result["value"] = {"error": f"cannot list {self.collections_root} ({e.strerror or e})"}
+                self._scan_thread = threading.Thread(target=scan, daemon=True, name="alerts-scan")
+                self._scan_thread.start()
+            self._scan = {"result": result, "started": now}
         scan = self._scan
         if "value" not in scan["result"] and now - scan["started"] < SCAN_TIMEOUT_S:
             return []           # wait for the drive, at most SCAN_TIMEOUT_S
