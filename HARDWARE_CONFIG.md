@@ -6,16 +6,16 @@ Lines beginning with "#" should be ignored. They are "commented-out" old configu
 
 SDR:
 * rPi USB 3 -> CoolGear CG-30ACTSSL-05M with copper braid -> B206mini (SDR). Pi enclosure wrapped in copper foil (2026-11-17). On USB 3 the GPS keeps a fix with ~10 dB more L1 noise; see `~/radar-testbench/gps_jam/README.md`
-* SDR TX -> short cable -> Empower 1094 PA (28 V on, VVA/J8 at 5 V, confirmed 2026-11-17) -> short cable -> 40 dB attenuator (100 W) -> 30 dB attenuator (1 W) -> Z99SC-62-S+ splitter A
+* SDR TX -> short cable -> Empower 1094 PA (28 V on; VVA/J8 at 3.452 V from a fixed divider since 2026-11-20, see "Empower 1094 amplifier and control board") -> short cable -> 40 dB attenuator (100 W) -> Z99SC-62-S+ splitter A
   * Splitter A output 1 -> Splitter B input (Z99SC-62-S+)
-  * Splitter output 2 -> 50 m loopback cable -> short cable -> VLFX-450+ low-pass filter -> ZFLM-252-1WL-S+ limiter -> ZX60-P103LN+ LNA (powered) -> ZFLM-252-1WL-S+ limiter -> 10 dB attenuator -> SDR RX
+  * Splitter output 2 -> 30 dB attenuator (1 W) -> 50 m loopback cable -> short cable -> VLFX-450+ low-pass filter -> ZFLM-252-1WL-S+ limiter -> ZX60-P103LN+ LNA (powered) -> ZFLM-252-1WL-S+ limiter -> 10 dB attenuator -> SDR RX
 * Splitter B:
   * Splitter B output 1 -> Logic MSO Blue via 50 ohm pass-through terminator
   * Splitter B output 2 -> ZX47-40-S+ power detector (powered) -> Logic MSO Red (direct, no 50 ohm terminator)
 * The scope (run by a peer Claude session, `configure-scope-gpio-capture`) also measures the current and voltage into the system
 * All devices, including the Pi, run from one 12 V supply (the PA's 28 V comes from it through a regulator). Emergency shutdown = power off the whole system
 * Datasheets for the front-end parts and the 1094 are in `hardware_reference/datasheets/`
-* HIL fixture for this chain: `~/radar-testbench/fixtures/loopback_50m_pa_rx_frontend.yaml`
+* HIL fixture for this chain: `~/radar-testbench/fixtures/loopback_50m_pa_rx_frontend.yaml` (not yet updated: it still describes the amplifier gain at VVA 5 V, about 24 dB, and the 30 dB attenuator ahead of splitter A)
 
 # * SDR TX -> shorter jumper -> 30 dB attenuator -> 50 m loopback cable -> VLFX-450+ low-pass filter -> ZFLM-252-1WL-S+ limiter -> ZX60-P103LN+ LNA -> ZFLM-252-1WL-S+ limiter -> 10 dB attenuator -> short jumper -> SDR RX
 # * The two jumpers are about 1 ft each; they were added after the 2026-10 HIL baselines
@@ -63,6 +63,12 @@ OpenLog Artemis:
 
 Empower 1094 amplifier and control board:
 * The control board is on the OLA's Qwiic bus
+* Control board replaced 2026-11-20 (the first replacement read a false, slowly decaying amplifier current after power-up; this one reads 0.144-0.156 A at idle from the first sample)
+* VVA (J8) is set by a fixed divider on the control board: 1k from VVA to 5 V, 2.2k + 470 ohm from VVA to ground; measured 3.452 V (2026-11-20). The VVA node is loaded by about 14.7 kohm, so an unloaded divider calculation does not apply. Without a divider the board's 100k pull-down gives 0 V = full gain
+* Amplifier gain at this setting is about 37 dB at 300 MHz (24.6 dB at VVA 5 V, about 55 dB at 0 V), and about 45 dB per volt of VVA around this point
+* Output at this setting, peak chirp power at the amplifier output (power detector, +/-1 dB): tx_gain 60 = +29.4 dBm, 66 = +35.6 dBm, 70 = +39.6 dBm (about 9-10 W). tx_gain 70 is the cap (`manager.limits.max_tx_gain` in `/etc/radar-runner/local.yaml`); 72 would give about 14 W
+* Power reference: the ZX47-40-S+ detector is about 46.6 dB below the amplifier output (40 dB attenuator and two splitters, nominal); datasheet in `hardware_reference/datasheets/`
+* 12 V input at tx_gain 70 (scope, 110 s continuous record, 2026-11-20; raw clamp readings, the clamp's zero offset of about 0.18 A not subtracted): idle 1.76 A / 24.1 W; transmitting 2.18 A / 29.7 W, essentially constant (no per-pulse current reaches the input); peaks 2.51 A / 34.2 W instantaneous, 2.41 A / 32.8 W over 2 ms, 2.21 A / 30.1 W over 1 s; bus 13.64 V transmitting, minimum 13.42 V
 * See `hardware_reference/empower_1094/`
 
 Pi GPIO connections:
